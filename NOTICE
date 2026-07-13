@@ -1,0 +1,15 @@
+Vinur
+Copyright 2026 Daniel Aras
+
+Licensed under the Apache License, Version 2.0.
+
+This software is provided as-is, for research and reference purposes, without
+warranty, and is not validated or intended for production or safety-critical use.
+
+Vinur was split out of the Vinkona monorepo (https://github.com/dantroline-sys/vinkona)
+on 2026-07-13 and continues under Apache 2.0 as its own project.
+
+This product includes no bundled third-party datasets. The optional importers
+consume separately-downloaded datasets (ConceptNet, CauseNet, GLUCOSE, ATOMIC,
+Wikipedia/Kiwix ZIM snapshots, RxNorm/RxClass/MED-RT) — each is governed by its
+own license; see external/README.md.
