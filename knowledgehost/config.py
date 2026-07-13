@@ -45,6 +45,12 @@ DEFAULTS = {
     "embed_document_prefix": "search_document: ",
     "embed_batch": 64,        # ingestion embed batch size
     "embed_timeout_s": 30,
+    # Long ingestion jobs (embed-nodes, document ingest) wait up to this many
+    # seconds for the embed endpoint to come back after a transport failure —
+    # llama.cpp's embedding server leaks under heavy use and gets restarted
+    # (Vinkona's watchdog / a cgroup memory cap), so the job should pause and
+    # resume, not abort.  0 = stop immediately (runs are resumable either way).
+    "embed_recover_wait_s": 300,
     # The embed server processes each sequence in ONE physical batch; an input
     # over its n_ubatch is rejected with HTTP 500.  Chunks are clipped to this
     # many (estimated) tokens before embedding so a stray oversized chunk is

@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import json
 import logging
+import time
 import urllib.error
 import urllib.request
 
@@ -35,6 +36,10 @@ class Embedder:
         self._trunc_warned = False
         self._reject_warned = False
         self.dim: int | None = None
+        # Has ANY request succeeded this run?  Separates "endpoint dropped
+        # mid-run" (worth waiting out — see wait_ready) from "no embed server
+        # at all" (a legitimate sparse-only setup that must not block).
+        self.ever_ok = False
 
     def _prefix(self, text: str, task: str) -> str:
         if not self.use_prefix:
@@ -64,7 +69,9 @@ class Embedder:
             headers={"Content-Type": "application/json"},
             method="POST")
         with urllib.request.urlopen(req, timeout=self.timeout) as r:
-            return json.loads(r.read())
+            out = json.loads(r.read())
+        self.ever_ok = True
+        return out
 
     def _normalize(self, vec):
         # Stdlib L2 normalize (numpy optional; this path has no numpy dependency).
@@ -75,6 +82,25 @@ class Embedder:
         out = [x / n for x in vec]
         self.dim = len(out)
         return out
+
+    def wait_ready(self, max_wait_s: float = 300.0, poll_s: float = 5.0) -> bool:
+        """Block until the embed endpoint answers again.  Long ingestion jobs
+        call this when a batch hits a transport failure: the usual cause is the
+        embed server being RESTARTED (llama.cpp's embedding mode leaks under
+        heavy use; Vinkona's watchdog bounces it), so the job should pause and
+        resume rather than abort.  True once it's back; False after max_wait_s.
+        The query service never calls this — reads stay non-blocking."""
+        deadline = time.monotonic() + max_wait_s
+        while True:
+            try:
+                self._post({"model": self.model, "input": ["ping"]})
+            except Exception:
+                if time.monotonic() >= deadline:
+                    return False
+                time.sleep(min(poll_s, max(0.1, deadline - time.monotonic())))
+                continue
+            self._warned = False        # log again if it drops a second time
+            return True
 
     def embed_one(self, text: str, task: str = "document"):
         """One vector as a python list[float], or None if the endpoint is down."""

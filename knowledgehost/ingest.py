@@ -52,9 +52,17 @@ def _embed_and_store(store, embedder, cfg, *, source_type, title,
         if not batch_rec:
             return
         vecs = embedder.embed_many(batch_text, "document") if embedder else None
+        if embedder and vecs is None:
+            # Transport failure mid-ingest — usually the embed server being
+            # restarted after a leak (Vinkona's watchdog).  Wait it out and
+            # retry, so this batch keeps its vectors instead of silently going
+            # sparse-only (sqlite) or aborting the document (lance).
+            wait_s = float(cfg.get("embed_recover_wait_s", 300) or 0)
+            if wait_s and getattr(embedder, "ever_ok", False) and embedder.wait_ready(wait_s):
+                vecs = embedder.embed_many(batch_text, "document")
         # lance stores nothing without a vector; a whole-batch None means the
-        # endpoint hiccupped — abort (resumable) so we don't drop chunks AND mark
-        # the doc done.  sqlite keeps them sparse-only, so it's fine to proceed.
+        # endpoint stayed down — abort (resumable) so we don't drop chunks AND
+        # mark the doc done.  sqlite keeps them sparse-only, so it can proceed.
         if embedder and vecs is None and cfg.get("backend") == "lance":
             raise EmbedUnavailable("embed endpoint dropped mid-ingest")
         for rec, vec in zip(batch_rec, vecs or [None] * len(batch_rec)):

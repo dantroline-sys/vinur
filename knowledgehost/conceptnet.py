@@ -257,7 +257,19 @@ def embed_nodes(kb: KB, embedder, cfg, *, limit: int | None = None,
         texts = [(r["label"] + (". " + r["summary"] if r["summary"] else ""))
                  for r in rows]
         vecs = embedder.embed_many(texts, "document")
-        if vecs is None:                                   # endpoint down → stop, resumable
+        if vecs is None:
+            # Transport failure — usually the embed server being restarted
+            # after a leak (Vinkona's watchdog).  Wait it out and retry the
+            # same batch (the cursor already advanced, so a plain `continue`
+            # would skip these rows for the rest of this run).
+            wait_s = float(cfg.get("embed_recover_wait_s", 300) or 0)
+            if wait_s and getattr(embedder, "ever_ok", False):
+                log.warning("embed endpoint dropped — waiting up to %.0fs for it "
+                            "to come back", wait_s)
+                if embedder.wait_ready(wait_s):
+                    log.info("embed endpoint is back — resuming")
+                    vecs = embedder.embed_many(texts, "document")
+        if vecs is None:                                   # still down → stop, resumable
             log.warning("embed endpoint unreachable — stopping (%d embedded; re-run to "
                         "resume).", st["embedded"])
             break
