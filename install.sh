@@ -15,12 +15,15 @@
 #   ./install.sh --wikipedia     # libzim, for a Kiwix Wikipedia ZIM
 #   ./install.sh --lance         # LanceDB IVF-PQ backend (Wikipedia scale)
 #   ./install.sh --minimal       # stdlib only, not even numpy
-#   ./install.sh --no-venv       # install into the active/system interpreter
-#   ./install.sh --python python3.12 --venv /opt/kb/venv
+#   ./install.sh --no-venv       # install into the active/system interpreter (pip)
+#   ./install.sh --python 3.12 --venv /opt/kb/venv   # version, name, or path
 #   ./install.sh --no-test       # skip the post-install smoke verification
 #
-# Re-running is safe and incremental: an existing venv is reused and pip just
-# adds anything new.  config.toml is seeded once and never overwritten.
+# Dependencies are managed by uv (bootstrapped in-tree on first run — see
+# env.sh): pyproject.toml declares them, uv.lock pins the exact working set on
+# every platform. Re-running is safe and incremental: an existing venv is
+# reused and new groups just add to it. config.toml is seeded once and never
+# overwritten.
 #
 # Maintenance commands:
 #   ./install.sh status          # what's installed and how big the data is
@@ -46,9 +49,9 @@ if [ "${1:-}" = "status" ]; then
 fi
 if [ "${1:-}" = "uninstall" ]; then
   purge=0; [ "${2:-}" = "--purge" ] && purge=1
-  rm -rf .venv models var/cache var/tmp
+  rm -rf .venv models var/cache var/tmp var/uv bin
   find . -name __pycache__ -type d -exec rm -rf {} + 2>/dev/null || true
-  echo "removed: .venv, models/, var/cache, var/tmp (software + caches)"
+  echo "removed: .venv, models/, bin/, var/cache, var/tmp, var/uv (software + caches)"
   if [ "$purge" -eq 1 ]; then
     echo ""
     echo "WARNING: --purge deletes the KNOWLEDGE BASE itself (var/: index.db, kb.db,"
@@ -102,46 +105,48 @@ say()  { printf '\033[1;36m==>\033[0m %s\n' "$*"; }
 warn() { printf '\033[1;33mwarning:\033[0m %s\n' "$*" >&2; }
 die()  { printf '\033[1;31merror:\033[0m %s\n' "$*" >&2; exit 1; }
 
-# ── 1. interpreter + version (tomllib needs >= 3.11) ────────────────────────
-command -v "$PYTHON" >/dev/null 2>&1 || die "interpreter not found: $PYTHON (try --python python3.11)"
-"$PYTHON" - <<'PY' || die "Python >= 3.11 is required (config.py uses the stdlib tomllib)."
+# ── 1./2./3. environment + dependency set (uv sync, per-flag groups) ────────
+if [ "$USE_VENV" -eq 1 ]; then
+  # uv builds the venv from pyproject.toml + uv.lock — the pinned set, same on
+  # every platform — and fetches a matching CPython itself if the system one
+  # doesn't satisfy requires-python (>= 3.11; config.py uses stdlib tomllib).
+  # --inexact keeps re-runs incremental: an existing venv is reused and new
+  # groups just add to it, exactly like the old pip behaviour.
+  UV_ARGS=(sync --inexact)
+  [ "$WANT_NUMPY" -eq 1 ] && UV_ARGS+=(--group recommended)
+  [ "$WITH_PDF"   -eq 1 ] && UV_ARGS+=(--group pdf)
+  [ "$WITH_EPUB"  -eq 1 ] && UV_ARGS+=(--group epub)
+  [ "$WITH_HTML"  -eq 1 ] && UV_ARGS+=(--group html)
+  [ "$WITH_WIKI"  -eq 1 ] && UV_ARGS+=(--group wikipedia)
+  [ "$WITH_LANCE" -eq 1 ] && UV_ARGS+=(--group lance)
+  [ "$PYTHON" != "python3" ] && UV_ARGS+=(--python "$PYTHON")
+  case "$VENV_DIR" in /*) VENV_ABS="$VENV_DIR" ;; *) VENV_ABS="$PWD/$VENV_DIR" ;; esac
+  say "syncing $VENV_DIR from pyproject.toml + uv.lock"
+  UV_PROJECT_ENVIRONMENT="$VENV_ABS" vk_uv "${UV_ARGS[@]}" || die "uv sync failed — see above"
+  PY="$VENV_DIR/bin/python"
+else
+  # --no-venv escape hatch: install into the active/system interpreter with
+  # plain pip (uv sync only manages venvs it owns). Loose ranges, not uv.lock.
+  command -v "$PYTHON" >/dev/null 2>&1 || die "interpreter not found: $PYTHON (try --python python3.11)"
+  "$PYTHON" - <<'PY' || die "Python >= 3.11 is required (config.py uses the stdlib tomllib)."
 import sys
 sys.exit(0 if sys.version_info[:2] >= (3, 11) else 1)
 PY
-say "using $("$PYTHON" -V) at $(command -v "$PYTHON")"
-
-# ── 2. virtualenv ───────────────────────────────────────────────────────────
-if [ "$USE_VENV" -eq 1 ]; then
-  if [ ! -x "$VENV_DIR/bin/python" ]; then
-    say "creating virtualenv at $VENV_DIR"
-    "$PYTHON" -m venv "$VENV_DIR" \
-      || die "venv creation failed — install the venv module (e.g. 'dnf install python3-virtualenv' / 'apt install python3-venv')"
-  else
-    say "reusing virtualenv at $VENV_DIR"
-  fi
-  PY="$VENV_DIR/bin/python"
-else
   warn "installing into the active interpreter (no venv): $(command -v "$PYTHON")"
   PY="$PYTHON"
-fi
-
-say "upgrading pip"
-"$PY" -m pip install --quiet --upgrade pip
-
-# ── 3. dependency set (only what was requested) ─────────────────────────────
-PKGS=()
-[ "$WANT_NUMPY" -eq 1 ] && PKGS+=("numpy" "usearch")   # usearch: optional ANN (build-ann)
-[ "$WITH_PDF"   -eq 1 ] && PKGS+=("pymupdf")
-[ "$WITH_EPUB"  -eq 1 ] && PKGS+=("ebooklib")
-[ "$WITH_HTML"  -eq 1 ] && PKGS+=("trafilatura")
-[ "$WITH_WIKI"  -eq 1 ] && PKGS+=("libzim")
-[ "$WITH_LANCE" -eq 1 ] && PKGS+=("lancedb" "pyarrow")
-
-if [ "${#PKGS[@]}" -gt 0 ]; then
-  say "installing: ${PKGS[*]}"
-  "$PY" -m pip install --upgrade "${PKGS[@]}"
-else
-  say "stdlib-only install (no pip packages requested)"
+  PKGS=()
+  [ "$WANT_NUMPY" -eq 1 ] && PKGS+=("numpy" "usearch")   # usearch: optional ANN (build-ann)
+  [ "$WITH_PDF"   -eq 1 ] && PKGS+=("pymupdf")
+  [ "$WITH_EPUB"  -eq 1 ] && PKGS+=("ebooklib")
+  [ "$WITH_HTML"  -eq 1 ] && PKGS+=("trafilatura")
+  [ "$WITH_WIKI"  -eq 1 ] && PKGS+=("libzim")
+  [ "$WITH_LANCE" -eq 1 ] && PKGS+=("lancedb" "pyarrow" "pylance")
+  if [ "${#PKGS[@]}" -gt 0 ]; then
+    say "installing: ${PKGS[*]}"
+    "$PY" -m pip install --upgrade "${PKGS[@]}"
+  else
+    say "stdlib-only install (no pip packages requested)"
+  fi
 fi
 
 # ── 4. system binaries we cannot pip-install (offer, never block) ───────────

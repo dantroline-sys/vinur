@@ -33,7 +33,7 @@ every passage is sanitized and cited before any LM reads it.
 | backend  | sparse | dense | needs | use for |
 |----------|--------|-------|-------|---------|
 | `sqlite` *(default)* | FTS5 | brute-force (numpy or pure-python) | **nothing** beyond the stdlib | the PDF collection / Phase 1; fine to ~1M chunks |
-| `lance`  | LanceDB FTS | IVF-PQ, on-disk/mmap | `pip install lancedb pyarrow` | a **full Wikipedia** snapshot (10–40M chunks) |
+| `lance`  | LanceDB FTS | IVF-PQ, on-disk/mmap | `./install.sh --lance` | a **full Wikipedia** snapshot (10–40M chunks) |
 
 Retrieval is **hybrid** on either: a dense (embedding) arm and a sparse (BM25/
 FTS) arm, fused by **Reciprocal Rank Fusion**, then reranked. FTS carries exact
@@ -43,7 +43,8 @@ quality lever at encyclopedia scale.
 ## Quick start
 
 ```bash
-# 0) install — builds .venv, seeds config.toml, runs the offline smoke test
+# 0) install — builds .venv (uv, bootstrapped in-tree; deps pinned by uv.lock),
+#    seeds config.toml, runs the offline smoke test
 ./install.sh                             # stdlib+numpy (sqlite backend)
 ./install.sh --all                       # + every parser (pdf/epub/html/zim) + lance
 ./install.sh --pdf --epub                # or pick the formats your collection has

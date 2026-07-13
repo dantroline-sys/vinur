@@ -1,0 +1,51 @@
+# Vinur — Python dependencies, managed by uv (https://docs.astral.sh/uv/).
+#
+# You normally never invoke uv yourself — ./install.sh does, and bootstraps uv
+# itself in-tree (see env.sh vk_uv).  The query service and the default
+# `sqlite` backend need NOTHING beyond the Python stdlib (FTS5 ships with
+# sqlite3), so the core dependency list is empty; everything else is a
+# dependency group matching an ./install.sh flag, installed only if your
+# corpus needs it.  All heavy parsers are lazy-imported, so a missing one only
+# disables its own format.
+#
+# uv.lock pins the exact working set for every platform (one lockfile for
+# Linux/macOS/Windows).  To change a dependency: edit here, `uv lock`, commit.
+
+[project]
+name = "vinur"
+version = "0"
+description = "Vinur — a local knowledge host (ingest, distill, retrieve, reason)"
+requires-python = ">=3.11"    # config.py uses the stdlib tomllib
+dependencies = []             # stdlib only — this is deliberate
+
+[dependency-groups]
+# Default install (./install.sh with no flags): dense-search fast path + ANN.
+# numpy makes dense search fast (pure-python fallback exists); usearch is the
+# optional HNSW index (`build-ann`) for sub-100ms search past ~1M nodes.
+recommended = ["numpy", "usearch"]
+
+# Document parsers — one group per format flag (--pdf, --epub, --html, --wikipedia)
+pdf = ["pymupdf"]             # the `fitz` module — fast text layer + layout
+epub = ["ebooklib"]
+html = ["trafilatura"]        # main-content extraction (stdlib parser is the fallback)
+wikipedia = ["libzim"]        # Kiwix ZIM iteration
+
+# Wikipedia-scale backend (--lance): LanceDB IVF-PQ, on-disk/mmap.
+# pylance is the lance engine; the viewer's random sampling uses its scanner.
+lance = ["lancedb", "pyarrow", "pylance"]
+
+# ./install.sh --all
+all = [
+    { include-group = "recommended" },
+    { include-group = "pdf" },
+    { include-group = "epub" },
+    { include-group = "html" },
+    { include-group = "wikipedia" },
+    { include-group = "lance" },
+]
+
+# OCR fallback for scanned PDFs is SYSTEM binaries, not pip: ocrmypdf +
+# tesseract on PATH (install.sh offers them via the OS package manager).
+
+[tool.uv]
+package = false     # sync manages dependencies only; the code runs in-place

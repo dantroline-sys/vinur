@@ -19,9 +19,11 @@ config.toml
 external/*
 !external/README.md
 
-# In-tree everything (see env.sh): indexes/kb/caches/tmp and the reranker GGUF.
+# In-tree everything (see env.sh): indexes/kb/caches/tmp, the reranker GGUF,
+# and the bootstrapped uv binary.
 /var/
 /models/
+/bin/
 
 # Editor / OS noise
 .DS_Store

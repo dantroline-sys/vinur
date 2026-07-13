@@ -17,6 +17,11 @@ KH_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 export XDG_CACHE_HOME="$KH_ROOT/var/cache"
 export HF_HOME="$KH_ROOT/var/cache/huggingface"
 export TMPDIR="$KH_ROOT/var/tmp"
+# uv (the python env manager — see vk_uv below): wheel cache + any CPython
+# interpreters it downloads both stay in-tree (the second line matters — the
+# default would be ~/.local/share/uv).
+export UV_CACHE_DIR="$KH_ROOT/var/cache/uv"
+export UV_PYTHON_INSTALL_DIR="$KH_ROOT/var/uv/python"
 mkdir -p "$KH_ROOT/var/cache" "$KH_ROOT/var/tmp"
 
 # ── vk_require_tools: check for system tools, offer to install the missing ──
@@ -61,4 +66,27 @@ vk_require_tools() {
     fi
     echo "Non-interactive shell — run:  sudo $mgr ${pkgs[*]}   then re-run this script."
     return 1
+}
+
+# ── vk_uv: run uv, bootstrapping it in-tree on first use ────────────────────
+# uv (https://docs.astral.sh/uv/) builds .venv from pyproject.toml + uv.lock —
+# same pinned set on every platform, and it downloads a matching CPython itself
+# (into var/uv/python) if the system one doesn't satisfy requires-python.
+# A system-wide uv is used when present; otherwise one standalone binary is
+# fetched into ./bin (UV_UNMANAGED_INSTALL = no PATH/rc edits, no self-update
+# state — in-tree like everything else). The venv it makes is a plain venv.
+vk_uv() {
+    local uv
+    uv="$(command -v uv 2>/dev/null || true)"
+    [ -n "$uv" ] || uv="$KH_ROOT/bin/uv"
+    if [ ! -x "$uv" ]; then
+        vk_require_tools curl || return 1
+        echo "==> fetching uv (one-time, into bin/)" >&2
+        mkdir -p "$KH_ROOT/bin"
+        curl -LsSf https://astral.sh/uv/install.sh \
+                | env UV_UNMANAGED_INSTALL="$KH_ROOT/bin" sh >&2 \
+            || { echo "could not bootstrap uv — install it yourself (https://docs.astral.sh/uv/) and re-run" >&2; return 1; }
+        uv="$KH_ROOT/bin/uv"
+    fi
+    "$uv" "$@"
 }
