@@ -27,11 +27,14 @@ mkdir -p "$KH_ROOT/var/cache" "$KH_ROOT/var/tmp"
 # ── vk_require_tools: check for system tools, offer to install the missing ──
 # Same helper as assistant/env.sh — kept in both so each component stands alone.
 # Usage:   vk_require_tools "tesseract:tesseract|tesseract-ocr" ocrmypdf || ...
-# Spec:    tool[:package] — package may be "dnfname|aptname" where they differ.
+# Spec:    tool[:package] — package may be "dnfname|aptname|brewname" where they
+#          differ; a spec with fewer alternatives falls back to the first name.
+# Homebrew (macOS) runs WITHOUT sudo — it refuses root.
 vk_require_tools() {
-    local mgr="" pick=1 spec tool pkg missing=() pkgs=()
+    local mgr="" pick=1 sudo_cmd="sudo" spec tool pkg a1 a2 a3 missing=() pkgs=()
     if command -v dnf >/dev/null 2>&1;      then mgr="dnf install -y"
     elif command -v apt-get >/dev/null 2>&1; then mgr="apt-get install -y"; pick=2
+    elif command -v brew >/dev/null 2>&1;    then mgr="brew install"; pick=3; sudo_cmd=""
     elif command -v pacman >/dev/null 2>&1;  then mgr="pacman -S --needed --noconfirm"
     elif command -v zypper >/dev/null 2>&1;  then mgr="zypper install -y"
     fi
@@ -39,7 +42,12 @@ vk_require_tools() {
         tool="${spec%%:*}"
         command -v "$tool" >/dev/null 2>&1 && continue
         pkg="${spec#*:}"; [ "$pkg" = "$spec" ] && pkg="$tool"
-        if [ "$pick" -eq 2 ]; then pkg="${pkg##*|}"; else pkg="${pkg%%|*}"; fi
+        IFS='|' read -r a1 a2 a3 <<<"$pkg"
+        case "$pick" in
+            2) pkg="${a2:-$a1}" ;;
+            3) pkg="${a3:-$a1}" ;;
+            *) pkg="$a1" ;;
+        esac
         missing+=("$tool"); pkgs+=("$pkg")
     done
     [ "${#missing[@]}" -eq 0 ] && return 0
@@ -49,13 +57,13 @@ vk_require_tools() {
         return 1
     fi
     if [ -t 0 ] || [ "${VINKONA_ASSUME_TTY:-}" = 1 ]; then
-        printf "Install now with 'sudo %s %s'? [Y/n]: " "$mgr" "${pkgs[*]}"
+        printf "Install now with '%s%s %s'? [Y/n]: " "${sudo_cmd:+$sudo_cmd }" "$mgr" "${pkgs[*]}"
         local answer; read -r answer
         case "$answer" in
             n*|N*) echo "Skipped — install them and re-run."; return 1 ;;
         esac
         # shellcheck disable=SC2086
-        sudo $mgr "${pkgs[@]}" || { echo "Package install failed — install manually, then re-run."; return 1; }
+        $sudo_cmd $mgr "${pkgs[@]}" || { echo "Package install failed — install manually, then re-run."; return 1; }
         hash -r
         local t
         for t in "${missing[@]}"; do
@@ -64,7 +72,7 @@ vk_require_tools() {
         echo "System tools installed."
         return 0
     fi
-    echo "Non-interactive shell — run:  sudo $mgr ${pkgs[*]}   then re-run this script."
+    echo "Non-interactive shell — run:  ${sudo_cmd:+$sudo_cmd }$mgr ${pkgs[*]}   then re-run this script."
     return 1
 }
 
