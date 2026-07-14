@@ -194,9 +194,12 @@ def refine_cards(kb, store, embedder, lm, cfg, *, limit=None, force=False,
     BackendUnavailable (via the LM transport) so the CLI can abort resumably."""
     budget_chars = int(cfg.get("refine_source_tokens", 46000)) * 4
     mtok = int(cfg.get("refine_max_tokens", 4096))
+    # How-to cards only: typed cards (criteria/staging/requirements/…) have no steps to
+    # refine, and running them through the how-to prompt would rewrite them wrongly.
     q = ("SELECT id, node_id, title, goal, steps, support, preconditions, tools, materials, "
          "tips, mistakes, red_flags, discriminators, escalation "
-         "FROM procedure_cards WHERE status='active'")
+         "FROM procedure_cards WHERE status='active' "
+         "AND (card_type IS NULL OR card_type='procedure') AND criteria IS NULL")
     if not force:
         q += " AND refined_at IS NULL"
     q += " ORDER BY hit_count DESC, updated_at DESC"

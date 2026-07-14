@@ -33,6 +33,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import threading
 import time
 from pathlib import Path
@@ -110,7 +111,9 @@ def save_plan(cfg: dict, plan: dict) -> dict:
     }
     p = plan_path(cfg)
     p.parent.mkdir(parents=True, exist_ok=True)
-    p.write_text(json.dumps(out, indent=2) + "\n")
+    tmp = p.with_suffix(".json.tmp")                # atomic: the loop thread re-reads this
+    tmp.write_text(json.dumps(out, indent=2) + "\n")
+    os.replace(tmp, p)
     return out
 
 
@@ -223,7 +226,12 @@ class Autopilot:
         key = step_key(step)
         self._state["running_step"] = label
         log.info("autopilot: running %s (%s)", step["command"], label)
-        res = self.ops.start(step["command"], step.get("args") or {})
+        try:
+            res = self.ops.start(step["command"], step.get("args") or {})
+        except ValueError as e:              # bad args (hand-edited plan) — treat as a
+            res = {"ok": False, "error": str(e)}  # failed launch, not a loop crash: the
+                                             # crash path retried the same step every 10s
+                                             # forever and starved everything below it
         if not res.get("ok"):
             # Couldn't launch (bad args, or a job slipped in) — note and back off so we
             # don't hot-loop on a broken step.

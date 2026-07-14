@@ -2,8 +2,7 @@
 distilled, so a card knows what it specialises, requires, is part of, or stands as an
 alternative to.  This is the consolidation pass: it reads the KB (not source prose) and
 adds the connective tissue that turns a pile of good cards into a navigable graph —
-"obstetric hypotension `is_a` hypotension", "post-spinal management `requires` spinal
-anaesthesia".
+"sourdough `is_a` bread", "proofing `requires` an active starter".
 
 Discipline (mirrors §9.4 — *bias toward not destroying*):
   * It never merges, rewrites, or deletes — it only ADDS typed edges, which are
@@ -65,10 +64,10 @@ _SYSTEM = (
     "B, from the SAME knowledge base. Identify the SINGLE strongest STRUCTURAL relationship "
     "between them, for navigation — not a fact about the world.\n"
     "Choose exactly one `relation`:\n"
-    "- a_is_a_b / b_is_a_a: one is a KIND or special case of the other (obstetric "
-    "hypotension is_a hypotension). Point from the specific to the general.\n"
+    "- a_is_a_b / b_is_a_a: one is a KIND or special case of the other (sourdough "
+    "is_a bread). Point from the specific to the general.\n"
     "- a_requires_b / b_requires_a: doing or understanding one needs the other as a "
-    "PREREQUISITE or input (managing post-spinal hypotension requires spinal anaesthesia).\n"
+    "PREREQUISITE or input (proofing dough requires an active starter).\n"
     "- a_part_of_b / b_part_of_a: one is a COMPONENT or step of the other, larger one.\n"
     "- alternative: they are competing approaches to the SAME goal.\n"
     "- related: clearly associated and worth cross-linking, but none of the above.\n"

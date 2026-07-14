@@ -17,12 +17,11 @@ import math
 import re
 from functools import lru_cache
 
-# High-stakes domains where a wrong answer can cause real harm, so a query touching
-# them defaults to `rigor='high'` (firewall filter + strength adjudication) and the
-# engine is more willing to hedge or abstain.  The list is deliberately broad and spans
-# unrelated domains (safety/medical, legal, financial) precisely so the engine leans
-# cautious on consequential questions — it is NOT a claim to answer any of them
-# authoritatively.  Extend via config; err toward inclusion.
+# Consequential questions — where a wrong answer can cause real harm — default to
+# `rigor='high'` (firewall filter + strength adjudication) and the engine is more
+# willing to hedge or abstain.  The pattern is deliberately broad and spans unrelated
+# areas precisely so the engine leans cautious on consequential questions; it is NOT a
+# claim to answer any of them authoritatively.  Err toward inclusion.
 _HIGH_STAKES = re.compile(
     r"\b(dose|dosage|dosing|drug|interaction|contraindicat|overdose|mg|"
     r"medication|toxic|lethal|allerg|surger|diagnos|treat|symptom|legal|tax)\w*",
@@ -156,7 +155,7 @@ def exclusion_features(item: dict) -> set:
 def _feature_overlap(qf: set, ef: set) -> float:
     """Signed feature agreement in [0,1] from the caller/query features `qf` against the
     item's discriminators `ef`: an exact feature:value match supports it, a same-feature/
-    different-value CLASH (caesarean vs labour, spinal vs epidural) counts against it.
+    different-value CLASH (diesel vs petrol, highway vs idle) counts against it.
     0.0 means a net clash — the item describes a *different* situation than the one asked
     about, the signal that turns 'topically near' into 'wrong answer, abstain'."""
     qg, eg = _by_feature(qf), _by_feature(ef)

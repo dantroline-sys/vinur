@@ -70,8 +70,10 @@ def connect(path: str, *, encrypted: bool = False, key: str | None = None, **kw)
             "encrypted bundle requested but no key found "
             "($KNOWLEDGEHOST_DB_KEY or db_key_file)")
     con = drv.connect(path, **kw)
-    # PRAGMA key must precede every other operation on the connection.
-    con.execute("PRAGMA key = ?", (key,))
+    # PRAGMA key must precede every other operation on the connection.  PRAGMA does not
+    # accept bound parameters (SQLite parses it before binding — "near '?'" error), so
+    # the key is inlined as a single-quoted literal with quotes escaped.
+    con.execute("PRAGMA key = '%s'" % str(key).replace("'", "''"))
     # Force the cipher to engage now so a wrong key / non-cipher file fails here
     # (loud) rather than deep in a later query.
     con.execute("SELECT count(*) FROM sqlite_master")

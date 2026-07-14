@@ -33,14 +33,17 @@ def _build(cfg):
 
 
 def _remove_path(path: str) -> list:
-    """Delete a db file (with its -wal/-shm sidecars) or a directory.  Returns the
-    paths actually removed."""
+    """Delete a db file (with its -wal/-shm sidecars and any ANN index files) or a
+    directory.  Returns the paths actually removed.  The ANN sidecars matter: a reset
+    that leaves them behind serves a stale index after re-ingest — every ANN hit is a
+    dead id, so search silently returns nothing."""
     removed = []
     if os.path.isdir(path):
         shutil.rmtree(path)
         removed.append(path)
     else:
-        for p in (path, path + "-wal", path + "-shm"):
+        for p in (path, path + "-wal", path + "-shm",
+                  path + ".ann.usearch", path + ".ann.ids.json"):
             if os.path.exists(p):
                 os.remove(p)
                 removed.append(p)
@@ -292,7 +295,8 @@ def _run_adjudicate(cfg, log, *, limit=None, batch=8, watch=False, interval=30,
             log.info("adjudicating residual with the %s", tier)
             stats = adj.adjudicate_queue(kb, lms[0], cfg, limit=limit, batch=batch, lease=lease)
             log.info("adjudicated: %s", stats)
-            ops_mod.emit_result(stats.get("seen", 0) > 0, **stats)
+            # adjudicate_queue reports 'judged' ('seen' belongs to the auto_resolve pass)
+            ops_mod.emit_result(stats.get("judged", 0) > 0, **stats)
             if not watch or limit or stats.get("open_remaining", 0) == 0:
                 break
             log.info("watch: %ds until the next pass (Ctrl-C to stop)…", interval)

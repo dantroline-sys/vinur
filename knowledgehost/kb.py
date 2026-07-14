@@ -258,6 +258,10 @@ class KB:
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             node_a TEXT, node_b TEXT, similarity REAL, reason TEXT,
             status TEXT DEFAULT 'open');
+        -- reconcile-import checks each incoming pair against the queue; without these
+        -- the check is a full-table scan per candidate (quadratic on big queues)
+        CREATE INDEX IF NOT EXISTS nmc_pair ON node_merge_candidates(node_a, node_b);
+        CREATE INDEX IF NOT EXISTS nmc_pair_rev ON node_merge_candidates(node_b, node_a);
 
         CREATE TABLE IF NOT EXISTS procedure_cards(
             id TEXT PRIMARY KEY, node_id TEXT, title TEXT, domain TEXT, goal TEXT,
@@ -703,15 +707,16 @@ class KB:
 
     def _new_node(self, label, kind, summary, embedding, aliases):
         nid = _hash("node", label or "", kind or "")
-        self.db.execute(
+        cur = self.db.execute(
             "INSERT OR IGNORE INTO nodes(id,label,kind,summary,embedding,aliases,support,status)"
             " VALUES(?,?,?,?,?,?,'[]', 'active')",
             (nid, label, kind, summary,
              _pack(embedding) if embedding is not None else None,
              json.dumps(list(aliases or []))))
         self._maybe_commit()
-        self._cache_node(nid, embedding)        # incremental — no full rebuild
-        return nid
+        if cur.rowcount:                        # only a REAL insert extends the dense cache —
+            self._cache_node(nid, embedding)    # an ignored one would append a duplicate id
+        return nid                              # (with a possibly different vector)
 
     def add_node_support(self, node_id, doc_id, evidence="", *, summary=None, regime=None):
         """Record a node's provenance (doc_id-keyed set, §9.3) and, if the node has
@@ -926,8 +931,8 @@ class KB:
         Recomputes `card_hash` (title/goal/steps may have changed), stamps `refined_at`, and
         optionally re-embeds the card and refreshes its surface question so retrieval tracks
         the new title/goal.  Never inserts a duplicate; returns False if the card is gone."""
-        r = self.db.execute("SELECT title, goal, steps, node_id FROM procedure_cards "
-                            "WHERE id=?", (card_id,)).fetchone()
+        r = self.db.execute("SELECT title, goal, steps, node_id, card_type, criteria "
+                            "FROM procedure_cards WHERE id=?", (card_id,)).fetchone()
         if not r:
             return False
         sets, vals = [], []
@@ -939,8 +944,18 @@ class KB:
         new_title = fields.get("title", r["title"])
         new_goal = fields.get("goal", r["goal"])
         new_steps = fields["steps"] if "steps" in fields else json.loads(r["steps"] or "[]")
-        ch = _hash("card", r["node_id"] or "", new_title or "", new_goal or "",
-                   json.dumps(new_steps or []))
+        # Same identity formula as add_card — typed/criteria cards extend the hash; using
+        # the plain formula here would let a later re-distill miss the match and insert
+        # a duplicate.
+        ctype = (r["card_type"] or "procedure").strip().lower()
+        crit = json.loads(r["criteria"]) if r["criteria"] else None
+        if ctype == "procedure" and not crit:
+            ch = _hash("card", r["node_id"] or "", new_title or "", new_goal or "",
+                       json.dumps(new_steps or []))
+        else:
+            ch = _hash("card", r["node_id"] or "", new_title or "", new_goal or "",
+                       json.dumps(new_steps or []), ctype,
+                       json.dumps(crit or {}, sort_keys=True))
         now = time.time()
         sets += ["card_hash=?", "refined_at=?", "updated_at=?"]
         vals += [ch, now, now]
@@ -994,7 +1009,9 @@ class KB:
         on the verbatim query.  Returns how many gaps were closed."""
         if not query_text or not str(query_text).strip():
             return 0
-        norm = " ".join(str(query_text).lower().split())
+        # Mirror the SQL side exactly (lower+trim): collapsing INTERNAL whitespace here
+        # made a gap logged with a double space unclosable by its own verbatim query.
+        norm = str(query_text).strip().lower()
         with self._lock:
             cur = self._raw.execute(
                 "UPDATE knowledge_gaps SET status=? WHERE status='open' "
@@ -1005,9 +1022,11 @@ class KB:
         return cur.rowcount
 
     # ── facets (multi-axis classification, facets.py) ────────────────────────
-    def set_facets(self, target_kind, target_id, axis, values):
+    def set_facets(self, target_kind, target_id, axis, values, *, commit=True):
         """Replace all values on one axis for one target (idempotent re-derivation).
-        `values` may be a str or iterable; empty clears the axis."""
+        `values` may be a str or iterable; empty clears the axis.  commit=False lets a
+        bulk pass (facetize) batch thousands of targets into a few transactions instead
+        of 4 commits per row."""
         if isinstance(values, str):
             values = [values]
         vals = [str(v) for v in (values or []) if v not in (None, "")]
@@ -1018,7 +1037,8 @@ class KB:
             self._raw.executemany(
                 "INSERT OR IGNORE INTO facets(target_kind,target_id,axis,value) "
                 "VALUES(?,?,?,?)", [(target_kind, target_id, axis, v) for v in vals])
-            self._raw.commit()
+            if commit:
+                self._raw.commit()
 
     def get_facets(self, target_kind, target_id) -> dict:
         rows = self.db.execute(
@@ -1083,7 +1103,9 @@ class KB:
             q = f"SELECT {cols} FROM {table}"
             if limit:
                 q += f" LIMIT {int(limit)}"
-            for r in self.db.execute(q):
+            # Batched commits: one per ~500 targets, not 4 per row (a full pass on a
+            # large KB was millions of transactions).
+            for r in self.db.execute(q).fetchall():
                 row = dict(r)
                 try:
                     support = json.loads(row.get("support") or "[]")
@@ -1091,8 +1113,14 @@ class KB:
                     support = []
                 derived = F.derive(kind, row, support, source_lookup)
                 for axis in F.AXES:                       # write every axis (clears stale)
-                    self.set_facets(kind, row["id"], axis, derived.get(axis, []))
+                    self.set_facets(kind, row["id"], axis, derived.get(axis, []),
+                                    commit=False)
                 n += 1
+                if n % 500 == 0:
+                    with self._lock:
+                        self._raw.commit()
+            with self._lock:
+                self._raw.commit()
             done[kind] = n
         return done
 
@@ -1672,7 +1700,11 @@ class KB:
             return False                          # already last (or empty) — nothing to do
         log.info("migrating nodes layout (embedding → last column); this copies the table…")
         with self._lock:
+            # One transaction (DDL is transactional in SQLite): a crash between the DROP
+            # and the RENAME would otherwise leave no `nodes` table at all — the next
+            # open would recreate it empty and silently serve an empty KB.
             self._raw.executescript("""
+            BEGIN;
             CREATE TABLE nodes_new(
                 id TEXT PRIMARY KEY, label TEXT, kind TEXT, summary TEXT,
                 aliases TEXT, support TEXT, status TEXT DEFAULT 'active', embedding BLOB);
@@ -1680,8 +1712,8 @@ class KB:
                 SELECT id,label,kind,summary,aliases,support,status,embedding FROM nodes;
             DROP TABLE nodes;
             ALTER TABLE nodes_new RENAME TO nodes;
+            COMMIT;
             """)
-            self._raw.commit()
         self._nodes_loaded = False                # caches reference the old table
         self._node_ids, self._node_vecs, self._node_mat = [], [], None
         return True

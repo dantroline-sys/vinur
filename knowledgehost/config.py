@@ -543,6 +543,15 @@ def settings_schema() -> dict:
     return out
 
 
+def _replace_text(p: Path, content: str) -> None:
+    """Write via temp + os.replace: config.toml is read by the server, ops subprocesses
+    and the panel concurrently — a truncate-then-write hands a reader half a file, and a
+    crash mid-write loses the config durably."""
+    tmp = p.with_suffix(p.suffix + ".tmp")
+    tmp.write_text(content)
+    os.replace(tmp, p)
+
+
 def update_config_file(path: str, updates: dict) -> dict:
     """Update top-level scalar keys in a config.toml IN PLACE, preserving comments and any
     other lines, validating each key/type against the schema.  Keys inside [tables] are left
@@ -591,7 +600,7 @@ def update_config_file(path: str, updates: dict) -> dict:
         out[at:at] = (["", "# --- set via the Settings panel ---", *block, ""]
                       if first_table_at is not None else
                       ["", "# --- set via the Settings panel ---", *block])
-    p.write_text("\n".join(out) + "\n")
+    _replace_text(p, "\n".join(out) + "\n")
     return applied
 
 
@@ -691,7 +700,7 @@ def write_library_sources(config_path: str, paths: list) -> list:
         block = ["", "# --- library folders (set via the Library panel) ---", newline]
         at = first_table_at if first_table_at is not None else len(out)
         out[at:at] = block
-    p.write_text("\n".join(out) + "\n")
+    _replace_text(p, "\n".join(out) + "\n")
     return list(paths)
 
 

@@ -162,6 +162,10 @@ class SqliteStore:
         self.db.execute("PRAGMA journal_mode=WAL")
         self.db.execute("PRAGMA synchronous=NORMAL")
         self.db.execute("PRAGMA busy_timeout=10000")   # wait out a concurrent writer
+        # INSERT OR REPLACE on chunks must fire the chunks_ad delete-trigger, or the
+        # external-content FTS keeps a posting for the dead rowid (and a later rowid
+        # reuse makes MATCH return an unrelated chunk).  Off by default in SQLite.
+        self.db.execute("PRAGMA recursive_triggers=ON")
         mmap = int(cfg.get("sqlite_mmap_mb", 0) or 0)
         if mmap > 0:                                    # map the DB into RAM: reads at memory speed
             self.db.execute(f"PRAGMA mmap_size={mmap * (1 << 20)}")
@@ -679,10 +683,11 @@ class LanceStore:
         if not filters:
             return None
         clauses = []
+        esc = lambda v: str(v).replace("'", "''")     # titles do contain apostrophes
         if filters.get("source_type"):
-            clauses.append(f"source_type = '{filters['source_type']}'")
+            clauses.append(f"source_type = '{esc(filters['source_type'])}'")
         if filters.get("title"):
-            clauses.append(f"title = '{filters['title']}'")
+            clauses.append(f"title = '{esc(filters['title'])}'")
         return " AND ".join(clauses) if clauses else None
 
     def search_vector(self, qvec, k, filters=None):

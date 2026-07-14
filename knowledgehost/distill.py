@@ -1616,7 +1616,10 @@ def _distill_pipeline(store, kb, extractors, verifiers, embedder, cfg, *, limit=
                     ch, reg, gen, narr = b
                     if j in res:
                         co, rl, pr, vs = res[j]
-                        gen = (co, rl, pr)
+                        # Carry the draft's criteria through — the verifier only vets
+                        # concepts/relations/procedures, and rebuilding a 3-tuple here
+                        # silently dropped every diagnostic-criteria card in pipeline mode.
+                        gen = (co, rl, pr, b[2][3] if len(b[2]) > 3 else [])
                         with lock:
                             st["rejected"] += vs["rejected"]
                             st["adjusted"] += vs["adjusted"]

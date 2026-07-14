@@ -63,8 +63,8 @@ CATALOGUE = [
             "query": {"type": "string", "description": "the question"},
             "context_features": {"type": "object", "description":
                 "optional but powerful: the structured context of the question as "
-                "{feature: value} (e.g. {\"trigger\": \"spinal anaesthesia\", \"context\": "
-                "\"caesarean section\", \"sign\": \"hypotension\"}). Answers are scored on "
+                "{feature: value} (e.g. {\"trigger\": \"cold start\", \"context\": "
+                "\"diesel engine\", \"sign\": \"white smoke\"}). Answers are scored on "
                 "how well they MATCH these — a card describing a different situation is "
                 "demoted or abstained on, so you get the right entity, not the nearest topic."},
             "intent": {"type": "string", "description":

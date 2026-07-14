@@ -192,12 +192,14 @@ def extract_closure(src: sqlite3.Connection, dst: sqlite3.Connection,
 
 
 def merge_db(src: sqlite3.Connection, dst: sqlite3.Connection,
-             tables=KNOWLEDGE_TABLES, *, intersect: bool = False) -> dict:
+             tables=KNOWLEDGE_TABLES, *, intersect: bool = False,
+             commit: bool = True) -> dict:
     """Wholesale ``INSERT OR IGNORE`` copy of an already-closed bundle file into
     the working DB.  Order doesn't matter and re-runs are idempotent (content-hash
     ids), so merging N bundles is just calling this N times.  ``intersect`` copies
     only the columns both sides have — for FOREIGN files whose schema may lead or
-    trail ours (a missing column takes the schema default on insert)."""
+    trail ours (a missing column takes the schema default on insert).  ``commit=False``
+    lets a caller fold the copy into its own larger transaction (import_bundle)."""
     counts: dict = {}
     for t in tables:
         if not _has_table(src, t) or not _has_table(dst, t):
@@ -213,7 +215,8 @@ def merge_db(src: sqlite3.Connection, dst: sqlite3.Connection,
         else:
             rows = [tuple(r) for r in src.execute(f"SELECT * FROM {t}")]
         counts[t] = _copy(dst, t, cols, rows)
-    dst.commit()
+    if commit:
+        dst.commit()
     return counts
 
 
@@ -330,7 +333,11 @@ def import_bundle(cfg: dict, path: str, *, name: str | None = None,
         pre = {t: {r[0] for r in master.execute(f"SELECT id FROM {t}")}
                for t in ("nodes", "procedure_cards", "edges")}
 
-        counts = merge_db(src, master, intersect=True)
+        # One transaction with the rebrand/trust-cap/vector-strip below (single commit at
+        # the end): a crash after a mid-import commit would land the foreign rows at the
+        # shipped file's own trust and bundle tag — and a re-run couldn't repair it (the
+        # docs would already be in pre_docs, so the cap/rebrand would never fire).
+        counts = merge_db(src, master, intersect=True, commit=False)
 
         new_docs = [d for d in src_docs if d not in pre_docs]
         newness = {t: _new_ids(master, pre[t], t)
