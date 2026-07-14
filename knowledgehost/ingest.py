@@ -342,6 +342,11 @@ def _ingest_research_doc(store, embedder, cfg, path, version, chash, st) -> int:
         "question": question or None,
         "kb_query": meta.get("kb_query"),
         "kind": meta.get("kind"),
+        # card hints (brains): the shape Vinkona says her answer wants to be — the
+        # distiller runs the matching typed extractor for the drop and seeds the
+        # card's discriminators from the features.  A nudge, never authority.
+        "card_type": meta.get("card_type"),
+        "context_features": meta.get("context_features"),
     })
     store.manifest.set(path, chash, st.st_mtime, version, "ok")
     log.info("research drop ingested: %s (%d chunk(s))", os.path.basename(path), n)

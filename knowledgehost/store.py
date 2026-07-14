@@ -38,7 +38,10 @@ FIELDS = ("id", "source_type", "title", "section", "path_or_url",
 # row.  Used by the research→learning loop to carry the `# Question`, `kb_query`,
 # and provenance/bundle/trust from ingest to the distiller (research_loop_spec §6).
 # These keys are merged into the chunk dicts iter_chunks yields.
-_DOC_META_KEYS = ("question", "kb_query", "provenance", "bundle", "trust", "kind")
+_DOC_META_KEYS = ("question", "kb_query", "provenance", "bundle", "trust", "kind",
+                  # card hints (brains): the shape a research drop says its answer
+                  # wants to be + WHEN it applies — read back by the distiller.
+                  "card_type", "context_features")
 
 
 def _doc_meta_init(db):

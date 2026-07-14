@@ -9,7 +9,13 @@ The host reads three things out of it:
     and distilled (the ``## Answer`` is Vinkona's synthesis, kept only as a fallback
     when a doc carries no sources);
   * front-matter ``kb_query`` — the verbatim query that opened the gap, so a card
-    grounding it can close that ``knowledge_gap`` (§6.2).
+    grounding it can close that ``knowledge_gap`` (§6.2);
+  * optional card HINTS — ``card_type`` (requirements | decision | playbook | case |
+    procedure) and ``context_features`` (a one-line JSON object of {feature: value}
+    pairs saying WHEN the answer applies).  Vinkona writes these when her research
+    concluded in an actionable shape; the distiller uses them to run the matching
+    typed-card extractor and to seed the card's discriminators.  Hints are a nudge,
+    never authority — extraction stays grounded only in the drop's text.
 
 Stdlib only (no PyYAML): we hand-parse the handful of scalar keys we need.
 Everything here is treated as untrusted DATA — the host sanitises on ingest and
@@ -17,6 +23,7 @@ the filename is never interpolated anywhere.
 """
 from __future__ import annotations
 
+import json
 import re
 
 _FM = re.compile(r"^﻿?---[ \t]*\r?\n(.*?)\r?\n---[ \t]*\r?\n", re.DOTALL)
@@ -115,9 +122,15 @@ def parse_research_doc(path: str) -> tuple[str, list, dict]:
             continue
         i += 1
 
+    card_type = (fm.get("card_type") or "").strip().lower() or None
     blocks = source_blocks
     if not blocks and answer:                            # no sources → distil the synthesis
         blocks = [("Answer", answer)]
+    elif answer and card_type:
+        # Hinted drop: the shaped answer IS the typed-card source (the sources are raw
+        # evidence; the conclusion lives in the Answer).  Chunk it too, first — the
+        # distiller runs the typed extractor on the Answer chunk exactly once.
+        blocks = [("Answer", answer)] + blocks
 
     meta = {
         "provenance": (fm.get("provenance") or "vinkona").lower(),
@@ -126,5 +139,25 @@ def parse_research_doc(path: str) -> tuple[str, list, dict]:
         "question": question or None,
         "answer": answer or None,
         "trust": fm.get("trust") or None,               # 'low' | number | None (label only)
+        "card_type": card_type,
+        "context_features": _parse_features(fm.get("context_features")),
     }
     return question, blocks, meta
+
+
+def _parse_features(raw) -> dict | None:
+    """The ``context_features`` hint: a one-line JSON object of {feature: value}
+    strings.  Anything else (absent, malformed, wrong shapes) → None — a bad hint
+    must never break ingestion of the drop itself."""
+    if not raw or not str(raw).strip():
+        return None
+    try:
+        obj = json.loads(str(raw))
+    except ValueError:
+        return None
+    if not isinstance(obj, dict):
+        return None
+    out = {str(k).strip().lower(): str(v).strip()
+           for k, v in obj.items()
+           if str(k).strip() and isinstance(v, (str, int, float)) and str(v).strip()}
+    return dict(list(out.items())[:8]) or None
