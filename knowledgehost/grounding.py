@@ -27,6 +27,27 @@ _HIGH_STAKES = re.compile(
     r"medication|toxic|lethal|allerg|surger|diagnos|treat|symptom|legal|tax)\w*",
     re.I)
 
+# Domain overlays extend the high-stakes vocabulary without forking this file:
+# config `high_stakes_extra = ["pattern", …]` (regex, case-insensitive) is registered
+# here at load_config time.  A specialised distribution ships its own patterns as a
+# config fragment — the engine stays domain-neutral.
+_HIGH_STAKES_EXTRA: dict = {}          # pattern string -> compiled (idempotent)
+
+
+def extend_high_stakes(patterns) -> int:
+    """Register extra high-stakes regex patterns (strings).  Invalid patterns are
+    skipped (a bad overlay must not take the engine down).  Returns how many are
+    now registered."""
+    for p in ([patterns] if isinstance(patterns, str) else (patterns or [])):
+        p = p.strip() if isinstance(p, str) else ""
+        if not p or p in _HIGH_STAKES_EXTRA:
+            continue
+        try:
+            _HIGH_STAKES_EXTRA[p] = re.compile(p, re.I)
+        except re.error:
+            continue
+    return len(_HIGH_STAKES_EXTRA)
+
 _WORDISH = re.compile(r"[a-z0-9]+")
 
 
@@ -62,7 +83,11 @@ def classify_intent(q: str) -> str:
 def default_rigor(q: str) -> str:
     """Stakes decide rigor, not regime (§10).  A cautious heuristic stand-in for
     the supervisor tier: high for safety/▲-consequence wording, else low."""
-    return "high" if _HIGH_STAKES.search(q or "") else "low"
+    if _HIGH_STAKES.search(q or ""):
+        return "high"
+    if any(rx.search(q or "") for rx in _HIGH_STAKES_EXTRA.values()):
+        return "high"
+    return "low"
 
 
 # A few natural-language phrasings that map onto vocabulary values the bare token

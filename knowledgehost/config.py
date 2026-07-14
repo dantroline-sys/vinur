@@ -34,6 +34,13 @@ DEFAULTS = {
     "port": 8771,
     "auth_token": "",      # if set, /call requires  Authorization: Bearer <it>
 
+    # Extra HIGH-STAKES query patterns (regex, case-insensitive) OR'd into the built-in
+    # rigor heuristic (grounding.default_rigor) — a query matching any of them defaults
+    # to rigor='high' (source firewall + strength adjudication).  This is the extension
+    # point a specialised domain overlay uses to ship its vocabulary as configuration,
+    # keeping the engine itself domain-neutral.
+    "high_stakes_extra": [],
+
     # ── embeddings (the nomic endpoint, shared with Vinkona's memory store) ────
     # Co-located on the Linux GPU box at 127.0.0.1:11437 (llama.cpp --embedding,
     # OpenAI /v1/embeddings).  Asymmetric model => task prefixes (search_query: /
@@ -434,7 +441,8 @@ _BOOL_KEYS = {"embed_task_prefix", "ocr", "verify", "strict",
               "conceptnet_include_lexical", "ann_search", "ann_mmap", "wiki_semantic",
               "ask_fit_gate", "use_spacy", "library_dense"}
 _LIST_KEYS = {"sources", "extensions", "distill_urls", "extract_urls", "verify_urls",
-              "encrypted_bundles", "library_sources", "stopwords_extra"}
+              "encrypted_bundles", "library_sources", "stopwords_extra",
+              "high_stakes_extra"}
 
 
 def _coerce(key: str, value):
@@ -748,4 +756,9 @@ def load_config(path: str | None = None) -> dict:
         cfg["control_dir"] = _abspath(cfg["control_dir"])
     cfg["library_sources"] = [_abspath(s) for s in cfg.get("library_sources", [])]
     cfg["sources"] = [_abspath(s) for s in cfg["sources"]]
+    if cfg.get("high_stakes_extra"):
+        # Domain overlays extend the rigor heuristic through config, keeping the
+        # engine itself domain-neutral (grounding.extend_high_stakes is idempotent).
+        from . import grounding as _grounding
+        _grounding.extend_high_stakes(cfg["high_stakes_extra"])
     return cfg
