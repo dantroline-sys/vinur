@@ -543,8 +543,12 @@ def _run_bundles(cfg, args, log) -> int:
             name = args.args[0]
             scen = B.scenario_def(cfg, name)
             srcs = B.list_sources(kb._raw)
-            picked = (B.select_sources(srcs, scen) if (scen or name != "all")
+            unloaded = B.unloaded_set(cfg)
+            picked = (B.select_sources(srcs, scen, unloaded)
+                      if (scen or name != "all" or unloaded)
                       else {s['doc_id'] for s in srcs})
+            if unloaded:
+                print(f"(unloaded brains: {', '.join(sorted(unloaded))})")
             print(f"scenario '{name}' → {len(picked)} source(s):")
             for s in srcs:
                 if s["doc_id"] in picked:
@@ -719,9 +723,10 @@ def main(argv=None):
                              "import-glucose", "import-causenet", "unimport", "embed-nodes", "build-ann",
                              "optimize", "stats", "reset", "bump-version", "migrate-vocab",
                              "bundles", "split", "source", "scenario", "eval", "facetize",
-                             "ingest-library", "rebuild-fts"])
+                             "ingest-library", "rebuild-fts", "import-bundle", "eject-bundle"])
     # positional args for the modular-bundle verbs:
     #   source <doc_id> [--title ..] [--bundle ..]   scenario [name]   split [dir]
+    #   import-bundle <file.kdb>     eject-bundle <bundle>
     ap.add_argument("args", nargs="*", help="positional args for bundles/source/scenario/split")
     ap.add_argument("-c", "--config", help="path to a TOML config file")
     ap.add_argument("--host"); ap.add_argument("--port", type=int)
@@ -746,7 +751,17 @@ def main(argv=None):
                     help="adjudicate: run ONLY the deterministic pre-pass, no LM")
     ap.add_argument("--fast", action="store_true",
                     help="adjudicate/link: use the fast 9B (4090) instead of the big LM (3090)")
-    ap.add_argument("--path", help="import-conceptnet: path to assertions.csv dump")
+    ap.add_argument("--path", help="import-conceptnet/import-bundle: path to the input file")
+    ap.add_argument("--name", help="import-bundle: bundle name to absorb the file under "
+                                   "(default: its manifest name, else the file stem)")
+    ap.add_argument("--trust", choices=["low", "keep"], default="low",
+                    help="import-bundle: cap the brain's support trust to 'low' (default; "
+                         "shipped knowledge earns promotion) or 'keep' its own values "
+                         "(your own brains moving between your own boxes)")
+    ap.add_argument("--dry-run", action="store_true", dest="dry_run",
+                    help="eject-bundle: scan and count, delete nothing")
+    ap.add_argument("--no-export", action="store_true", dest="no_export",
+                    help="eject-bundle: skip the safety export to <bundle>.kdb first")
     ap.add_argument("--min-weight", type=float, dest="min_weight",
                     help="import-conceptnet: drop assertions below this weight")
     ap.add_argument("--all", action="store_true",
@@ -846,6 +861,43 @@ def main(argv=None):
 
     if args.command in ("bundles", "split", "source", "scenario"):   # modular §16, KB-only
         return _run_bundles(cfg, args, log)
+    if args.command == "import-bundle":       # absorb a shipped brain into the master
+        import json as _json
+        from . import bundles as B
+        path = (args.args[0] if args.args else None) or args.path
+        if not path:
+            log.error("import-bundle needs the file: import-bundle <file.kdb> "
+                      "[--name N] [--trust low|keep]")
+            return 1
+        try:
+            res = B.import_bundle(cfg, path, name=args.name, trust=args.trust,
+                                  log_fn=log.info)
+        except ValueError as e:
+            log.error("%s", e)
+            return 1
+        kb = KB({**cfg, "ann_search": False})   # facet the new rows right away
+        try:
+            res["facetized"] = kb.facetize()
+        finally:
+            kb.close()
+        print(_json.dumps(res, indent=2))
+        return 0
+    if args.command == "eject-bundle":        # export, then permanently remove one bundle
+        import json as _json
+        from . import bundles as B
+        bundle = (args.args[0] if args.args else None) or args.bundle
+        if not bundle:
+            log.error("eject-bundle needs the bundle name: eject-bundle <bundle> "
+                      "[--dry-run] [--no-export]")
+            return 1
+        try:
+            st = B.eject_bundle(cfg, bundle, export_first=not args.no_export,
+                                dry_run=args.dry_run, log_fn=log.info)
+        except ValueError as e:
+            log.error("%s", e)
+            return 1
+        print(_json.dumps(st, indent=2))
+        return 0
 
     if args.command == "eval":                # retrieval eval harness (KB + embedder)
         return _run_eval(cfg, log, gold=args.gold, retriever=args.retriever, trace=args.trace)

@@ -262,6 +262,11 @@ DEFAULTS = {
     #                  [scenarios.casual]\n   exclude = ["geology"]
     # tokens match a source's bundle tag, doc_id, or title; "*" = everything.
     "scenarios": {},
+    # Runtime brain toggle (the /brain endpoint + kb_brain tool): bundles listed
+    # here are pruned AFTER the scenario — "unload the X brain" without touching
+    # scenario definitions.  Comma-separated bundle names; persisted by the
+    # panel/tool so the choice survives a restart.  Empty ⇒ everything loads.
+    "unloaded_bundles": "",
     # ── encryption at rest (overlay/sensitive bundles; spec §16.6) ────────────
     # SQLCipher (via pysqlcipher3/sqlcipher3) encrypts flagged bundle files at rest.
     # Key comes from $KNOWLEDGEHOST_DB_KEY (or the OS keystore) — never stored here.
@@ -502,6 +507,10 @@ EDITABLE_SETTINGS = frozenset({
     "rerank_pool", "snippet_max_len",
     # read-time knowledge mode
     "mode", "strict",
+    # runtime brain toggle (comma-separated bundle names; the /brain endpoint
+    # and Bundles panel write it — it's state, but scalar round-tripping through
+    # the same writer keeps one persistence path)
+    "unloaded_bundles",
 })
 
 # Belt-and-braces: even if a sensitive key were mistakenly added to the allowlist,

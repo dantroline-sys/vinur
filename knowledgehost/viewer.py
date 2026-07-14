@@ -645,9 +645,18 @@ async function loadBundles() {
     scen.innerHTML = names.map(n => `<option ${n === r.active ? 'selected' : ''}>${esc(n)}</option>`).join('');
   }
   const enc = new Set(r.encrypted_bundles || []);
-  const grp = (r.bundles || []).map(b =>
-    `<tr><td><code>${esc(b.bundle)}</code>${enc.has(b.bundle) ? ' 🔒' : ''}</td><td>${b.sources}</td></tr>`).join('')
-    || '<tr><td colspan=2 style="opacity:.5">no sources yet</td></tr>';
+  const off = new Set(r.unloaded || []);
+  const grp = (r.bundles || []).map(b => {
+    const loaded = !off.has(b.bundle);
+    return `<tr><td><code>${esc(b.bundle)}</code>${enc.has(b.bundle) ? ' 🔒' : ''}</td>`
+      + `<td>${b.sources}</td>`
+      + `<td>${loaded ? '<span style="color:#0a0">loaded</span>' : '<span style="opacity:.5">unloaded</span>'}</td>`
+      + `<td><button class="toolbtn" onclick="brainToggle('${esc(b.bundle)}', ${loaded ? 'false' : 'true'})">`
+      + `${loaded ? 'unload' : 'load'}</button> `
+      + `<button class="toolbtn" title="export to .kdb, then permanently remove from the master (shared rows survive)" `
+      + `onclick="ejectBundle('${esc(b.bundle)}')">eject…</button></td></tr>`;
+  }).join('')
+    || '<tr><td colspan=4 style="opacity:.5">no sources yet</td></tr>';
   const scenRows = Object.entries(r.scenarios || {}).map(([n, d]) =>
     `<tr><td><code>${esc(n)}</code>${n === r.active ? ' <span class="badge">active</span>' : ''}</td>`
     + `<td style="opacity:.7">${d.include ? 'include ' + esc((d.include || []).join(', ')) : ''}`
@@ -673,7 +682,16 @@ async function loadBundles() {
     + (r.modular ? ` — working DB <code>${esc((r.working || '').split('/').pop())}</code>` : ' — master (no scenario)')
     + `</div>`
     + `<div style="display:flex;gap:24px;flex-wrap:wrap;align-items:flex-start">`
-    + `<div><h4 style="margin:4px 0">Bundles</h4><table><tr><th>bundle</th><th>sources</th></tr>${grp}</table></div>`
+    + `<div><h4 style="margin:4px 0">Brains (bundles)</h4>`
+    + `<table><tr><th>bundle</th><th>sources</th><th>state</th><th></th></tr>${grp}</table>`
+    + `<div style="opacity:.6;font-size:.85em;max-width:420px;margin-top:4px">load/unload is instant and`
+    + ` non-destructive (reassembles the working DB); eject exports the bundle to its .kdb first,`
+    + ` then removes it from the master — re-import the file to undo.</div>`
+    + `<div style="margin-top:8px"><input id="brainfile" placeholder="/path/to/brain.kdb" style="width:220px">`
+    + ` <input id="brainname" placeholder="name (optional)" style="width:110px">`
+    + ` <label title="cap the brain's trust to 'low' (recommended for shipped files); keep = trust its own values">`
+    + `<input type="checkbox" id="braintrust"> keep trust</label>`
+    + ` <button class="toolbtn" onclick="importBrain()">import brain…</button></div></div>`
     + `<div><h4 style="margin:4px 0">Scenarios</h4><table><tr><th>name</th><th>rule</th></tr>${scenRows}</table></div>`
     + `</div>`
     + `<h4 style="margin:14px 0 4px">Sources — rename, assign a bundle, set the licence &amp; licensor (writes to master)</h4>`
@@ -685,6 +703,40 @@ async function saveSource(doc) {
     license: g('license'), license_holder: g('license_holder') }).catch(e => ({ ok: false, error: '' + e }));
   $('#banner').innerHTML = `<div class="note">${r.ok ? '✓ saved ' + esc(doc) + ' — ' + esc(r.note || '') : '✗ ' + esc(r.error || 'failed')}</div>`;
   if (r.ok) loadBundles();
+}
+async function brainToggle(name, load) {
+  $('#banner').innerHTML = `<div class="note">${load ? 'loading' : 'unloading'} '${esc(name)}' — reassembling…</div>`;
+  const r = await postJSON('/brain', { action: load ? 'load' : 'unload', brain: name })
+    .catch(e => ({ ok: false, error: '' + e }));
+  $('#banner').innerHTML = `<div class="note">${r.ok ? '✓ ' + esc(r.note || 'done')
+    + (r.persisted === false ? ' — <b>not persisted</b> (no config file)' : '')
+    : '✗ ' + esc(r.error || 'failed')}</div>`;
+  if (r.ok) { loadBundles(); refreshStats(); }
+}
+async function importBrain() {
+  const path = $('#brainfile').value.trim();
+  if (!path) { $('#banner').innerHTML = '<div class="note">✗ enter the .kdb path (on the host box)</div>'; return; }
+  const args = { path };
+  const name = $('#brainname').value.trim();
+  if (name) args.name = name;
+  if ($('#braintrust').checked) args.trust = 'keep';
+  $('#banner').innerHTML = '<div class="note">importing — watch Operations for progress…</div>';
+  const r = await postJSON('/ops/run', { command: 'import-bundle', args })
+    .catch(e => ({ ok: false, error: '' + e }));
+  $('#banner').innerHTML = `<div class="note">${r.ok
+    ? '✓ import started — see Operations; when it finishes, the brain appears here (load it to serve it)'
+    : '✗ ' + esc(r.error || 'failed')}</div>`;
+}
+async function ejectBundle(name) {
+  if (!confirm(`Eject '${name}' from the master?\n\nIts closure is exported to ${name}.kdb first, `
+    + `so re-importing that file undoes this. Shared rows survive with the ejected provenance `
+    + `stripped.\n\n(Want counts first? Cancel, then run eject-bundle with dry_run in Operations.)`))
+    return;
+  const r = await postJSON('/ops/run', { command: 'eject-bundle', args: { bundle: name } })
+    .catch(e => ({ ok: false, error: '' + e }));
+  $('#banner').innerHTML = `<div class="note">${r.ok
+    ? '✓ eject started — see Operations; reload this tab when it finishes'
+    : '✗ ' + esc(r.error || 'failed')}</div>`;
 }
 async function applyScenario() {
   const name = $('#scensel') ? $('#scensel').value : '';

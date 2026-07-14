@@ -261,15 +261,26 @@ class Handler(BaseHTTPRequestHandler):
             if not self._authed():
                 return self._send_json({"ok": False, "error": "unauthorized"}, 401)
             from . import bundles as B
-            kb = getattr(self.server, "kb", None)
             scenarios = self.cfg.get("scenarios") or {}
+            # Read from the MASTER, not the served working copy: the panel is an
+            # authoring surface, and an unloaded/scenario-excluded bundle must
+            # still be visible (or it could never be switched back on).
+            try:
+                mkb = self.server.open_master_kb()
+                try:
+                    bsum, srcs = mkb.bundle_summary(), mkb.list_sources(500)
+                finally:
+                    mkb.close()
+            except Exception:                      # no master yet — empty panel
+                bsum, srcs = [], []
             return self._send_json({
                 "ok": True,
-                "bundles": kb.bundle_summary() if kb else [],
-                "sources": kb.list_sources(500) if kb else [],
+                "bundles": bsum,
+                "sources": srcs,
                 "scenarios": {n: (scenarios[n] if isinstance(scenarios[n], dict) else {})
                               for n in scenarios},
                 "active": B.active_scenario_name(self.cfg),
+                "unloaded": sorted(B.unloaded_set(self.cfg)),
                 "master": self.server.master_kb_path(),
                 "working": self.cfg.get("kb_path"),
                 "modular": B.is_modular(self.cfg),
@@ -311,7 +322,8 @@ class Handler(BaseHTTPRequestHandler):
     def do_POST(self):
         path = urlparse(self.path).path
         if path not in ("/call", "/ops/run", "/ops/stop", "/ops/reload", "/config",
-                        "/ops/autopilot", "/library/config", "/source", "/scenario"):
+                        "/ops/autopilot", "/library/config", "/source", "/scenario",
+                        "/brain"):
             return self._send_json({"ok": False, "error": "not found"}, 404)
         if not self._authed():
             return self._send_json({"ok": False, "error": "unauthorized"}, 401)
@@ -401,6 +413,22 @@ class Handler(BaseHTTPRequestHandler):
                 return self._send_json(
                     {"ok": False, "error": f"{type(e).__name__}: {e}"}, 500)
             return self._send_json({"ok": True, **info})
+        if path == "/brain":                           # runtime brain toggle (non-destructive)
+            action = (req.get("action") or "").strip().lower()
+            try:
+                if action == "list":
+                    return self._send_json({"ok": True, **self.server.brain_summary()})
+                if action in ("load", "unload"):
+                    out = self.server.brain_toggle((req.get("brain") or "").strip(),
+                                                   load=(action == "load"))
+                    return self._send_json({"ok": True, **out})
+            except ValueError as e:
+                return self._send_json({"ok": False, "error": str(e)}, 400)
+            except Exception as e:                     # swap failure — report, don't 500-html
+                return self._send_json(
+                    {"ok": False, "error": f"{type(e).__name__}: {e}"}, 500)
+            return self._send_json(
+                {"ok": False, "error": "action must be list | load | unload"}, 400)
 
 
 class KnowledgeHostServer(ThreadingHTTPServer):
@@ -417,6 +445,7 @@ class KnowledgeHostServer(ThreadingHTTPServer):
         from . import lm_lease as _L
         self.autopilot = _A.Autopilot(cfg, self.ops, lease_mod=_L)   # priority-driven verb runner
         self._swap_lock = __import__("threading").Lock()
+        tools.brain_host = self                     # lets the kb_brain tool reach the hot-swap
         super().__init__((cfg["host"], cfg["port"]), Handler)
 
     def master_kb_path(self) -> str:
@@ -457,6 +486,58 @@ class KnowledgeHostServer(ThreadingHTTPServer):
                     pass
             return {"scenario": bundles.active_scenario_name(self.cfg),
                     "working_db": work, "counts": new_kb.counts()}
+
+    # ── brains: the runtime load/unload surface (kb_brain tool + /brain) ──────
+    def brain_summary(self) -> dict:
+        """Every bundle in the MASTER with its size and loaded state — 'loaded'
+        is the runtime toggle only; a scenario may exclude it independently."""
+        from . import bundles as B
+        mkb = self.open_master_kb()
+        try:
+            summ = mkb.bundle_summary()
+        finally:
+            mkb.close()
+        unloaded = B.unloaded_set(self.cfg)
+        return {"brains": [{"name": b["bundle"], "sources": b["sources"],
+                            "loaded": b["bundle"] not in unloaded}
+                           for b in summ],
+                "unloaded": sorted(unloaded),
+                "active_scenario": B.active_scenario_name(self.cfg)}
+
+    def brain_toggle(self, name: str, *, load: bool) -> dict:
+        """Flip one brain on/off: update unloaded_bundles, persist it when a
+        config file exists, and hot-swap the working DB.  Non-destructive —
+        the master is untouched; this only changes what the session serves."""
+        from . import bundles as B
+        mkb = self.open_master_kb()
+        try:
+            known = {b["bundle"] for b in mkb.bundle_summary()}
+        finally:
+            mkb.close()
+        if name not in known:
+            raise ValueError(f"no such brain: '{name}' "
+                             f"(available: {', '.join(sorted(known))})")
+        unloaded = B.unloaded_set(self.cfg)
+        already = (name not in unloaded) if load else (name in unloaded)
+        if already:
+            return {**self.brain_summary(),
+                    "note": f"'{name}' is already {'loaded' if load else 'unloaded'}"}
+        (unloaded.discard if load else unloaded.add)(name)
+        self.cfg["unloaded_bundles"] = ",".join(sorted(unloaded))
+        persisted = False
+        cp = self.cfg.get("_config_path")
+        if cp:
+            try:
+                from .config import update_config_file
+                update_config_file(cp, {"unloaded_bundles":
+                                        self.cfg["unloaded_bundles"]})
+                persisted = True
+            except (ValueError, OSError) as e:     # session still switches; say so
+                log.warning("unloaded_bundles not persisted: %s", e)
+        swap = self.swap_scenario(None)
+        return {**self.brain_summary(), "swap": swap, "persisted": persisted,
+                "note": f"{'loaded' if load else 'unloaded'} '{name}'"
+                        + ("" if persisted else " (this session only — no config file)")}
 
 
 def serve(cfg, store, tools, kb=None):

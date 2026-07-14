@@ -16,6 +16,17 @@ Two directions, one closure primitive:
   the closure straight from the master.  Either way the hot read path stays
   single-file (spec §16.7: "ship granular, run consolidated").
 
+On top of those, the **brain** operations (a brain = a shippable bundle file):
+- **import_bundle**  absorb a FOREIGN ``.kdb`` — one authored elsewhere — into
+  the master under a single bundle name.  New rows get their support trust
+  capped so shipped knowledge lands at trust_tier 'low' no matter what the file
+  claims; rows already in the master (same content hash) are never touched.
+- **eject_bundle**  the inverse: export the bundle's closure to its ``.kdb``
+  (nothing is ever lost), then remove its provenance from the master —
+  refcount-aware, so shared rows survive with the ejected support stripped.
+- **load / unload**  are not here at all: they are just the ``unloaded_bundles``
+  selection filter + a working-DB reassembly, completely non-destructive.
+
 Everything here is plain sqlite3 + json (no numpy / no GPU) so it runs anywhere
 the CLI does and is unit-testable without the model stack.
 """
@@ -40,6 +51,12 @@ KNOWLEDGE_TABLES = ("source_registry", "nodes", "procedure_cards", "edges",
 
 BUNDLE_EXT = ".kdb"
 DEFAULT_BUNDLE = "base"
+
+# Support-trust ceiling stamped on rows a foreign brain contributes: below
+# facets._TRUST_MED (0.40), so every derived trust_tier facet comes out 'low'.
+# The read path (fit-gate, retrieval filters) then treats shipped knowledge
+# with appropriate skepticism until the operator promotes it deliberately.
+IMPORT_TRUST_CAP = 0.35
 
 
 # ── low-level sqlite helpers ─────────────────────────────────────────────────
@@ -175,19 +192,245 @@ def extract_closure(src: sqlite3.Connection, dst: sqlite3.Connection,
 
 
 def merge_db(src: sqlite3.Connection, dst: sqlite3.Connection,
-             tables=KNOWLEDGE_TABLES) -> dict:
+             tables=KNOWLEDGE_TABLES, *, intersect: bool = False) -> dict:
     """Wholesale ``INSERT OR IGNORE`` copy of an already-closed bundle file into
     the working DB.  Order doesn't matter and re-runs are idempotent (content-hash
-    ids), so merging N bundles is just calling this N times."""
+    ids), so merging N bundles is just calling this N times.  ``intersect`` copies
+    only the columns both sides have — for FOREIGN files whose schema may lead or
+    trail ours (a missing column takes the schema default on insert)."""
     counts: dict = {}
     for t in tables:
-        if not _has_table(src, t):
+        if not _has_table(src, t) or not _has_table(dst, t):
             continue
         cols = _cols(src, t)
-        rows = [tuple(r) for r in src.execute(f"SELECT * FROM {t}")]
+        if intersect:
+            dcols = set(_cols(dst, t))
+            cols = [c for c in cols if c in dcols]
+            if not cols:
+                continue
+            sel = ",".join(cols)
+            rows = [tuple(r) for r in src.execute(f"SELECT {sel} FROM {t}")]
+        else:
+            rows = [tuple(r) for r in src.execute(f"SELECT * FROM {t}")]
         counts[t] = _copy(dst, t, cols, rows)
     dst.commit()
     return counts
+
+
+# ── manifest: a .kdb file's self-description ─────────────────────────────────
+def write_manifest(dst: sqlite3.Connection, bundle: str, counts: dict,
+                   cfg: dict) -> None:
+    """Single-row JSON manifest inside a bundle file: what it is, when it was
+    exported, and which embed model produced its node vectors (an importer on a
+    different model strips the vectors and re-embeds)."""
+    dst.execute("CREATE TABLE IF NOT EXISTS bundle_manifest(json TEXT)")
+    dst.execute("DELETE FROM bundle_manifest")
+    dst.execute("INSERT INTO bundle_manifest(json) VALUES(?)", (json.dumps({
+        "format": 1, "name": bundle, "created": time.time(),
+        "embed_model": cfg.get("embed_model") or "",
+        "counts": counts}),))
+
+
+def read_manifest(conn: sqlite3.Connection) -> dict | None:
+    if not _has_table(conn, "bundle_manifest"):
+        return None
+    row = conn.execute("SELECT json FROM bundle_manifest LIMIT 1").fetchone()
+    try:
+        m = json.loads(row[0]) if row else None
+        return m if isinstance(m, dict) else None
+    except (ValueError, TypeError):
+        return None
+
+
+def inspect_bundle_file(path: str) -> dict:
+    """What's in a .kdb without importing it — for the panel / CLI preview."""
+    p = Path(path).expanduser()
+    if not p.exists():
+        raise ValueError(f"no such file: {p}")
+    conn = _connect(str(p))
+    try:
+        if not _has_table(conn, "source_registry") or not _has_table(conn, "nodes"):
+            raise ValueError(f"{p.name} is not a knowledge bundle "
+                             "(missing source_registry/nodes)")
+        counts = {t: conn.execute(f"SELECT COUNT(*) FROM {t}").fetchone()[0]
+                  for t in KNOWLEDGE_TABLES if _has_table(conn, t)}
+        return {"file": str(p), "manifest": read_manifest(conn),
+                "sources": list_sources(conn), "counts": counts}
+    except sqlite3.DatabaseError as e:
+        raise ValueError(f"{p.name} is not readable as a bundle "
+                         f"(encrypted, or not sqlite): {e}") from None
+    finally:
+        conn.close()
+
+
+# ── import: absorb a foreign brain into the master ──────────────────────────
+def _cap_support_trust(support_json, cap: float):
+    """Cap every support entry's trust at `cap`; None if nothing changed."""
+    try:
+        entries = json.loads(support_json or "[]")
+    except (ValueError, TypeError):
+        return None
+    changed = False
+    for e in entries if isinstance(entries, list) else []:
+        t = e.get("trust") if isinstance(e, dict) else None
+        if isinstance(t, (int, float)) and t > cap:
+            e["trust"] = round(cap, 3)
+            changed = True
+    return json.dumps(entries) if changed else None
+
+
+def _new_ids(master: sqlite3.Connection, pre: set, table: str,
+             key: str = "id") -> list:
+    return [r[0] for r in master.execute(f"SELECT {key} FROM {table}")
+            if r[0] not in pre]
+
+
+def import_bundle(cfg: dict, path: str, *, name: str | None = None,
+                  trust: str = "low", log_fn=None) -> dict:
+    """Absorb a foreign ``.kdb`` into the MASTER under one bundle name.
+
+    Content-hash ids make this idempotent: re-importing the same brain is a
+    no-op, and rows the master already has are never modified (so a shared
+    concept keeps its local trust/provenance).  Everything NEW gets:
+      * its source rows rebranded to the single bundle `name`
+        (default: manifest name, else the file stem) — a shipped file that
+        calls itself 'base' can't pollute the local base group;
+      * support trust capped at IMPORT_TRUST_CAP unless trust='keep'
+        (use 'keep' for your own brains moving between your own boxes);
+      * embeddings stripped when the file's manifest names a different embed
+        model than this install (embed-nodes backfills them).
+    Returns counts + follow-up notes.  Load/unload afterwards is the
+    ``unloaded_bundles`` filter; permanent removal is ``eject_bundle``."""
+    say = log_fn or log.info
+    if trust not in ("low", "keep"):
+        raise ValueError(f"trust must be 'low' or 'keep', not {trust!r}")
+    info = inspect_bundle_file(path)               # validates the file
+    src_sources = info["sources"]
+    bundle = _slug(name or (info["manifest"] or {}).get("name")
+                   or Path(path).stem)
+    master_path = str(Path(cfg.get("_master_kb_path")
+                           or cfg["kb_path"]).expanduser())
+    if not os.path.exists(master_path):
+        raise ValueError(f"no master kb at {master_path} — run ingest first "
+                         "(or copy the brain in as your kb.db)")
+
+    src = _connect(str(Path(path).expanduser()))
+    master = _connect(master_path)
+    try:
+        existing = {s["bundle"] for s in list_sources(master)}
+        src_docs = {s["doc_id"] for s in src_sources}
+        pre_docs = {r[0] for r in master.execute(
+            "SELECT doc_id FROM source_registry")}
+        if bundle in existing and not (src_docs & pre_docs):
+            raise ValueError(
+                f"bundle '{bundle}' already exists in the master — import "
+                f"with a different --name, or eject '{bundle}' first")
+
+        # what the master holds NOW, so we can tell which rows are the brain's
+        pre = {t: {r[0] for r in master.execute(f"SELECT id FROM {t}")}
+               for t in ("nodes", "procedure_cards", "edges")}
+
+        counts = merge_db(src, master, intersect=True)
+
+        new_docs = [d for d in src_docs if d not in pre_docs]
+        newness = {t: _new_ids(master, pre[t], t)
+                   for t in ("nodes", "procedure_cards", "edges")}
+
+        # 1. rebrand: every source THIS import introduced joins bundle `name`
+        master.executemany(
+            "UPDATE source_registry SET bundle=? WHERE doc_id=?",
+            [(bundle, d) for d in new_docs])
+
+        # 2. trust cap on the brain's own rows (shared rows were IGNOREd)
+        capped = 0
+        if trust == "low":
+            for t in ("nodes", "procedure_cards", "edges"):
+                ids = newness[t]
+                for i in range(0, len(ids), 500):
+                    batch = ids[i:i + 500]
+                    qm = ",".join("?" * len(batch))
+                    upd = []
+                    for rid, sup in master.execute(
+                            f"SELECT id, support FROM {t} WHERE id IN ({qm})",
+                            batch):
+                        s2 = _cap_support_trust(sup, IMPORT_TRUST_CAP)
+                        if s2 is not None:
+                            upd.append((s2, rid))
+                    master.executemany(
+                        f"UPDATE {t} SET support=? WHERE id=?", upd)
+                    capped += len(upd)
+            master.executemany(
+                "UPDATE source_registry SET trust_weight=? WHERE doc_id=? "
+                "AND (trust_weight IS NULL OR trust_weight>?)",
+                [(IMPORT_TRUST_CAP, d, IMPORT_TRUST_CAP) for d in new_docs])
+
+        # 3. foreign embed model ⇒ the shipped vectors are in the wrong space
+        stripped = 0
+        man_model = (info["manifest"] or {}).get("embed_model") or ""
+        our_model = cfg.get("embed_model") or ""
+        if man_model and our_model and man_model != our_model and newness["nodes"]:
+            ids = newness["nodes"]
+            for i in range(0, len(ids), 500):
+                batch = ids[i:i + 500]
+                qm = ",".join("?" * len(batch))
+                stripped += master.execute(
+                    f"UPDATE nodes SET embedding=NULL WHERE id IN ({qm})",
+                    batch).rowcount
+            say(f"import '{bundle}': embed model mismatch "
+                f"({man_model} ≠ {our_model}) — stripped {stripped} vectors; "
+                "run embed-nodes to backfill")
+        master.commit()
+
+        new_counts = {t: len(v) for t, v in newness.items()}
+        res = {"bundle": bundle, "file": info["file"],
+               "sources_new": len(new_docs),
+               "sources_shared": len(src_docs) - len(new_docs),
+               "new": new_counts, "merged": counts,
+               "trust": trust, "support_capped": capped,
+               "embeddings_stripped": stripped,
+               "next": ["facetize", "build-ann"]
+                       + (["embed-nodes"] if stripped else [])}
+        say(f"import '{bundle}': {len(new_docs)} new source(s), "
+            f"{new_counts} new rows (trust={trust})")
+        return res
+    finally:
+        src.close()
+        master.close()
+
+
+# ── eject: export-then-remove a bundle from the master ──────────────────────
+def eject_bundle(cfg: dict, bundle: str, *, export_first: bool = True,
+                 dry_run: bool = False, log_fn=None) -> dict:
+    """Permanently remove one bundle's provenance from the MASTER — the
+    destructive half of de-merge (the reversible half is just unloading it).
+    Unless dry_run, the bundle's closure is first exported to its ``.kdb``
+    (export_first), so an eject can always be undone by re-importing the file.
+    Shared rows survive with the ejected support stripped (see unimport.py —
+    same refcount rules as the dataset undo)."""
+    say = log_fn or log.info
+    from .kb import KB
+    from .unimport import remove_docs
+    master_path = str(Path(cfg.get("_master_kb_path")
+                           or cfg["kb_path"]).expanduser())
+    mcfg = {**cfg, "kb_path": master_path, "ann_search": False}
+    kb = KB(mcfg)
+    try:
+        docs = {s["doc_id"] for s in list_sources(kb._raw)
+                if s["bundle"] == bundle}
+        if not docs:
+            raise ValueError(f"no sources in bundle '{bundle}' — nothing to eject")
+        exported = None
+        if export_first and not dry_run:
+            exported = split(mcfg, force=True, only={bundle},
+                             log_fn=say).get(bundle, {}).get("file")
+        st = remove_docs(kb, docs, dry_run=dry_run)
+        st.update({"bundle": bundle, "sources": len(docs),
+                   "exported": exported, "dry_run": dry_run})
+        if not dry_run:
+            say(f"eject '{bundle}': {st}")
+        return st
+    finally:
+        kb.close()
 
 
 # ── scenario resolution ──────────────────────────────────────────────────────
@@ -214,16 +457,30 @@ def _match(token: str, row: dict) -> bool:
                                      row.get("title"))
 
 
-def select_sources(sources: list[dict], scenario: dict) -> set:
+def select_sources(sources: list[dict], scenario: dict,
+                   unloaded=()) -> set:
     """Apply a scenario's include/exclude to the source list → set of doc_ids.
     include absent/empty ⇒ everything; exclude prunes.  Retracted sources are
-    always dropped."""
+    always dropped.  ``unloaded`` (the runtime load/unload toggle — see
+    unloaded_set) prunes whole bundles AFTER the scenario, so 'unload the X
+    brain' composes with whatever scenario is active."""
     inc = scenario.get("include") or ["*"]
     exc = scenario.get("exclude") or []
     live = [s for s in sources if s.get("status") != "retracted"]
     picked = [s for s in live if any(_match(t, s) for t in inc)]
     picked = [s for s in picked if not any(_match(t, s) for t in exc)]
+    if unloaded:
+        picked = [s for s in picked if s.get("bundle") not in set(unloaded)]
     return {s["doc_id"] for s in picked}
+
+
+def unloaded_set(cfg: dict) -> set:
+    """Bundles currently switched OFF (the runtime 'unload that brain' state).
+    Persisted as a comma-separated scalar (``unloaded_bundles``) so the panel's
+    config writer can round-trip it; empty ⇒ everything loads."""
+    raw = cfg.get("unloaded_bundles") or ""
+    toks = raw if isinstance(raw, (list, tuple, set)) else str(raw).split(",")
+    return {t.strip() for t in toks if str(t).strip()}
 
 
 def active_scenario_name(cfg: dict) -> str:
@@ -239,10 +496,11 @@ def scenario_def(cfg: dict, name: str) -> dict:
 
 
 def is_modular(cfg: dict) -> bool:
-    """Modularity is engaged only when the operator has defined scenarios or asked
-    for a non-default one.  Absent that, everything short-circuits to the master
-    kb.db and behaviour is byte-for-byte identical to before this feature."""
-    if cfg.get("scenarios"):
+    """Modularity is engaged only when the operator has defined scenarios, asked
+    for a non-default one, or unloaded a bundle at runtime.  Absent all three,
+    everything short-circuits to the master kb.db and behaviour is byte-for-byte
+    identical to before this feature."""
+    if cfg.get("scenarios") or unloaded_set(cfg):
         return True
     name = active_scenario_name(cfg)
     return name not in ("", "all")
@@ -292,11 +550,12 @@ def assemble_working_db(cfg: dict, *, force: bool = False, log_fn=None) -> str:
 
     name = active_scenario_name(cfg)
     scen = scenario_def(cfg, name)
+    unloaded = unloaded_set(cfg)
     master = _connect(master_path)                  # base/master is always clear
     try:
         sources = list_sources(master)
-        doc_ids = (select_sources(sources, scen)
-                   if (scen or name != "all")
+        doc_ids = (select_sources(sources, scen, unloaded)
+                   if (scen or name != "all" or unloaded)
                    else {s["doc_id"] for s in sources})
         if not doc_ids:
             say(f"scenario '{name}' selected 0 sources — serving empty working DB")
@@ -405,10 +664,11 @@ def _prune_stale(work_dir: Path, keep: str, limit: int = 6) -> None:
 
 # ── split: master → per-bundle files ─────────────────────────────────────────
 def split(cfg: dict, out_dir: str | None = None, *, force: bool = False,
-          log_fn=None) -> dict:
+          only: set | None = None, log_fn=None) -> dict:
     """Export each provenance group in the master into its own ``<bundle>.kdb``
     file (the group's closure).  Returns {bundle: {file, counts}}.  Idempotent —
-    re-running overwrites the files with a fresh closure."""
+    re-running overwrites the files with a fresh closure.  ``only`` restricts the
+    export to the named bundles (eject uses this for its safety export)."""
     say = log_fn or log.info
     master_path = str(Path(cfg["kb_path"]).expanduser())
     out = Path(out_dir or (cfg.get("bundle_dir") or
@@ -422,6 +682,8 @@ def split(cfg: dict, out_dir: str | None = None, *, force: bool = False,
         groups: dict = {}
         for s in list_sources(master):
             groups.setdefault(s["bundle"], set()).add(s["doc_id"])
+        if only is not None:
+            groups = {b: d for b, d in groups.items() if b in only}
         for bundle, docs in sorted(groups.items()):
             enc = dbcrypt.bundle_is_encrypted(cfg, bundle)
             f = out / f"{_slug(bundle)}{BUNDLE_EXT}"
@@ -436,6 +698,8 @@ def split(cfg: dict, out_dir: str | None = None, *, force: bool = False,
             try:
                 _clone_schema(master, dst)
                 counts = extract_closure(master, dst, docs)
+                write_manifest(dst, bundle, counts, cfg)
+                dst.commit()
             finally:
                 dst.close()
             os.replace(tmp, f)

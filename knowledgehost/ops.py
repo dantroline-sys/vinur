@@ -52,6 +52,10 @@ COMMANDS: dict = {
     "optimize":   {"vacuum": "bool"},
     "stats":      {},
     "split":      {"force": "bool"},    # export each bundle group to its <bundle>.kdb file
+    # brains: absorb a shipped .kdb into the master / permanently remove one bundle.
+    # (Runtime load/unload is NOT here — it's the instant /brain endpoint, no job needed.)
+    "import-bundle": {"path": "path", "name": "str", "trust": "choice:low,keep"},
+    "eject-bundle":  {"bundle": "str", "dry_run": "bool", "no_export": "bool"},
 }
 
 

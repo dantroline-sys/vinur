@@ -81,6 +81,25 @@ CATALOGUE = [
     },
 ]
 
+# Advertised only when the serving host wires itself in (Tools.catalogue) —
+# load/unload needs the live server's hot-swap, so the bare CLI can't offer it.
+BRAIN_TOOL = {
+    "name": "kb_brain",
+    "description": (
+        "List, load, or unload knowledge 'brains' — modular bundles of the "
+        "knowledge base (e.g. a field-geology brain, a base brain). "
+        "action='list' shows each brain, its size, and whether it is loaded. "
+        "action='load'/'unload' switches one on or off for answering: "
+        "non-destructive, reversible, persists across restarts. Use when the "
+        "user asks what knowledge is available, or to load/unload a brain by "
+        "name."),
+    "parameters": {"type": "object", "properties": {
+        "action": {"type": "string", "description": "list | load | unload"},
+        "brain": {"type": "string", "description":
+                  "the brain (bundle) name — required for load/unload"}},
+        "required": ["action"]},
+}
+
 # Advertised only when a library corpus is loaded (Tools.catalogue).
 LIBRARY_TOOL = {
     "name": "library_search",
@@ -108,12 +127,15 @@ class Tools:
         self.cfg = cfg
         self.kb = kb
         self.library_store = library_store        # the search-only document library (optional)
+        self.brain_host = None                    # the serving KnowledgeHostServer (kb_brain)
         self.reranker = make_reranker(cfg)
 
     def catalogue(self):
         tools = list(CATALOGUE)
         if self.library_store is not None:        # only advertise it when a library is loaded
             tools = tools + [LIBRARY_TOOL]
+        if self.brain_host is not None:           # only under a live server (needs hot-swap)
+            tools = tools + [BRAIN_TOOL]
         return {"tools": tools}
 
     def call(self, name: str, arguments: dict) -> dict:
@@ -256,6 +278,29 @@ class Tools:
         if not passages:
             result["note"] = "No match in the local library for this query."
         return {"ok": True, "result": json.dumps(result, ensure_ascii=False)}
+
+    def _t_kb_brain(self, args):
+        """List/load/unload knowledge brains — delegated to the serving host,
+        which owns the working-DB hot-swap and the persistence of the toggle."""
+        host = self.brain_host
+        if host is None:
+            return {"ok": False, "error":
+                    "kb_brain needs the running knowledge-host server"}
+        action = (args.get("action") or "list").strip().lower()
+        if action == "list":
+            return {"ok": True,
+                    "result": json.dumps(host.brain_summary(), ensure_ascii=False)}
+        if action in ("load", "unload"):
+            name = (args.get("brain") or "").strip()
+            if not name:
+                return {"ok": False, "error": f"{action} needs a brain name"}
+            try:
+                out = host.brain_toggle(name, load=(action == "load"))
+            except ValueError as e:
+                return {"ok": False, "error": str(e)}
+            return {"ok": True, "result": json.dumps(out, ensure_ascii=False)}
+        return {"ok": False, "error": f"kb_brain: unknown action {action!r} "
+                                      "(list | load | unload)"}
 
     def _t_kb_ask(self, args):
         query = (args.get("query") or "").strip()
