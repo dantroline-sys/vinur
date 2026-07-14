@@ -58,6 +58,88 @@ COMMANDS: dict = {
     "eject-bundle":  {"bundle": "str", "dry_run": "bool", "no_export": "bool"},
 }
 
+# Human-readable help for the panel (Operations + Prioritizer): what each verb does
+# ("_") and what each option means.  This is what makes an args editor usable —
+# a bare {} tells the operator nothing.
+HELP: dict = {
+    "ingest": {"_": "Parse new/changed documents into raw chunks",
+               "force": "re-process every file, ignoring the seen-manifest",
+               "wikipedia": "also ingest the configured Wikipedia ZIM",
+               "distill": "distil right after ingesting (needs the big LM)",
+               "limit": "max files this run"},
+    "ingest-library": {"_": "Index the search-only document library",
+                       "force": "re-index everything"},
+    "rebuild-fts": {"_": "Rebuild the FTS index with the configured tokenizer"},
+    "distill": {"_": "Distil raw chunks into cards/nodes/edges (the LM pass)",
+                "bundle": "ONLY chunks from this brain/bundle — 'vinkona' = the "
+                          "assistant's research drops, 'base' = untagged documents; "
+                          "empty = everything. Two Prioritizer steps with different "
+                          "bundles are tracked as different steps",
+                "limit": "max chunks this run — bounded batches let higher-priority "
+                         "steps preempt between runs",
+                "watch": "keep running as a concurrent ingest adds chunks",
+                "interval": "watch mode: seconds between passes"},
+    "import-conceptnet": {"_": "Bulk-import the ConceptNet commonsense graph",
+                          "path": "assertions.csv dump (default from config)",
+                          "min_weight": "drop assertions weaker than this",
+                          "all": "include weak/lexical relations",
+                          "exclude": "comma-separated relations to skip"},
+    "import-atomic": {"_": "Bulk-import the ATOMIC if-then graph",
+                      "path": "dump file (default from config)",
+                      "min_count": "drop rare events", "limit": "cap rows"},
+    "import-glucose": {"_": "Bulk-import the GLUCOSE causal dataset",
+                       "path": "dump file", "min_count": "drop rare rows",
+                       "limit": "cap rows"},
+    "import-causenet": {"_": "Bulk-import CauseNet cause→effect pairs",
+                        "path": "dump file", "min_sources": "evidence floor",
+                        "limit": "cap rows"},
+    "unimport": {"_": "Provenance-aware undo of one bulk dataset import",
+                 "dataset": "which import to remove"},
+    "migrate-vocab": {"_": "One-shot pre-1.2 → 1.2 vocabulary migration"},
+    "link": {"_": "Type structural edges between related cards (LM judged)",
+             "limit": "max pairs this run", "fast": "use the fast 9B instead of the big LM",
+             "top_k": "embedding neighbours considered per node"},
+    "refine": {"_": "Rewrite cards against their own sources (grounded, in place)",
+               "limit": "max cards this run", "force": "also re-refine already-refined cards"},
+    "adjudicate": {"_": "Judge duplicate-node merge candidates",
+                   "limit": "max pairs this run", "batch": "pairs per LM call",
+                   "fast": "use the fast 9B", "no_auto": "LM judges everything",
+                   "auto_only": "only the high-similarity auto-merges"},
+    "reconcile": {"_": "Propose cross-source merges by embedding similarity",
+                  "limit": "max clusters", "top_k": "neighbours per anchor",
+                  "anchors": "corpus = card-bearing only; all = every node"},
+    "build-ann": {"_": "Build the fast dense-search index over node vectors"},
+    "embed-nodes": {"_": "Backfill embeddings for nodes that have none",
+                    "limit": "max nodes this run"},
+    "optimize": {"_": "One-time node table layout fix",
+                 "vacuum": "reclaim disk afterwards"},
+    "stats": {"_": "Print corpus statistics"},
+    "split": {"_": "Export each bundle to its own .kdb brain file",
+              "force": "overwrite existing files"},
+    "import-bundle": {"_": "Absorb a shipped .kdb brain into the master",
+                      "path": "the .kdb file on this box",
+                      "name": "bundle name to import under (default: its manifest name)",
+                      "trust": "low = cap the brain's trust (recommended for shipped "
+                               "files); keep = trust its own values (your own files)"},
+    "eject-bundle": {"_": "Export a brain to its .kdb, then remove it from the master",
+                     "bundle": "which brain to eject",
+                     "dry_run": "count what would go, delete nothing",
+                     "no_export": "skip the safety export (not recommended)"},
+}
+
+# ── job result channel ────────────────────────────────────────────────────────
+# A verb may print one final machine-readable line; the runner picks up the LAST
+# one after the process exits.  The autopilot uses `did_work` to notice that a
+# step found nothing to do and stand aside for lower-priority steps.
+RESULT_PREFIX = "OPS_RESULT "
+
+
+def emit_result(did_work: bool, **stats) -> None:
+    """Called by the verbs (via __main__) at the end of a pass."""
+    import json as _json
+    print(RESULT_PREFIX + _json.dumps({"did_work": bool(did_work), **stats}),
+          flush=True)
+
 
 def _argv(command: str, args: dict) -> list:
     """Validate the typed options for `command` and render them to CLI flags.  Raises
@@ -179,6 +261,32 @@ class OpsRunner:
         return {"running": rc is None, "command": j["command"], "argv": j["argv"],
                 "started": j["started"], "elapsed_s": round(time.time() - j["started"]),
                 "exit_code": rc, "logfile": j["logfile"]}
+
+    def result(self) -> dict | None:
+        """The finished job's OPS_RESULT line (parsed), plus command/exit_code —
+        or None while running / when the job never emitted one.  The autopilot
+        reads this right after a step completes to learn whether it did work."""
+        import json as _json
+        j = self._job
+        if not j:
+            return None
+        rc = j["proc"].poll()
+        if rc is None:
+            return None
+        payload = None
+        try:
+            with open(j["logfile"], "r", errors="replace") as f:
+                for line in f:
+                    if line.startswith(RESULT_PREFIX):
+                        try:
+                            payload = _json.loads(line[len(RESULT_PREFIX):])
+                        except ValueError:
+                            pass
+        except OSError:
+            return None
+        if payload is None:
+            return None
+        return {"command": j["command"], "exit_code": rc, **payload}
 
     def tail(self, n: int = 300) -> str:
         j = self._job

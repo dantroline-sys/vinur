@@ -26,7 +26,7 @@ _MAX_BODY = 4 * 1024 * 1024
 
 from . import __version__
 from . import lm_lease
-from .ops import COMMANDS as OPS_COMMANDS, OpsRunner
+from .ops import COMMANDS as OPS_COMMANDS, HELP as OPS_HELP, OpsRunner
 from .viewer import INDEX_HTML
 
 log = logging.getLogger("knowledgehost.server")
@@ -290,16 +290,25 @@ class Handler(BaseHTTPRequestHandler):
                 return self._send_json({"ok": False, "error": "unauthorized"}, 401)
             from . import autopilot as A
             ap = getattr(self.server, "autopilot", None)
+            try:                                   # bundle names, for the args editor
+                mkb = self.server.open_master_kb()
+                try:
+                    bnames = [b["bundle"] for b in mkb.bundle_summary()]
+                finally:
+                    mkb.close()
+            except Exception:
+                bnames = []
             return self._send_json({"ok": True, "plan": A.load_plan(self.cfg),
                                     "state": ap.status() if ap else {"enabled": False},
-                                    "commands": OPS_COMMANDS})
+                                    "commands": OPS_COMMANDS, "help": OPS_HELP,
+                                    "bundles": bnames})
         if path in ("/ops/status", "/ops/log", "/config"):
             if not self._authed():
                 return self._send_json({"ok": False, "error": "unauthorized"}, 401)
             if path == "/ops/status":
                 return self._send_json({"ok": True, "status": self.server.ops.status(),
                                         "health": self._health(),
-                                        "commands": OPS_COMMANDS})
+                                        "commands": OPS_COMMANDS, "help": OPS_HELP})
             if path == "/ops/log":
                 n = int((q.get("tail") or ["300"])[0] or 300)
                 return self._send_json({"ok": True, "log": self.server.ops.tail(n),

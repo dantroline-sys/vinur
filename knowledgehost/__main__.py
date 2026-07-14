@@ -16,6 +16,7 @@ import time
 
 from . import distill as distill_mod
 from . import ingest as ingest_mod
+from . import ops as ops_mod
 from . import server
 from .config import load_config
 from .distill import BackendUnavailable
@@ -146,6 +147,7 @@ def _run_distill(cfg, embedder, log, *, limit=None, watch=False, interval=30, bu
                                                limit=limit, verifiers=verifiers, bundle=bundle)
             log.info("distilled: %s", stats)
             log.info("kb: %s", kb.counts())
+            ops_mod.emit_result(stats.get("chunks", 0) > 0, **stats)
             if not watch or limit:
                 break
             log.info("watch: waiting %ds for ingest to add more chunks (Ctrl-C to stop)…",
@@ -192,6 +194,8 @@ def _run_link(cfg, log, *, limit=None, top_k=None, fast=False) -> int:
         stats = link_mod.link_concepts(kb, live[0], cfg, limit=limit, top_k=top_k, lease=lease)
         log.info("link: %s", stats)
         log.info("kb: %s", kb.counts())
+        ops_mod.emit_result(stats.get("judged", 0) > 0, **{
+            k: v for k, v in stats.items() if not isinstance(v, (list, dict))})
     except BackendUnavailable as e:
         log.error("aborted (resumable): %s", e)
         return 1
@@ -233,6 +237,8 @@ def _run_refine(cfg, store, embedder, log, *, limit=None, force=False) -> int:
                                         limit=limit, force=force, lease=lm_lease.BIG)
         log.info("refine: %s", stats)
         log.info("kb: %s", kb.counts())
+        ops_mod.emit_result(stats.get("candidates", 0) > 0, **{
+            k: v for k, v in stats.items() if not isinstance(v, (list, dict))})
     except BackendUnavailable as e:
         log.error("aborted (resumable): %s", e)
         return 1
@@ -286,6 +292,7 @@ def _run_adjudicate(cfg, log, *, limit=None, batch=8, watch=False, interval=30,
             log.info("adjudicating residual with the %s", tier)
             stats = adj.adjudicate_queue(kb, lms[0], cfg, limit=limit, batch=batch, lease=lease)
             log.info("adjudicated: %s", stats)
+            ops_mod.emit_result(stats.get("seen", 0) > 0, **stats)
             if not watch or limit or stats.get("open_remaining", 0) == 0:
                 break
             log.info("watch: %ds until the next pass (Ctrl-C to stop)…", interval)
@@ -975,6 +982,8 @@ def main(argv=None):
         try:
             stats = ingest_mod.crawl(store, embedder, cfg, force=args.force)
             log.info("documents: %s", stats)
+            ops_mod.emit_result(stats.get("docs", 0) > 0 or stats.get("chunks", 0) > 0,
+                                **stats)
             if args.wikipedia:
                 wstats = ingest_mod.ingest_wikipedia(store, embedder, cfg,
                                                      limit=args.limit, force=args.force)

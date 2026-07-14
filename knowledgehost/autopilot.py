@@ -13,6 +13,12 @@ more immediately relevant than mountains of ingested PDFs, so 'distil the vinkon
 bundle' sits above 'distil everything else' — the former drains fully (it's small),
 the latter runs in bounded batches so the former can preempt it when new drops land.
 
+Starvation guard: a step whose run reports no work (the verbs print an OPS_RESULT
+line; ops.result() relays it) — or that exits non-zero — is held aside for one
+idle_interval before it's considered again, so a permanently-due 0-interval step
+can't monopolise the slot.  That is what makes TWO steps of the same verb with
+different args (the two distills above) actually both run.
+
 Coordination: the single-slot OpsRunner means one job at a time (a manual job from
 the Operations tab always wins).  And when the assistant is doing its own idle work
 it holds the LM leases (lm_fast / lm_big); with respect_leases on, the autopilot
@@ -108,16 +114,26 @@ def save_plan(cfg: dict, plan: dict) -> dict:
     return out
 
 
-def due_step(steps: list, last_run: dict, now: float):
+def due_step(steps: list, last_run: dict, now: float, hold_until: dict | None = None):
     """Pure selection: the first enabled step (highest priority) whose min_interval has
-    elapsed since it last ran.  Returns (index, step) or (None, None).
+    elapsed since it last ran AND that isn't in a no-work hold.  Returns (index, step)
+    or (None, None).
 
     `last_run` maps a step key -> unix ts of its last completion.  Re-evaluating from
-    the top each call is what gives priority preemption."""
+    the top each call is what gives priority preemption.
+
+    `hold_until` maps a step key -> unix ts before which the step is skipped because
+    its last run reported no work (or failed).  This is what lets two 0-interval steps
+    of the SAME verb coexist — e.g. 'distil the vinkona bundle' above 'distil the
+    rest': when the first finds nothing, it stands aside instead of monopolising the
+    slot forever, and the second actually runs."""
+    hold_until = hold_until or {}
     for i, s in enumerate(steps):
         if not s.get("enabled", True):
             continue
         key = step_key(s)
+        if now < hold_until.get(key, 0.0):
+            continue
         gap = now - last_run.get(key, 0.0)
         if gap >= float(s.get("min_interval_s", 0) or 0):
             return i, s
@@ -141,6 +157,7 @@ class Autopilot:
         self.ops = ops
         self.lease = lease_mod
         self._last_run: dict = {}
+        self._hold_until: dict = {}    # step key -> ts; set when a run found no work
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
         self._state = {"running_step": None, "last_reason": "not started"}
@@ -189,34 +206,51 @@ class Autopilot:
                     self._state.update(running_step=None, last_reason="yielding — assistant holds the LMs")
                     self._sleep(min(30, plan["idle_interval_s"]))
                     continue
-                idx, step = due_step(plan["steps"], self._last_run, time.time())
+                idx, step = due_step(plan["steps"], self._last_run, time.time(),
+                                     self._hold_until)
                 if step is None:
                     self._state.update(running_step=None, last_reason="all steps idle / not due")
                     self._sleep(plan["idle_interval_s"])
                     continue
-                self._run_step(step)
+                self._run_step(step, plan)
             except Exception as e:                  # pragma: no cover - defensive
                 log.warning("autopilot loop error (continuing): %s", e)
                 self._sleep(10)
         log.info("autopilot thread stopped")
 
-    def _run_step(self, step):
+    def _run_step(self, step, plan):
         label = step.get("label", step["command"])
+        key = step_key(step)
         self._state["running_step"] = label
         log.info("autopilot: running %s (%s)", step["command"], label)
         res = self.ops.start(step["command"], step.get("args") or {})
         if not res.get("ok"):
             # Couldn't launch (bad args, or a job slipped in) — note and back off so we
             # don't hot-loop on a broken step.
-            self._last_run[step_key(step)] = time.time()
+            self._last_run[key] = time.time()
             self._state["last_reason"] = f"{step['command']}: {res.get('error','could not start')}"
             self._sleep(10)
             return
         # Wait for completion, staying responsive to stop.
         while not self._stop.is_set() and self.ops.running():
             self._stop.wait(2)
-        self._last_run[step_key(step)] = time.time()
-        self._state["last_reason"] = f"ran {step['command']}"
+        now = time.time()
+        self._last_run[key] = now
+        # Work-aware hold: a step that found nothing to do (OPS_RESULT did_work:false)
+        # or that exited non-zero stands aside for one idle interval, so the steps
+        # below it get the slot.  When new work lands it is picked up again within
+        # that interval — priority preemption survives, starvation doesn't.
+        result = self.ops.result() or {}
+        backoff = float(plan.get("idle_interval_s", 60) or 60)
+        if result.get("command") == step["command"] and result.get("did_work") is False:
+            self._hold_until[key] = now + backoff
+            self._state["last_reason"] = f"{label}: no work — standing aside {int(backoff)}s"
+        elif self.ops.status().get("exit_code") not in (0, None):
+            self._hold_until[key] = now + backoff
+            self._state["last_reason"] = f"{label}: failed — backing off {int(backoff)}s"
+        else:
+            self._hold_until.pop(key, None)
+            self._state["last_reason"] = f"ran {step['command']}"
         # Loop restarts from the top → priority preemption.
 
     def _sleep(self, secs):

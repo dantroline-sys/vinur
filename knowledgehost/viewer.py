@@ -486,22 +486,24 @@ function postJSON(path, body) {
 const tokInput = () => `<input id="tok" type="password" placeholder="auth token" value="${esc(tok())}"
   title="auth token — saved in this browser only" style="width:130px" onchange="setTok(this.value)">`;
 
-let OPSPEC = {}, opsTimer = null, SETVALS = {};
+let OPSPEC = {}, OPHELP = {}, opsTimer = null, SETVALS = {};
 
 function renderOpOptions(cmd) {
-  const spec = OPSPEC[cmd] || {};
-  return Object.entries(spec).map(([opt, t]) => {
-    const id = 'op_' + opt;
-    if (t === 'bool') return `<label class="op" style="font-size:13px"><input type="checkbox" id="${id}"> ${opt}</label>`;
-    if (t === 'int') return `<label class="op" style="font-size:13px">${opt} <input type="number" id="${id}" style="width:64px"></label>`;
-    if (t === 'float') return `<label class="op" style="font-size:13px">${opt} <input type="number" step="any" id="${id}" style="width:76px"></label>`;
-    if (t === 'str') return `<label class="op" style="font-size:13px">${opt} <input id="${id}" style="width:120px"></label>`;
-    if (t === 'list') return `<label class="op" style="font-size:13px">${opt} <input id="${id}" style="width:220px" placeholder="comma-separated"></label>`;
-    if (t === 'path') return `<label class="op" style="font-size:13px">${opt} <input id="${id}" style="width:260px" placeholder="(defaults to the path in Settings)"></label>`;
-    if (t.startsWith('choice:')) return `<label class="op" style="font-size:13px">${opt} <select id="${id}">`
+  const spec = OPSPEC[cmd] || {}, help = OPHELP[cmd] || {};
+  const fields = Object.entries(spec).map(([opt, t]) => {
+    const id = 'op_' + opt, h = esc(help[opt] || '');
+    if (t === 'bool') return `<label class="op" style="font-size:13px" title="${h}"><input type="checkbox" id="${id}"> ${opt}</label>`;
+    if (t === 'int') return `<label class="op" style="font-size:13px" title="${h}">${opt} <input type="number" id="${id}" style="width:64px" title="${h}"></label>`;
+    if (t === 'float') return `<label class="op" style="font-size:13px" title="${h}">${opt} <input type="number" step="any" id="${id}" style="width:76px" title="${h}"></label>`;
+    if (t === 'str') return `<label class="op" style="font-size:13px" title="${h}">${opt} <input id="${id}" style="width:120px" title="${h}"></label>`;
+    if (t === 'list') return `<label class="op" style="font-size:13px" title="${h}">${opt} <input id="${id}" style="width:220px" placeholder="comma-separated" title="${h}"></label>`;
+    if (t === 'path') return `<label class="op" style="font-size:13px" title="${h}">${opt} <input id="${id}" style="width:260px" placeholder="(defaults to the path in Settings)" title="${h}"></label>`;
+    if (t.startsWith('choice:')) return `<label class="op" style="font-size:13px" title="${h}">${opt} <select id="${id}" title="${h}">`
       + t.split(':')[1].split(',').map(v => `<option>${v}</option>`).join('') + `</select></label>`;
     return '';
   }).join(' ');
+  const summary = (help._ || '');
+  return (summary ? `<span style="opacity:.6;font-size:12px">${esc(summary)} — </span>` : '') + fields;
 }
 function onCmdChange() { const c = $('#opcmd'); if (c) $('#opopts').innerHTML = renderOpOptions(c.value); }
 function gatherArgs() {
@@ -539,7 +541,7 @@ async function loadOps() {
       height:46vh;overflow:auto;font-size:12px;white-space:pre-wrap;margin:0"></pre>`;
   let r; try { r = await (await authFetch('/ops/status')).json(); } catch (e) { $('#opstatus').textContent = 'request failed: ' + e; return; }
   if (!r.ok) { $('#opstatus').textContent = 'enter the auth token above to use Operations'; return; }
-  OPSPEC = r.commands || {};
+  OPSPEC = r.commands || {}; OPHELP = r.help || {};
   const sel = $('#opcmd');
   if (sel) { sel.innerHTML = Object.keys(OPSPEC).sort().map(c => `<option>${c}</option>`).join(''); onCmdChange(); }
   pollOps();
@@ -749,57 +751,92 @@ async function applyScenario() {
 }
 
 // ── Prioritizer: the autopilot plan (ordered auto-run of maintenance verbs) ──
-let APLAN = null, APSPEC = {};
+let APLAN = null, APSPEC = {}, APHELP = {}, ABUNDLES = [], APSTATE = {};
 async function loadAutopilot() {
   $('#banner').innerHTML = ''; $('#results').className = ''; $('#results').textContent = 'loading plan…';
   let r; try { r = await (await authFetch('/ops/autopilot')).json(); } catch (e) { $('#results').textContent = 'request failed: ' + e; return; }
   if (!r.ok) { $('#results').className = 'empty'; $('#results').textContent = 'enter the auth token above to use the Prioritizer'; return; }
-  APLAN = r.plan; APSPEC = r.commands || {};
+  APLAN = r.plan; APSPEC = r.commands || {}; APHELP = r.help || {}; ABUNDLES = r.bundles || [];
   renderAutopilot(r.state || {});
 }
+function apArgsFields(cmd, args) {
+  // Typed, documented inputs for this command's options — hover any field for
+  // what it means.  This replaces the old raw-JSON args box.
+  const spec = APSPEC[cmd] || {}, help = APHELP[cmd] || {};
+  const fields = Object.keys(spec).map(k => {
+    const t = spec[k], v = (args || {})[k], h = esc(help[k] || '');
+    let inp;
+    if (t === 'bool')
+      inp = `<input type="checkbox" data-a="${k}" ${v ? 'checked' : ''} title="${h}">`;
+    else if (t === 'int' || t === 'float')
+      inp = `<input type="number" ${t === 'float' ? 'step="any"' : ''} data-a="${k}"
+                    value="${v === undefined || v === null ? '' : v}" style="width:64px" title="${h}">`;
+    else if (t.startsWith('choice:'))
+      inp = `<select data-a="${k}" title="${h}"><option value=""></option>`
+        + t.split(':')[1].split(',').map(c => `<option ${v === c ? 'selected' : ''}>${c}</option>`).join('')
+        + `</select>`;
+    else                                       // str | path | list
+      inp = `<input data-a="${k}" value="${esc(String(v === undefined || v === null ? '' : v))}"
+                    ${k === 'bundle' ? 'list="apblist"' : ''} style="width:100px" title="${h}"
+                    ${t === 'list' ? 'placeholder="a,b,c"' : ''}>`;
+    return `<label title="${h}" style="display:inline-flex;align-items:center;gap:3px;
+                   margin:1px 8px 1px 0;font-size:12px;white-space:nowrap">${k} ${inp}</label>`;
+  }).join('');
+  return fields || '<span style="opacity:.5;font-size:12px">(no options)</span>';
+}
 function renderAutopilot(state) {
+  APSTATE = state || APSTATE || {};
   const p = APLAN;
-  const st = state.enabled
-    ? `<b style="color:#2e7d32">ON</b> — ${esc(state.running_step || state.last_reason || 'idle')}`
+  const st = APSTATE.enabled
+    ? `<b style="color:#2e7d32">ON</b> — ${esc(APSTATE.running_step || APSTATE.last_reason || 'idle')}`
     : `<b style="color:#999">off</b>`;
   const rows = (p.steps || []).map((s, i) => {
     const opts = Object.keys(APSPEC).sort().map(c =>
-      `<option ${c === s.command ? 'selected' : ''}>${c}</option>`).join('');
+      `<option ${c === s.command ? 'selected' : ''} title="${esc((APHELP[c] || {})._ || '')}">${c}</option>`).join('');
     return `<tr data-i="${i}">
       <td style="white-space:nowrap">
         <button class="toolbtn" onclick="moveStep(${i},-1)" title="higher priority" ${i === 0 ? 'disabled' : ''}>▲</button>
         <button class="toolbtn" onclick="moveStep(${i},1)" title="lower priority" ${i === p.steps.length - 1 ? 'disabled' : ''}>▼</button>
       </td>
       <td><input type="checkbox" data-f="enabled" ${s.enabled ? 'checked' : ''}></td>
-      <td><select data-f="command">${opts}</select></td>
-      <td><input data-f="args" value="${esc(JSON.stringify(s.args || {}))}" style="width:180px"
-                 title='JSON, e.g. {"bundle":"vinkona"} or {"limit":50}'></td>
+      <td><select data-f="command" onchange="apCmdChanged()" title="${esc((APHELP[s.command] || {})._ || '')}">${opts}</select></td>
+      <td style="max-width:380px">${apArgsFields(s.command, s.args)}</td>
       <td><input data-f="min_interval_s" type="number" min="0" value="${s.min_interval_s || 0}" style="width:90px"></td>
-      <td><input data-f="label" value="${esc(s.label || '')}" style="width:220px"></td>
+      <td><input data-f="label" value="${esc(s.label || '')}" style="width:200px"></td>
       <td><button class="toolbtn" onclick="delStep(${i})">✕</button></td></tr>`;
   }).join('');
   $('#results').innerHTML =
-    `<div style="margin:6px 0 12px;font-size:13px">
+    `<datalist id="apblist">${ABUNDLES.map(b => `<option value="${esc(b)}">`).join('')}</datalist>
+     <div style="margin:6px 0 12px;font-size:13px">
        <label><input type="checkbox" id="apEnabled" ${p.enabled ? 'checked' : ''}> <b>Autopilot enabled</b></label>
        &nbsp;·&nbsp; status: ${st}
        <div style="opacity:.65;margin-top:6px">Steps run top-to-bottom by priority; after each, the list is
          re-checked from the top, so a higher step that just gained work (e.g. fresh Vinkona drops) preempts
-         the backlog below it. “Min interval” throttles a step; leave 0 to run whenever there's work.</div>
+         the backlog below it. A step that finds <b>no work</b> (or fails) stands aside for one idle re-check
+         interval, so the steps below it get their turn — two distill steps with different bundles both run.
+         “Min interval” additionally throttles a step; hover any field for what it does.</div>
      </div>
      <label style="font-size:13px"><input type="checkbox" id="apLeases" ${p.respect_leases ? 'checked' : ''}>
        Yield to the assistant (pause while it's using the LMs)</label>
      &nbsp;·&nbsp; <label style="font-size:13px">idle re-check
        <input id="apInterval" type="number" min="5" value="${p.idle_interval_s || 60}" style="width:70px">s</label>
-     <table style="margin-top:10px"><tr><th>order</th><th>on</th><th>command</th><th>args (JSON)</th>
+     <table style="margin-top:10px"><tr><th>order</th><th>on</th><th>command</th><th>arguments</th>
        <th>min interval s</th><th>label</th><th></th></tr>${rows}</table>`;
 }
+function apCmdChanged() { APLAN = _readAutopilotForm(); renderAutopilot(APSTATE); }
 function _readAutopilotForm() {
   const steps = [];
   document.querySelectorAll('#results tr[data-i]').forEach(tr => {
     const g = f => tr.querySelector(`[data-f="${f}"]`);
-    let args = {};
-    try { args = JSON.parse(g('args').value || '{}'); } catch (e) { args = {}; }
-    steps.push({ command: g('command').value, enabled: g('enabled').checked,
+    const cmd = g('command').value, spec = APSPEC[cmd] || {}, args = {};
+    tr.querySelectorAll('[data-a]').forEach(inp => {
+      const k = inp.dataset.a, t = spec[k] || 'str';
+      if (t === 'bool') { if (inp.checked) args[k] = true; }
+      else if (t === 'int') { if (inp.value.trim() !== '') args[k] = parseInt(inp.value, 10); }
+      else if (t === 'float') { if (inp.value.trim() !== '') args[k] = parseFloat(inp.value); }
+      else { if (inp.value.trim() !== '') args[k] = inp.value.trim(); }
+    });
+    steps.push({ command: cmd, enabled: g('enabled').checked,
                  args, min_interval_s: parseInt(g('min_interval_s').value || '0', 10),
                  label: g('label').value });
   });
@@ -808,11 +845,11 @@ function _readAutopilotForm() {
 }
 function moveStep(i, d) { const s = APLAN.steps; const j = i + d;
   if (j < 0 || j >= s.length) return; APLAN = _readAutopilotForm();
-  [APLAN.steps[i], APLAN.steps[j]] = [APLAN.steps[j], APLAN.steps[i]]; renderAutopilot({}); }
-function delStep(i) { APLAN = _readAutopilotForm(); APLAN.steps.splice(i, 1); renderAutopilot({}); }
+  [APLAN.steps[i], APLAN.steps[j]] = [APLAN.steps[j], APLAN.steps[i]]; renderAutopilot(APSTATE); }
+function delStep(i) { APLAN = _readAutopilotForm(); APLAN.steps.splice(i, 1); renderAutopilot(APSTATE); }
 function addAutopilotStep() { APLAN = _readAutopilotForm();
   APLAN.steps.push({ command: 'distill', args: {}, enabled: true, min_interval_s: 0, label: 'new step' });
-  renderAutopilot({}); }
+  renderAutopilot(APSTATE); }
 async function saveAutopilot() {
   const plan = _readAutopilotForm();
   const r = await postJSON('/ops/autopilot', { plan }).catch(e => ({ ok: false, error: '' + e }));
