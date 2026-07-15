@@ -331,15 +331,36 @@ function renderEdges(es) {
   }).join('') : '', 'No relations yet — distil some sources.');
 }
 
+// Typed cards (criteria/staging/requirements/decision/playbook/case…) keep their
+// content as a JSON payload in `criteria` — render it generically so every shape
+// (and any future card type) displays: strings as lines, string-lists as bullets,
+// object-lists as nested blocks, dicts as labelled sub-sections.
+function renderPayload(v) {
+  if (v == null || v === '') return '';
+  if (Array.isArray(v)) {
+    if (!v.length) return '';
+    return '<ul class="steps">' + v.map(x =>
+      '<li>' + (typeof x === 'object' ? renderPayload(x) : esc(x)) + '</li>').join('') + '</ul>';
+  }
+  if (typeof v === 'object') {
+    return Object.entries(v).map(([k, x]) => {
+      const body = renderPayload(x);
+      return body ? `<div class="text"><b>${esc(k.replace(/_/g, ' '))}:</b> ${body}</div>` : '';
+    }).join('');
+  }
+  return esc(v);
+}
+
 function renderCards(cs) {
   setRows(cs && cs.length ? cs.map(c => `
     <div class="p">
-      <div class="meta"><span class="title">${esc(c.title)}</span>${badge(c.regime)}
+      <div class="meta"><span class="title">${esc(c.title)}</span>${badge(c.card_type || 'procedure')}${badge(c.regime)}
         ${c.node ? '<span>node: ' + esc(c.node) + '</span>' : ''}</div>
       ${c.goal ? '<div class="text">Goal: ' + esc(c.goal) + '</div>' : ''}
       ${(c.steps && c.steps.length) ? '<ol class="steps">' + c.steps.map(s => '<li>' + esc(s) + '</li>').join('') + '</ol>' : ''}
+      ${c.criteria ? '<div class="text">' + renderPayload(c.criteria) + '</div>' : ''}
       ${(c.support && c.support.length) ? '<div class="src">support: ' + esc(c.support.join(' · ')) + '</div>' : ''}
-    </div>`).join('') : '', 'No procedure cards yet (the how-extractor lands in M2+).');
+    </div>`).join('') : '', 'No cards yet — distil some sources.');
 }
 
 function renderTable(rows, cols, emptyMsg) {

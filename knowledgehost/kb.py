@@ -1546,8 +1546,14 @@ class KB:
         for r in self.db.execute(
                 "SELECT * FROM procedure_cards WHERE status='active' "
                 "ORDER BY updated_at DESC LIMIT ?", (int(limit),)):
+            try:               # typed cards (criteria/staging/requirements/decision/
+                crit = json.loads(r["criteria"]) if r["criteria"] else None
+            except (ValueError, TypeError):     # playbook/case…) keep their content here
+                crit = None
             out.append({"title": r["title"], "node": self._label_of(r["node_id"]),
                         "goal": r["goal"], "domain": r["domain"], "regime": r["regime"],
+                        "card_type": r["card_type"] or "procedure",
+                        "criteria": crit,
                         "steps": json.loads(r["steps"] or "[]"),
                         "support": [s.get("doc_id") for s in json.loads(r["support"] or "[]")]})
         return out
