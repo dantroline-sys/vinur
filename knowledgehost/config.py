@@ -41,6 +41,17 @@ DEFAULTS = {
     # keeping the engine itself domain-neutral.
     "high_stakes_extra": [],
 
+    # External-oracle id regions (VINUR-OPS-01).  Entries are "name" or "name=tag":
+    # ids minted under "<name>:" belong to the region, facetize derives domain:<tag>
+    # for them, and the ops_annotate tool is advertised.  Empty (default) ⇒ no
+    # annotation surface.  Values ship in the consumer pack's config fragment —
+    # the engine stays region-agnostic.
+    "ops_regions": [],
+    # Conversational firewall (VINUR-OPS-01 §5.1): "axis:value" facets excluded from
+    # the kb_ask / kb_search / guidance candidate pools unless a request names that
+    # axis in its `facets` argument (the explicit opt-in).  Ships with the pack.
+    "ask_exclude_facets": [],
+
     # ── embeddings (the nomic endpoint, shared with Vinkona's memory store) ────
     # Co-located on the Linux GPU box at 127.0.0.1:11437 (llama.cpp --embedding,
     # OpenAI /v1/embeddings).  Asymmetric model => task prefixes (search_query: /
@@ -442,7 +453,7 @@ _BOOL_KEYS = {"embed_task_prefix", "ocr", "verify", "strict",
               "ask_fit_gate", "use_spacy", "library_dense"}
 _LIST_KEYS = {"sources", "extensions", "distill_urls", "extract_urls", "verify_urls",
               "encrypted_bundles", "library_sources", "stopwords_extra",
-              "high_stakes_extra"}
+              "high_stakes_extra", "ops_regions", "ask_exclude_facets"}
 
 
 def _coerce(key: str, value):

@@ -43,3 +43,10 @@ rerank_url       = "http://127.0.0.1:11439"   # ./run-reranker.sh (llama.cpp --r
 rerank_model     = "bge-reranker-v2-m3-Q8_0.gguf"
 
 log_level = "INFO"
+
+# ── external-oracle consumer pack (VINUR-OPS-01) ────────────────────────────
+# A coding-assistance (or other oracle-backed) overlay ships this fragment.
+# The engine holds only the mechanisms; the region VALUES live here.
+# Example — a Rust programme whose ids are minted under "rust:":
+#   ops_regions        = ["rust=rust-coding"]      # id region -> domain facet tag
+#   ask_exclude_facets = ["domain:rust-coding"]    # keep it out of conversation

@@ -76,7 +76,11 @@ CATALOGUE = [
                      "humanities | fiction — restricts answers by source kind"},
             "strict": {"type": "boolean", "description":
                        "with a mode: exclude by SOURCE ORIGIN (drop everything from e.g. "
-                       "the fiction folder), not just by claim type (default false)"}},
+                       "the fiction folder), not just by claim type (default false)"},
+            "facets": {"type": "object", "description":
+                       "optional additive facet filter {axis: [values]} (e.g. domain, "
+                       "time_frame, trust_tier). Naming an axis also lifts any "
+                       "config-default exclusion on that axis for this request."}},
             "required": ["query"]},
     },
 ]
@@ -98,6 +102,26 @@ BRAIN_TOOL = {
         "brain": {"type": "string", "description":
                   "the brain (bundle) name — required for load/unload"}},
         "required": ["action"]},
+}
+
+# Advertised only when external-oracle id regions are configured (VINUR-OPS-01 §3.4) —
+# a purely conversational deployment never grows this surface.
+OPS_TOOL = {
+    "name": "ops_annotate",
+    "description": (
+        "Annotate candidate operation ids produced by an EXTERNAL legality oracle "
+        "(a compiler front-end, analyser, or rules engine that enumerated the legal "
+        "moves). For each requested id: attached hazard/knowledge cards and the "
+        "learned-rank fields once a learned layer populates them. The response is a "
+        "map keyed by exactly the requested ids — this surface never adds, removes, "
+        "or orders candidates."),
+    "parameters": {"type": "object", "properties": {
+        "ops": {"type": "array", "items": {"type": "string"},
+                "description": "the oracle's candidate ids (1-500 per call)"},
+        "context_features": {"type": "object", "description":
+            "optional {feature: value} typed context, reserved for the learned "
+            "layer's conditional rank — it never affects which ids are returned"}},
+        "required": ["ops"]},
 }
 
 # Advertised only when a library corpus is loaded (Tools.catalogue).
@@ -136,6 +160,8 @@ class Tools:
             tools = tools + [LIBRARY_TOOL]
         if self.brain_host is not None:           # only under a live server (needs hot-swap)
             tools = tools + [BRAIN_TOOL]
+        if self.kb is not None and getattr(self.kb, "ops_regions", None):
+            tools = tools + [OPS_TOOL]            # only with configured id regions (§3.4)
         return {"tools": tools}
 
     def call(self, name: str, arguments: dict) -> dict:
@@ -207,6 +233,17 @@ class Tools:
 
         # 2. fuse, 3. rerank (intent-conditioned, local only)
         fused = rrf_fuse(dense, sparse, wiki, rrf_k=self.cfg["rrf_k"])
+        # Exclusion firewall at document level (VINUR-OPS-01 §5.1): a chunk is dropped
+        # when its source document carries an excluded facet (producers facet region
+        # drops as ("doc", <path_or_url>)).  Vacuous until docs are faceted; kb_search
+        # has no facets argument, so there is no opt-in on this path.
+        excl = self._ask_exclusions(None) if self.kb is not None else []
+        ex = [tuple(e.split(":", 1)) for e in excl]
+        if ex and fused:
+            fmap = self.kb.facets_for([("doc", c.get("path_or_url") or "") for c in fused])
+            fused = [c for c in fused
+                     if not any(v in fmap.get(("doc", c.get("path_or_url") or ""),
+                                              {}).get(a, set()) for a, v in ex)]
         ranked = self.reranker.rerank(query, intent, fused[:shortlist])
         top = ranked[:k]
 
@@ -302,6 +339,15 @@ class Tools:
         return {"ok": False, "error": f"kb_brain: unknown action {action!r} "
                                       "(list | load | unload)"}
 
+    def _ask_exclusions(self, facets_arg) -> list:
+        """Config-shipped conversational exclusions (VINUR-OPS-01 §5.1), minus any axis
+        the request explicitly names in `facets` — naming an axis IS the opt-in."""
+        excl = [str(e) for e in (self.cfg.get("ask_exclude_facets") or []) if ":" in str(e)]
+        if isinstance(facets_arg, dict) and facets_arg:
+            named = {str(a) for a in facets_arg}
+            excl = [e for e in excl if e.split(":", 1)[0] not in named]
+        return excl
+
     def _t_kb_ask(self, args):
         query = (args.get("query") or "").strip()
         if not query:
@@ -309,6 +355,7 @@ class Tools:
         if self.kb is None:
             return {"ok": False, "error": "structured KB not available"}
         strict = args["strict"] if "strict" in args else self.cfg.get("strict", False)
+        facets_arg = args.get("facets") if isinstance(args.get("facets"), dict) else None
         bundle = query_mod.answer(self.kb, self.embedder, query, rigor=args.get("rigor"),
                                   k=int(args.get("k") or self.cfg["default_k"]),
                                   mode=args.get("mode") or self.cfg.get("mode"),
@@ -318,5 +365,25 @@ class Tools:
                                   context_features=args.get("context_features"),
                                   intent=args.get("intent"),
                                   fit_gate=bool(self.cfg.get("ask_fit_gate", True)),
-                                  vinkona_penalty=float(self.cfg.get("ask_vinkona_penalty", 0.85)))
+                                  vinkona_penalty=float(self.cfg.get("ask_vinkona_penalty", 0.85)),
+                                  facets=facets_arg,
+                                  exclude_facets=self._ask_exclusions(facets_arg))
         return {"ok": True, "result": json.dumps(bundle, ensure_ascii=False)}
+
+    def _t_ops_annotate(self, args):
+        """VINUR-OPS-01 §3 — batch id-join annotation for an external oracle's
+        candidates.  Deterministic serialisation (sorted keys) so identical
+        (request, graph_version) yields identical bytes (§6 gate 2)."""
+        if self.kb is None:
+            return {"ok": False, "error": "structured KB not available"}
+        if not getattr(self.kb, "ops_regions", None):
+            return {"ok": False, "error": "no id regions configured (ops_regions)"}
+        ops = args.get("ops")
+        if not isinstance(ops, list) or not ops:
+            return {"ok": False, "error": "ops_annotate needs a non-empty ops list"}
+        if len(ops) > 500:
+            return {"ok": False, "error": "ops_annotate accepts at most 500 ids per call"}
+        if not all(isinstance(o, str) and o.strip() for o in ops):
+            return {"ok": False, "error": "every op id must be a non-empty string"}
+        res = self.kb.annotate_ops(ops, args.get("context_features"))
+        return {"ok": True, "result": json.dumps(res, ensure_ascii=False, sort_keys=True)}

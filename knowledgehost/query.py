@@ -99,7 +99,7 @@ def _features_to_set(cf) -> set:
 def answer(kb, embedder, query: str, *, rigor=None, k=6, mode=None, modes=None,
            strict=False, prior_penalty=0.5, pool=50, context_features=None,
            intent=None, fit_gate=True, vinkona_penalty=0.85, facets=None,
-           bm25=False, reranker=None, rerank_pool=40,
+           exclude_facets=None, bm25=False, reranker=None, rerank_pool=40,
            use_spacy=False, spacy_model="en_core_web_sm") -> dict:
     # Query understanding (understand.py): the utterance's illocutionary form (question /
     # feasibility check / hypothetical / counterfactual / narration / present-action) steers
@@ -244,6 +244,16 @@ def answer(kb, embedder, query: str, *, rigor=None, k=6, mode=None, modes=None,
         fmap = kb.facets_for([(it["kind"], it["id"]) for it in items])
         items = [it for it in items
                  if facets_mod.matches(fmap.get((it["kind"], it["id"]), {}), req_facets)]
+
+    # Exclusion firewall (VINUR-OPS-01 §5.1): rows carrying an excluded axis:value stay
+    # out of the conversational pool entirely.  The consumer pack ships the values; the
+    # caller lifts an axis by naming it in `facets` (the tool layer does that arithmetic).
+    ex = [tuple(str(e).split(":", 1)) for e in (exclude_facets or []) if ":" in str(e)]
+    if ex and items:
+        fex = kb.facets_for([(it["kind"], it["id"]) for it in items])
+        items = [it for it in items
+                 if not any(v in fex.get((it["kind"], it["id"]), {}).get(a, set())
+                            for a, v in ex)]
 
     # Cross-encoder rerank (contract §5): put the whole heterogeneous pool on ONE
     # comparable scale — the equaliser that cures incomparable dense/BM25/walk scores and

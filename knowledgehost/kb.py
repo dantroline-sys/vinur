@@ -158,6 +158,16 @@ def _hash(*parts: str) -> str:
     return h.hexdigest()[:20]
 
 
+# Reserved learned-layer fields (VINUR-OPS-01 §4.4 / consumer programme §7.4): persisted
+# on nodes and cards with inert defaults, relayed verbatim by annotate_ops, populated by
+# a LATER contract.  Cheap to reserve now; impossible to backfill.
+_RESERVED_LEARNED = (("observed_count", "INTEGER DEFAULT 0"),
+                     ("validated_count", "INTEGER DEFAULT 0"),
+                     ("last_observed", "REAL"),
+                     ("conditional_rank", "REAL"),
+                     ("anti_pattern_of", "TEXT"))
+
+
 class KB:
     def __init__(self, cfg: dict):
         self.path = cfg["kb_path"]
@@ -197,6 +207,11 @@ class KB:
         self._counts_cache = None  # (value, monotonic_ts) — see counts(); spares the viewer
         self._counts_ttl = float(cfg.get("counts_cache_ttl", 30.0))  # full scans every poll
         self._defer = 0            # >0 ⇒ inside a batch(): hold commits until it exits
+        # External-oracle id regions (VINUR-OPS-01): (prefix, domain_tag) pairs from
+        # config `ops_regions`.  Empty ⇒ no annotation surface is served.
+        from . import facets as _facets_mod
+        self.ops_regions = _facets_mod.parse_regions(cfg.get("ops_regions") or [])
+        self._region_ver = None    # cached region content digest — reload() invalidates
         self._init_schema()
         try:
             import numpy as np
@@ -351,10 +366,18 @@ class KB:
                            ("escalation", "TEXT"), ("refined_at", "REAL"),
                            # polymorphic cards: how-to | criteria | staging | (recommendation
                            # rides as a grade on any card).  criteria/grade are JSON payloads.
-                           ("card_type", "TEXT"), ("criteria", "TEXT"), ("grade", "TEXT")):
+                           ("card_type", "TEXT"), ("criteria", "TEXT"), ("grade", "TEXT"),
+                           *_RESERVED_LEARNED):
                 if c not in cols:
                     self._raw.execute(f"ALTER TABLE procedure_cards ADD COLUMN {c} {typ}")
                     added.append(c)
+            # Reserved learned-layer fields on NODES too (VINUR-OPS-01 §4.4): persisted
+            # from day one, computed by a later contract — impossible to backfill.
+            ncols = {r["name"] for r in self._raw.execute("PRAGMA table_info(nodes)").fetchall()}
+            for c, typ in _RESERVED_LEARNED:
+                if c not in ncols:
+                    self._raw.execute(f"ALTER TABLE nodes ADD COLUMN {c} {typ}")
+                    added.append("nodes." + c)
             # empirical findings (effect size / study design / population / certainty)
             # attached to a causal edge — the structured form of a paper's claim.
             ecols = {r["name"] for r in self._raw.execute(
@@ -1112,6 +1135,14 @@ class KB:
                 except (ValueError, TypeError):
                     support = []
                 derived = F.derive(kind, row, support, source_lookup)
+                # External-oracle regions (VINUR-OPS-01 §4.3): the domain facet is
+                # DERIVED from the id prefix, so it can never drift from the id — and
+                # the §5 firewall keys on it.
+                rtag = next((t for p, t in self.ops_regions
+                             if str(row["id"]).startswith(p)), None)
+                if rtag:
+                    derived = dict(derived)
+                    derived["domain"] = [rtag]
                 for axis in F.AXES:                       # write every axis (clears stale)
                     self.set_facets(kind, row["id"], axis, derived.get(axis, []),
                                     commit=False)
@@ -1558,6 +1589,96 @@ class KB:
                         "support": [s.get("doc_id") for s in json.loads(r["support"] or "[]")]})
         return out
 
+    # ── op annotation (VINUR-OPS-01): external-oracle candidate decoration ────
+    def _in_region(self, some_id: str) -> bool:
+        return any(str(some_id).startswith(p) for p, _t in self.ops_regions)
+
+    def region_version(self) -> str:
+        """Content digest identifying the loaded knowledge state of the configured id
+        regions (VINUR-OPS-01 §3.2).  Covers ids, card hashes and the reserved learned
+        fields, so a learned-layer update changes the version.  Cached; reload()
+        invalidates."""
+        if self._region_ver is not None:
+            return self._region_ver
+        h = hashlib.sha256()
+        for prefix, _tag in sorted(self.ops_regions):
+            n = len(prefix)
+            for r in self.db.execute(
+                    "SELECT id, observed_count, validated_count, last_observed, "
+                    "conditional_rank, anti_pattern_of FROM nodes "
+                    "WHERE substr(id,1,?)=? ORDER BY id", (n, prefix)):
+                h.update(("|".join(str(r[k]) for k in r.keys())).encode())
+            for r in self.db.execute(
+                    "SELECT id, card_hash FROM procedure_cards WHERE substr(id,1,?)=? "
+                    "ORDER BY id", (n, prefix)):
+                h.update(f"{r['id']}|{r['card_hash']}".encode())
+            for r in self.db.execute(
+                    "SELECT id FROM edges WHERE substr(id,1,?)=? ORDER BY id", (n, prefix)):
+                h.update(r["id"].encode())
+        self._region_ver = "sha256:" + h.hexdigest()
+        return self._region_ver
+
+    def annotate_ops(self, op_ids, context_features=None) -> dict:
+        """Batch id-join for candidates produced by an EXTERNAL legality oracle
+        (VINUR-OPS-01 §3).  The response is a map keyed by exactly the requested ids —
+        containment and non-suppression hold by construction, and ordering is
+        structurally not this surface's to express.  The join fires only inside the
+        configured id regions, and every id it emits (caveat cards, anti_pattern_of)
+        stays in-region, so no general or personal knowledge can reach an oracle
+        consumer.  Strictly read-only (§3.3).  `context_features` is accepted for the
+        learned layer and MUST never affect the key set (§6 gate 7)."""
+        ids, seen = [], set()
+        for i in op_ids or []:
+            s = str(i).strip()
+            if s and s not in seen:
+                seen.add(s); ids.append(s)
+        out: dict = {}
+        joined = 0
+        for oid in ids:
+            if not self._in_region(oid):
+                out[oid] = {"annotated": False}   # present, bare: fail-open on knowledge,
+                continue                          # but never joined outside the region
+            r = self.db.execute(
+                "SELECT * FROM nodes WHERE id=? AND (status IS NULL OR status='active')",
+                (oid,)).fetchone()
+            if not r:
+                out[oid] = {"annotated": False}
+                continue
+            joined += 1
+            ann: dict = {"annotated": True}
+            if r["label"]:
+                ann["display"] = r["label"]
+            caveats = []
+            for c in self.db.execute(
+                    "SELECT id, title, criteria FROM procedure_cards "
+                    "WHERE node_id=? AND status='active'", (oid,)):
+                if not self._in_region(c["id"]):
+                    continue                      # §5.2: cross-region attachments never leave
+                try:
+                    crit = json.loads(c["criteria"]) if c["criteria"] else {}
+                except (ValueError, TypeError):
+                    crit = {}
+                cav = {"card_id": c["id"],
+                       "severity": (crit.get("severity") if isinstance(crit, dict)
+                                    else None) or "unspecified"}
+                if c["title"]:
+                    cav["title"] = c["title"]
+                caveats.append(cav)
+            ann["caveats"] = sorted(caveats, key=lambda x: x["card_id"])
+            # reserved learned fields relayed VERBATIM (§4.4); a later contract computes
+            # them — this surface never does.
+            ann["rank"] = r["conditional_rank"]
+            ann["rank_specificity"] = None
+            try:
+                apo = json.loads(r["anti_pattern_of"] or "[]")
+            except (ValueError, TypeError):
+                apo = []
+            ann["anti_pattern_of"] = [a for a in apo
+                                      if isinstance(a, str) and self._in_region(a)]
+            out[oid] = ann
+        return {"annotations": out, "graph_version": self.region_version(),
+                "requested": len(ids), "joined": joined}
+
     def list_sources(self, limit=200):
         rows = [dict(r) for r in self.db.execute(
             "SELECT doc_id,title,source_type,trust_weight,regime,status,"
@@ -1701,21 +1822,32 @@ class KB:
         overflow pages (~100ms/row uncached) — this puts it last so the hot columns sit in
         the leaf page and lookups are fast.  One-time, idempotent; copies the table (a few
         minutes at 1M rows).  Code reads/writes columns by name, so nothing else changes."""
-        cols = [r["name"] for r in self._raw.execute("PRAGMA table_info(nodes)").fetchall()]
+        info = self._raw.execute("PRAGMA table_info(nodes)").fetchall()
+        cols = [r["name"] for r in info]
         if not cols or cols[-1] == "embedding":
             return False                          # already last (or empty) — nothing to do
         log.info("migrating nodes layout (embedding → last column); this copies the table…")
+        # Carry EVERY current column (later migrations add e.g. the reserved learned
+        # fields) — a fixed column list here would silently drop their data.
+        decls, names = [], []
+        for r in info:
+            if r["name"] == "embedding":
+                continue
+            d = f'{r["name"]} {r["type"] or "TEXT"}'
+            if r["pk"]:
+                d += " PRIMARY KEY"
+            if r["dflt_value"] is not None:
+                d += f' DEFAULT {r["dflt_value"]}'
+            decls.append(d); names.append(r["name"])
+        collist = ",".join(names + ["embedding"])
         with self._lock:
             # One transaction (DDL is transactional in SQLite): a crash between the DROP
             # and the RENAME would otherwise leave no `nodes` table at all — the next
             # open would recreate it empty and silently serve an empty KB.
-            self._raw.executescript("""
+            self._raw.executescript(f"""
             BEGIN;
-            CREATE TABLE nodes_new(
-                id TEXT PRIMARY KEY, label TEXT, kind TEXT, summary TEXT,
-                aliases TEXT, support TEXT, status TEXT DEFAULT 'active', embedding BLOB);
-            INSERT INTO nodes_new(id,label,kind,summary,aliases,support,status,embedding)
-                SELECT id,label,kind,summary,aliases,support,status,embedding FROM nodes;
+            CREATE TABLE nodes_new({", ".join(decls)}, embedding BLOB);
+            INSERT INTO nodes_new({collist}) SELECT {collist} FROM nodes;
             DROP TABLE nodes;
             ALTER TABLE nodes_new RENAME TO nodes;
             COMMIT;
@@ -1736,6 +1868,7 @@ class KB:
             self._ann = None
             self._ann_tried = False
             self._counts_cache = None
+            self._region_ver = None
         self._get_ann()
         self.warm()
         try:

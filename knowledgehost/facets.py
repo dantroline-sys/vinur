@@ -27,6 +27,24 @@ from __future__ import annotations
 # the axis names are a closed set; add here to introduce a new slice
 AXES = ("epistemic", "time_frame", "trust_tier", "domain")
 
+
+def parse_regions(entries) -> list:
+    """Parse configured external-oracle id regions (VINUR-OPS-01 §4.1) into
+    ``(prefix, domain_tag)`` pairs.  An entry is ``"name"`` or ``"name=tag"``:
+    ids minted under ``"<name>:"`` belong to the region, and facetize derives
+    ``domain: <tag>`` for them (tag defaults to the name).  Region VALUES ship in
+    the consumer pack's config — the engine stays region-agnostic (§1.4)."""
+    out = []
+    for e in entries or []:
+        e = str(e).strip()
+        if not e:
+            continue
+        name, _, tag = e.partition("=")
+        name = name.strip().rstrip(":")
+        if name:
+            out.append((name + ":", tag.strip() or name))
+    return out
+
 EPISTEMIC_VALUES = ("empirical", "conventional", "fictional", "interpretive", "historical")
 TIME_FRAME_VALUES = ("current", "historical", "superseded", "timeless")
 TRUST_TIER_VALUES = ("high", "medium", "low")
