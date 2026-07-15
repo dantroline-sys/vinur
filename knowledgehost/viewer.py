@@ -414,6 +414,13 @@ function renderCriteria(c) {
   if (c.gold_standard) h += `<div class="crit-row"><b>confirm</b>${esc(c.gold_standard)}</div>`;
   if (c.differentials && c.differentials.length) h += `<div class="crit-row"><b>differential</b>${c.differentials.map(d => esc(d.condition) + (d.discriminator ? ' <span style="opacity:.6">(' + esc(d.discriminator) + ')</span>' : '')).join(' · ')}</div>`;
   if (c.levels && c.levels.length) h += `<div class="crit-row"><b>stages</b>${c.levels.map(l => '<b style="opacity:1">' + esc(l.level) + '</b> ' + esc(l.label || '')).join(' · ')}</div>`;
+  // typed-card payloads (requirements/decision/playbook/case…) carry OTHER keys — render
+  // whatever the rows above didn't handle generically, so no card ever draws empty.
+  const known = ['required', 'supportive', 'exclusion', 'threshold', 'gold_standard',
+                 'differentials', 'levels'];
+  const rest = Object.fromEntries(Object.entries(c).filter(([k, v]) =>
+    !known.includes(k) && v != null && v !== '' && (!Array.isArray(v) || v.length)));
+  if (Object.keys(rest).length) h += renderPayload(rest);
   return h + '</div>';
 }
 function renderGrade(g) {
