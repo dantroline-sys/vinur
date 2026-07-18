@@ -94,6 +94,38 @@ def main():
         except ValueError:
             ok("unknown engine rejected")
 
+        # first-class vLLM tuning keys → CLI flags (NVFP4 + fp8 KV case)
+        vdir = Path(td) / "serving" / ".venv" / "bin"
+        vdir.mkdir(parents=True)
+        (vdir / "vllm").write_text("")
+        full = {"name": "p", "engine": "vllm", "model": "org/M-NVFP4", "port": 11438,
+                "quantization": "modelopt", "kv_cache_dtype": "fp8",
+                "max_model_len": 16384, "gpu_memory_utilization": 0.9,
+                "max_num_seqs": 32, "tensor_parallel": 2, "enforce_eager": True,
+                "trust_remote_code": False, "served_model_name": "primary",
+                "args": ["--kv-cache-dtype", "auto"]}
+        argv = serving.llm_argv(full, root=Path(td))
+        s = " ".join(argv)
+        assert "--quantization modelopt" in s and "--kv-cache-dtype fp8" in s
+        assert "--max-model-len 16384" in s and "--gpu-memory-utilization 0.9" in s
+        assert "--max-num-seqs 32" in s and "--tensor-parallel-size 2" in s
+        assert "--served-model-name primary" in s
+        assert "--enforce-eager" in s and "--trust-remote-code" not in s
+        assert argv[-2:] == ["--kv-cache-dtype", "auto"], "args must come LAST (override)"
+        ok("vLLM keys map to flags; false flags omitted; args override last")
+
+        lean = serving.llm_argv({"name": "p", "engine": "vllm",
+                                 "model": "org/M", "port": 1}, root=Path(td))
+        assert not any(a.startswith("--kv-cache") or a.startswith("--max-model")
+                       for a in lean), "unset keys must not emit flags"
+        ok("unset keys leave vLLM defaults untouched")
+
+        argv = serving.llm_argv({"name": "g", "engine": "llama", "model": str(gguf),
+                                 "port": 11440, "ctx_size": 8192, "n_gpu_layers": 0})
+        s = " ".join(argv)
+        assert "-c 8192" in s and "-ngl 0" in s
+        ok("llama first-class keys: ctx_size (-c) + n_gpu_layers (-ngl)")
+
         ea = serving.embed_argv(c2, "/x/nomic.gguf")
         assert "--embedding" in ea and "11437" in ea and "-ub" in ea
         ok("embed argv (llama-server --embedding, batch-safe)")

@@ -25,32 +25,58 @@ auth_token = ""         # if set, /call requires Authorization: Bearer <token>
 # rerank_url / distill_urls / extract_urls / verify_urls at the same ports.
 # All off by default: ./vinur.sh then just supervises the kb.
 #
-# [[serving.llms]]                        # primary distiller (vLLM; ./install.sh --serving)
-# name   = "primary"
-# engine = "vllm"                         # weights download into var/cache/huggingface
-# model  = "Qwen/Qwen2.5-32B-Instruct-AWQ"
-# port   = 11438                          # = distill_urls default
-# args   = ["--max-model-len", "16384", "--gpu-memory-utilization", "0.55"]
+# Every [[serving.llms]] key, engine = "vllm" (weights fetch into
+# var/cache/huggingface on first start; ./install.sh --serving builds the venv):
 #
-# [[serving.llms]]                        # second, different-family verifier/extractor
-# name   = "secondary"
-# engine = "vllm"
-# model  = "mistralai/Mistral-Small-24B-Instruct-2501"
-# port   = 11435                          # = extract_urls default
-# args   = ["--max-model-len", "16384", "--gpu-memory-utilization", "0.30"]
+# [[serving.llms]]
+# name      = "primary"           # required — the service/swap name (llm-<name>)
+# engine    = "vllm"              # required — vllm | llama
+# model     = "org/Model-NVFP4"   # required — HF id or local snapshot dir
+# port      = 11438               # required — 11438 = distill_urls default
+# host      = "127.0.0.1"         # bind (keep localhost; the kb proxies nothing)
+# exclusive = true                # can't co-reside with the other exclusive
+#                                 #   entries: ONE of them runs, swap loads another
+#                                 #   (./vinur.sh swap <name> / POST /serving/swap /
+#                                 #   a Prioritizer step's "model" key)
+# default   = true                # the exclusive entry that boots at start
+#   # ── how vLLM loads the model ──────────────────────────────────────────
+# quantization    = "modelopt"    # checkpoint format when detection needs help:
+#                                 #   modelopt (NVFP4), fp8, awq, gptq, …
+#                                 #   (usually auto-detected — omit first)
+# dtype           = "auto"        # compute dtype for unquantized weights
+# kv_cache_dtype  = "fp8"         # KV cache precision.  NVFP4/FP8 checkpoints:
+#                                 #   set "fp8" — halves KV memory and keeps the
+#                                 #   whole path on the 8-bit tensor cores;
+#                                 #   default "auto" = the model dtype (16-bit)
+# trust_remote_code = false       # required by some architectures' repos
+#   # ── how it runs / fits ────────────────────────────────────────────────
+# max_model_len          = 16384  # context window actually served (KV budget!)
+# gpu_memory_utilization = 0.90   # fraction of VRAM vLLM may claim — resident
+#                                 #   PAIRS must sum ≤ ~0.9; a lone exclusive
+#                                 #   model can take 0.90
+# max_num_seqs           = 32     # concurrent sequences cap (batch pressure)
+# tensor_parallel        = 1      # GPUs to shard across
+# cpu_offload_gb         = 0      # spill this many GB of weights to RAM (slow,
+#                                 #   but lets an oversized model limp in)
+# swap_space             = 4      # GB of CPU swap for preempted sequences
+# served_model_name      = ""     # the name clients pass as "model" (default: id)
+#   # ── escape hatches ────────────────────────────────────────────────────
+# env  = { VLLM_ATTENTION_BACKEND = "FLASHINFER" }   # extra process environment
+# args = ["--enable-prefix-caching"]  # ANY other `vllm serve` flag — appended
+#                                     #   LAST, so it also overrides the above
 #
-# [serving.embed]                         # nomic via llama-server --embedding
-# enabled = true                          # (GGUF auto-downloads into models/);
-#                                         # serves embed_url's port (11437)
+# engine = "llama" entries (a single GGUF via llama-server) take: ctx_size (-c),
+# n_gpu_layers (-ngl, default 99), plus the same host/args/env keys.
+#
+# [serving.embed]                 # nomic via llama-server --embedding
+# enabled = true                  # (GGUF auto-downloads into models/);
+#                                 # serves embed_url's port (11437)
 # [serving.reranker]
-# enabled = true                          # run-reranker.sh on rerank_url's port (cpu)
+# enabled = true                  # run-reranker.sh on rerank_url's port (cpu)
 #
-# Models too big to co-reside in VRAM: add `exclusive = true` to those llms
-# entries (+ `default = true` on the one that boots).  Exactly one runs at a
-# time; swap with `./vinur.sh swap <name>`, POST /serving/swap, or a
-# Prioritizer step's "model" key (phase-batched distill vs verify).  The
-# weights-load budget is serving.swap_timeout_s (default 900s).
-# See serving/README.md for a worked 96 GB example.
+# swap_timeout_s = 900 (top-level in [serving]) bounds a swap's weights-load
+# wait.  See serving/README.md for worked 96 GB examples (resident pair and
+# exclusive swap mode).
 
 # ── embeddings (the nomic endpoint, shared with Vinkona's memory store) ─────────
 embed_url   = "http://127.0.0.1:11437"

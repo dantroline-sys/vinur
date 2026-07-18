@@ -16,8 +16,9 @@ name   = "primary"                       # card extraction / distill battery
 engine = "vllm"
 model  = "Qwen/Qwen3-32B-FP8"            # ~33 GB
 port   = 11438
-args   = ["--max-model-len", "16384", "--gpu-memory-utilization", "0.55",
-          "--kv-cache-dtype", "fp8"]
+max_model_len          = 16384
+gpu_memory_utilization = 0.55
+kv_cache_dtype         = "fp8"
 
 [[serving.llms]]
 name   = "secondary"                     # different LAB on purpose: the
@@ -25,8 +26,9 @@ engine = "vllm"                          # two-model disagreement gate only
                                          # works across training lineages
 model  = "RedHatAI/Mistral-Small-3.2-24B-Instruct-2506-FP8"   # ~24 GB
 port   = 11435
-args   = ["--max-model-len", "16384", "--gpu-memory-utilization", "0.30",
-          "--kv-cache-dtype", "fp8"]
+max_model_len          = 16384
+gpu_memory_utilization = 0.30
+kv_cache_dtype         = "fp8"
 
 [serving.embed]
 enabled = true                           # nomic GGUF auto-downloads (~260 MB)
@@ -35,8 +37,43 @@ enabled = true                           # nomic GGUF auto-downloads (~260 MB)
 enabled = true                           # bge GGUF auto-downloads (~600 MB)
 ```
 
-The two `gpu-memory-utilization` fractions must leave headroom (≤ ~0.9
+The two `gpu_memory_utilization` fractions must leave headroom (≤ ~0.9
 total) — the embed server and CUDA fragmentation live in the remainder.
+
+## Tuning how vLLM loads and runs each model
+
+The load/run-critical knobs are first-class TOML keys on every
+`[[serving.llms]]` entry — set only what you mean; vLLM's own default
+applies otherwise. `config.example.toml` documents each inline. The mapping:
+
+| TOML key | `vllm serve` flag | what it tunes |
+|---|---|---|
+| `quantization` | `--quantization` | checkpoint format when auto-detection needs help: `modelopt` (NVFP4), `fp8`, `awq`, `gptq`, … |
+| `kv_cache_dtype` | `--kv-cache-dtype` | KV cache precision (`auto` / `fp8`) |
+| `dtype` | `--dtype` | compute dtype for unquantized weights |
+| `max_model_len` | `--max-model-len` | served context window — the KV budget |
+| `gpu_memory_utilization` | `--gpu-memory-utilization` | VRAM fraction this server may claim |
+| `max_num_seqs` | `--max-num-seqs` | concurrent-sequence cap |
+| `tensor_parallel` | `--tensor-parallel-size` | GPUs to shard across |
+| `cpu_offload_gb` | `--cpu-offload-gb` | GB of weights spilled to RAM |
+| `swap_space` | `--swap-space` | GB of CPU swap for preempted sequences |
+| `served_model_name` | `--served-model-name` | the `model` name clients send |
+| `enforce_eager` | `--enforce-eager` | disable CUDA graphs (less VRAM, slower) |
+| `trust_remote_code` | `--trust-remote-code` | repos that ship custom code |
+
+Plus two escape hatches on every entry: `env = { ... }` (extra process
+environment, e.g. `VLLM_ATTENTION_BACKEND`) and `args = [...]` — **any**
+other `vllm serve` flag, appended last so it also overrides the keys above.
+`engine = "llama"` entries take `ctx_size` (`-c`) and `n_gpu_layers`
+(`-ngl`, default 99) the same way.
+
+**Quantization pairing rule of thumb:** match the KV cache to the
+checkpoint. **NVFP4** and **FP8** checkpoints want `kv_cache_dtype = "fp8"`
+— it halves KV memory (double the context/batch for the same VRAM) and
+keeps the whole attention path on the 8-bit tensor cores instead of
+bouncing through 16-bit KV. NVFP4 repos usually auto-detect; if not, set
+`quantization = "modelopt"`. For AWQ/GPTQ on older GPUs, fp8 KV still saves
+memory but verify output quality — those stacks are less exercised with it.
 
 ## When two models don't fit: exclusive swap mode
 
@@ -52,11 +89,13 @@ other, wait for `/health` — minutes for big weights, budget in
 [[serving.llms]]
 name      = "primary"                 # boots (default = true)
 engine    = "vllm"
-model     = "Qwen/Qwen3.5-122B-A10B-AWQ"      # ~70 GB — general/research distill
+model     = "Qwen/Qwen3.5-122B-A10B-NVFP4"    # ~70 GB — general/research distill
 port      = 11438
 exclusive = true
 default   = true
-args      = ["--max-model-len", "16384", "--gpu-memory-utilization", "0.90"]
+kv_cache_dtype         = "fp8"        # NVFP4 checkpoint → 8-bit KV (see Tuning)
+max_model_len          = 16384
+gpu_memory_utilization = 0.90         # lone resident — it can take the card
 
 [[serving.llms]]
 name      = "secondary"               # standby until swapped in
@@ -64,7 +103,9 @@ engine    = "vllm"
 model     = "mistralai/Mistral-Small-4..."    # ~60 GB — verify / second opinion
 port      = 11435
 exclusive = true
-args      = ["--max-model-len", "16384", "--gpu-memory-utilization", "0.90"]
+kv_cache_dtype         = "fp8"
+max_model_len          = 16384
+gpu_memory_utilization = 0.90
 ```
 
 Three ways to trigger a swap:

@@ -55,8 +55,46 @@ def _anchored(path: str) -> str:
     return str(ROOT / Path(path).expanduser())
 
 
+# First-class vLLM tuning keys — one TOML key per load/run knob people actually
+# set per model (fit, quantization, KV cache), mapped straight onto `vllm serve`
+# flags.  A key is emitted only when the entry SETS it (vLLM's own default wins
+# otherwise); anything not listed here goes in `args`, which is appended LAST
+# so it also overrides these.  (config.example.toml documents each.)
+_VLLM_KEYS = [
+    # (toml key, cli flag, kind: value | flag)
+    ("quantization",           "--quantization",           "value"),
+    ("kv_cache_dtype",         "--kv-cache-dtype",         "value"),
+    ("dtype",                  "--dtype",                  "value"),
+    ("max_model_len",          "--max-model-len",          "value"),
+    ("gpu_memory_utilization", "--gpu-memory-utilization", "value"),
+    ("max_num_seqs",           "--max-num-seqs",           "value"),
+    ("tensor_parallel",        "--tensor-parallel-size",   "value"),
+    ("cpu_offload_gb",         "--cpu-offload-gb",         "value"),
+    ("swap_space",             "--swap-space",             "value"),
+    ("served_model_name",      "--served-model-name",      "value"),
+    ("enforce_eager",          "--enforce-eager",          "flag"),
+    ("trust_remote_code",      "--trust-remote-code",      "flag"),
+]
+
+
+def _mapped_flags(entry: dict, table: list) -> list[str]:
+    out: list[str] = []
+    for key, flag, kind in table:
+        if key not in entry:
+            continue
+        v = entry[key]
+        if kind == "flag":
+            if v:
+                out.append(flag)
+        elif v is not None and str(v) != "":
+            out += [flag, str(v)]
+    return out
+
+
 def llm_argv(entry: dict, root: Path = ROOT) -> list[str]:
-    """argv for one llms[] entry ({name, engine, model, port, args, host})."""
+    """argv for one llms[] entry ({name, engine, model, port, host, exclusive,
+    default, env, args} + the first-class tuning keys in _VLLM_KEYS /
+    ctx_size + n_gpu_layers for llama)."""
     for k in ("name", "engine", "model", "port"):
         if not entry.get(k):
             raise ValueError(f"serving.llms entry needs '{k}': {entry}")
@@ -69,16 +107,21 @@ def llm_argv(entry: dict, root: Path = ROOT) -> list[str]:
         if not vllm.exists():
             raise FileNotFoundError(
                 f"{vllm} missing — run ./install.sh --serving first")
-        return [str(vllm), "serve", str(entry["model"]),
-                "--host", host, "--port", port] + args
+        return ([str(vllm), "serve", str(entry["model"]),
+                 "--host", host, "--port", port]
+                + _mapped_flags(entry, _VLLM_KEYS) + args)
     if engine == "llama":
         model = _anchored(str(entry["model"]))
         if not os.path.isfile(model):
             raise FileNotFoundError(f"GGUF not found: {model}")
-        # -ngl 99 default (a box serving LMs wants them on GPU); args can override
+        # -ngl 99 default (a box serving LMs wants them on GPU); ctx_size /
+        # n_gpu_layers are the first-class knobs, args can override anything
         # because llama-server takes the LAST occurrence of a repeated flag.
-        return [_llama_server(), "-m", model, "--host", host, "--port", port,
-                "-ngl", "99"] + args
+        argv = [_llama_server(), "-m", model, "--host", host, "--port", port,
+                "-ngl", str(entry.get("n_gpu_layers", 99))]
+        if "ctx_size" in entry:
+            argv += ["-c", str(entry["ctx_size"])]
+        return argv + args
     raise ValueError(f"unknown serving engine '{engine}' (vllm | llama)")
 
 
@@ -349,7 +392,14 @@ def main(argv: list[str] | None = None) -> None:
         if ns.name not in entries:
             sys.exit(f"no serving.llms entry named '{ns.name}' "
                      f"(have: {', '.join(entries) or 'none'})")
-        cmd = llm_argv(entries[ns.name])
+        entry = entries[ns.name]
+        cmd = llm_argv(entry)
+        # Per-model environment (env = { VLLM_ATTENTION_BACKEND = "...", ... }):
+        # applied here, at exec time, so the supervisor path and a manual
+        # `python -m knowledgehost.serving <name>` behave identically.
+        env = entry.get("env")
+        if isinstance(env, dict):
+            os.environ.update({str(k): str(v) for k, v in env.items()})
     print("exec:", " ".join(cmd), flush=True)
     os.execvp(cmd[0], cmd)
 
