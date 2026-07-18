@@ -282,6 +282,11 @@ _FAILURE_HINTS = [
      "CUDA toolkit missing — vLLM's JIT kernels (NVFP4/FP8 MoE on consumer "
      "Blackwell needs them) can't build. serving/README.md → Troubleshooting "
      "has the toolkit-only install."),
+    ("unsupported GNU version",
+     "system gcc is newer than the CUDA toolkit supports — add "
+     'env = { NVCC_APPEND_FLAGS = "-allow-unsupported-compiler" } to the '
+     "model entry (or -ccbin a versioned g++). serving/README.md → "
+     "Troubleshooting."),
     ("CUDA out of memory",
      "VRAM overflow — lower gpu_memory_utilization / max_model_len, check "
      "what else is resident (exclusive swap mode exists for this)."),

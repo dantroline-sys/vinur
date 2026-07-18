@@ -312,6 +312,34 @@ Either way the Serving panel tab shows the crash line in its note column —
 if a model's service is dead and its weights chip says ready, the reason is
 an engine error like this one, not a download.
 
+### `#error -- unsupported GNU version! gcc versions later than N are not supported!`
+
+The sequel to the nvcc error on bleeding-edge distros: the toolkit is
+installed, but the **system gcc is newer than nvcc's supported ceiling**
+(the same reason the runfile installer needed `--override`). nvcc reads
+`NVCC_APPEND_FLAGS` from the environment, so fix it per model entry:
+
+```toml
+env = { NVCC_APPEND_FLAGS = "-allow-unsupported-compiler" }   # quick; NVIDIA's
+                                                              # "at your own risk"
+```
+
+or, to stay inside the support matrix, install a versioned compat compiler
+and hand it to nvcc instead:
+
+```bash
+sudo dnf install gcc14-c++          # Fedora ships versioned gcc packages
+```
+```toml
+env = { NVCC_APPEND_FLAGS = "-ccbin /usr/bin/g++-14" }
+```
+
+One-time cost either way: after the first successful JIT compile the module
+is cached (`var/cache/flashinfer`) and nvcc isn't invoked again. The same
+mismatch hits `./install.sh --llama`'s CUDA build — there the escape hatch
+is `VINUR_LLAMA_CMAKE_EXTRA='-DCMAKE_CUDA_FLAGS=-allow-unsupported-compiler'`
+(or `-DCMAKE_CUDA_HOST_COMPILER=/usr/bin/g++-14`).
+
 ### Benign startup noise (not bugs)
 
 Seen in healthy logs — none of these stop the engine:

@@ -277,6 +277,8 @@ def main():
                     "x\nRuntimeError: Could not find nvcc and default cuda_home...")
                 assert "gated HF repo" in sv.failure_hint("401 Client Error: Unauthorized")
                 assert "VRAM" in sv.failure_hint("torch.cuda: CUDA out of memory")
+                assert "NVCC_APPEND_FLAGS" in sv.failure_hint(
+                    "#error -- unsupported GNU version! gcc versions later than 15")
                 assert sv.failure_hint("something novel") is None
                 ok("failure_hint maps known crash signatures, ignores the rest")
 
