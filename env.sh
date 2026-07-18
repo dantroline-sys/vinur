@@ -76,6 +76,9 @@ vk_require_tools() {
     return 1
 }
 
+# ── vk_ncpu: portable CPU count for make -j (nproc is Linux-only) ────────────
+vk_ncpu() { nproc 2>/dev/null || sysctl -n hw.ncpu 2>/dev/null || echo 4; }
+
 # ── vk_uv: run uv, bootstrapping it in-tree on first use ────────────────────
 # uv (https://docs.astral.sh/uv/) builds .venv from pyproject.toml + uv.lock —
 # same pinned set on every platform, and it downloads a matching CPython itself

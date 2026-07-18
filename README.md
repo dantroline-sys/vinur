@@ -134,7 +134,8 @@ table and let `./vinur.sh` supervise all of it — the kb, the vLLM chat
 model(s), the nomic embed endpoint, and the CPU reranker:
 
 ```bash
-./install.sh --serving        # + vLLM in its own serving/.venv (GPU box; big download)
+./install.sh --serving --llama  # vLLM venv (big chat models) + an in-tree
+                                #   llama-server build (embed + reranker)
 $EDITOR config.toml           # [[serving.llms]] entries + embed/reranker — see the example
 ./vinur.sh start              # everything up, watched, logged to var/log/
 ./vinur.sh status             # dead services show the reason line from their log

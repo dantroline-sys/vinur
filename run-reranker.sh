@@ -20,11 +20,15 @@ MODEL_FILE="${MODEL_FILE:-bge-reranker-v2-m3-Q8_0.gguf}"
 MODEL_URL="${MODEL_URL:-https://huggingface.co/gpustack/bge-reranker-v2-m3-GGUF/resolve/main/${MODEL_FILE}}"
 MODEL_PATH="${MODEL_PATH:-${MODEL_DIR}/${MODEL_FILE}}"
 
-# Locate the llama.cpp server binary (override with LLAMA_SERVER=...).
+# Locate the llama.cpp server binary: $LLAMA_SERVER > the in-tree build
+# (./install.sh --llama -> bin/) > PATH > a sibling Vinkona checkout's build.
 BIN="${LLAMA_SERVER:-}"
+[ -z "$BIN" ] && [ -x "bin/llama-server" ] && BIN="bin/llama-server"
 if [ -z "$BIN" ]; then BIN="$(command -v llama-server || true)"; fi
+[ -z "$BIN" ] && [ -x "../vinkona/assistant/bin/llama-server" ] && BIN="../vinkona/assistant/bin/llama-server"
 if [ -z "$BIN" ] || [ ! -x "$BIN" ]; then
-  echo "error: llama-server not found. Set LLAMA_SERVER=/path/to/llama-server." >&2
+  echo "error: llama-server not found. Build it with ./install.sh --llama," >&2
+  echo "or set LLAMA_SERVER=/path/to/llama-server." >&2
   exit 1
 fi
 

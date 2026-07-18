@@ -44,7 +44,8 @@ DEFAULTS = {
     # extract_urls / verify_urls at the ports chosen here.  Engines:
     #   "vllm"  — serving/.venv (install with ./install.sh --serving);
     #             model = a HF id (downloads into var/cache/huggingface) or path
-    #   "llama" — llama-server on $PATH (or $LLAMA_SERVER); model = a GGUF path
+    #   "llama" — llama-server (./install.sh --llama builds it into bin/; also
+    #             found on $PATH / $LLAMA_SERVER); model = a GGUF path
     # Each llms entry: {name, engine, model, port, args=[...], host="127.0.0.1"}.
     # Models too big to co-reside in VRAM: mark them `exclusive = true` — they
     # form ONE GPU group of which exactly one runs (`default = true` picks the

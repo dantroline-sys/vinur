@@ -16,6 +16,9 @@
 #   ./install.sh --lance         # LanceDB IVF-PQ backend (Wikipedia scale)
 #   ./install.sh --serving       # + vLLM in its own serving/.venv (a standalone
 #                                #   GPU box serving its own LMs — see vinur.sh)
+#   ./install.sh --llama         # build llama-server into ./bin (the embed
+#                                #   endpoint + reranker run on it; CUDA when
+#                                #   nvcc is present, else CPU)
 #   ./install.sh --minimal       # stdlib only, not even numpy
 #   ./install.sh --no-venv       # install into the active/system interpreter (pip)
 #   ./install.sh --python 3.12 --venv /opt/kb/venv   # version, name, or path
@@ -44,6 +47,7 @@ if [ "${1:-}" = "status" ]; then
   echo "Knowledge host @ $(pwd)"
   [ -d .venv ]  && echo "  venv     .venv ($(du -sh .venv 2>/dev/null | cut -f1))" || echo "  venv     not installed"
   [ -d serving/.venv ] && echo "  serving  serving/.venv ($(du -sh serving/.venv 2>/dev/null | cut -f1)) — vLLM"
+  [ -x bin/llama-server ] && echo "  binary   bin/llama-server (embed + reranker)"
   [ -d var ]    && echo "  data     var/ ($(du -sh var 2>/dev/null | cut -f1)) — indexes, kb.db, caches" || echo "  data     none yet"
   [ -d models ] && echo "  models   models/ ($(du -sh models 2>/dev/null | cut -f1))"
   [ -f config.toml ] && echo "  config   config.toml (yours, kept on uninstall)" || echo "  config   not seeded yet"
@@ -52,9 +56,9 @@ if [ "${1:-}" = "status" ]; then
 fi
 if [ "${1:-}" = "uninstall" ]; then
   purge=0; [ "${2:-}" = "--purge" ] && purge=1
-  rm -rf .venv serving/.venv models var/cache var/tmp var/uv bin
+  rm -rf .venv serving/.venv models var/cache var/tmp var/uv var/build bin
   find . -name __pycache__ -type d -exec rm -rf {} + 2>/dev/null || true
-  echo "removed: .venv, models/, bin/, var/cache, var/tmp, var/uv (software + caches)"
+  echo "removed: .venv, serving/.venv, models/, bin/, var/cache, var/tmp, var/uv, var/build (software + caches)"
   if [ "$purge" -eq 1 ]; then
     echo ""
     echo "WARNING: --purge deletes the KNOWLEDGE BASE itself (var/: index.db, kb.db,"
@@ -79,7 +83,7 @@ VENV_DIR=".venv"
 USE_VENV=1
 WANT_NUMPY=1
 RUN_TEST=1
-WITH_PDF=0; WITH_EPUB=0; WITH_HTML=0; WITH_WIKI=0; WITH_LANCE=0; WITH_SERVING=0
+WITH_PDF=0; WITH_EPUB=0; WITH_HTML=0; WITH_WIKI=0; WITH_LANCE=0; WITH_SERVING=0; WITH_LLAMA=0
 
 # Print the leading comment block (everything after the shebang up to the first
 # non-comment line), with the leading "# " stripped.
@@ -94,6 +98,7 @@ while [ $# -gt 0 ]; do
     --wikipedia|--zim) WITH_WIKI=1 ;;
     --lance)     WITH_LANCE=1 ;;
     --serving)   WITH_SERVING=1 ;;   # vLLM venv (serving/.venv) — GPU box, big download
+    --llama)     WITH_LLAMA=1 ;;     # build llama-server into ./bin (embed + reranker)
 
     --minimal|--no-numpy) WANT_NUMPY=0 ;;
     --no-venv)   USE_VENV=0 ;;
@@ -151,6 +156,56 @@ PY
     "$PY" -m pip install --upgrade "${PKGS[@]}"
   else
     say "stdlib-only install (no pip packages requested)"
+  fi
+fi
+
+# ── 3a. llama-server (embed + reranker + engine="llama" entries) ────────────
+# A standalone Vinur box needs its own llama.cpp: the embed endpoint and the
+# CPU reranker run on llama-server (see serving/README.md — vLLM is only for
+# the big chat models).  Same recipe Vinkona's installer proved out:
+# LLAMA_CURL=OFF (the URL-download path is never used; it drags curl/OpenSSL
+# probing in), Darwin adds GGML_OPENMP=OFF (Apple clang has no libomp; Metal +
+# Accelerate make it pointless), CUDA auto-enables only when nvcc is present.
+# VINUR_LLAMA_CMAKE_EXTRA appends ad-hoc cmake flags without edits.
+if [ "$WITH_LLAMA" -eq 1 ]; then
+  if [ -x bin/llama-server ]; then
+    say "bin/llama-server already built — delete it to force a rebuild"
+  else
+    platform_flags=""
+    if [ "$(uname -s)" = Darwin ]; then
+      platform_flags="-DGGML_OPENMP=OFF"
+      vk_require_tools git cmake || die "building llama.cpp needs git + cmake (see above)"
+    else
+      vk_require_tools git cmake gcc "g++:gcc-c++|g++" make \
+        || die "building llama.cpp needs the C++ toolchain + cmake (see above)"
+    fi
+    cuda_flag="-DGGML_CUDA=OFF"
+    if command -v nvcc >/dev/null 2>&1; then
+      cuda_flag="-DGGML_CUDA=ON"
+      say "llama: nvcc found — building with CUDA (GPU embeddings)"
+    elif [ "$(uname -s)" != Darwin ]; then
+      warn "no nvcc — building CPU-only (fine for the reranker; embeddings run"
+      warn "slower). Install the CUDA toolkit and re-run for a GPU build, or"
+      warn "append flags via VINUR_LLAMA_CMAKE_EXTRA."
+    fi
+    src="var/build/llama.cpp"
+    say "llama: cloning/updating llama.cpp into $src"
+    if [ -d "$src/.git" ]; then git -C "$src" pull --ff-only; else
+      mkdir -p var/build
+      git clone --depth 1 https://github.com/ggml-org/llama.cpp "$src"
+    fi
+    say "llama: building llama-server ($cuda_flag) — this takes a while"
+    # shellcheck disable=SC2086
+    cmake -S "$src" -B "$src/build" $cuda_flag $platform_flags \
+          -DLLAMA_CURL=OFF \
+          -DBUILD_SHARED_LIBS=OFF -DLLAMA_BUILD_TESTS=OFF -DLLAMA_BUILD_EXAMPLES=OFF \
+          -DLLAMA_BUILD_SERVER=ON ${VINUR_LLAMA_CMAKE_EXTRA:-} >/dev/null \
+      || die "cmake configure failed — see above"
+    cmake --build "$src/build" --target llama-server -j"$(vk_ncpu)" \
+      || die "llama-server build failed — see above"
+    mkdir -p bin
+    cp "$src/build/bin/llama-server" bin/
+    say "installed bin/llama-server (found automatically by serving.py + run-reranker.sh)"
   fi
 fi
 

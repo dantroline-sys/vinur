@@ -315,6 +315,18 @@ def cmd_start() -> int:
               "or bind host = \"127.0.0.1\".", file=sys.stderr)
         return 1
     svcs = services_for(cfg)
+    # Friendly preflight: embed, the reranker, and engine="llama" entries all
+    # run on llama-server — say so upfront instead of letting them die at spawn.
+    from . import serving as sv
+    needs_llama = ([s["name"] for s in svcs if s["name"] in ("embed", "reranker")]
+                   + [f"llm-{e.get('name')}" for e in cfg["serving"]["llms"]
+                      if e.get("engine") == "llama"])
+    if needs_llama and not sv.find_llama_server():
+        verb = "needs" if len(needs_llama) == 1 else "need"
+        print(f"warning: {', '.join(needs_llama)} {verb} llama-server, which is not\n"
+              "installed — they will show as dead in status.  Build it in-tree with\n"
+              "'./install.sh --llama' (or set LLAMA_SERVER=/path/to/llama-server).",
+              file=sys.stderr)
     LOGS.mkdir(parents=True, exist_ok=True)
 
     if os.fork() != 0:                                 # parent: report and leave

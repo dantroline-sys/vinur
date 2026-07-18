@@ -126,6 +126,32 @@ def main():
         assert "-c 8192" in s and "-ngl 0" in s
         ok("llama first-class keys: ctx_size (-c) + n_gpu_layers (-ngl)")
 
+        # llama-server resolution: $LLAMA_SERVER > bin/ > PATH > sibling vinkona
+        saved_ls = os.environ.pop("LLAMA_SERVER", None)
+        try:
+            vroot = Path(td) / "vinur-root"
+            assert serving.find_llama_server(vroot) is None
+            sib = Path(td) / "vinkona" / "assistant" / "bin" / "llama-server"
+            sib.parent.mkdir(parents=True)
+            sib.write_text("#!/bin/sh\n")
+            sib.chmod(0o755)
+            vroot2 = Path(td) / "vinur"          # sibling of the vinkona dir
+            vroot2.mkdir()
+            assert serving.find_llama_server(vroot2) == str(sib)
+            own = vroot2 / "bin" / "llama-server"
+            own.parent.mkdir()
+            own.write_text("#!/bin/sh\n")
+            own.chmod(0o755)
+            assert serving.find_llama_server(vroot2) == str(own), "in-tree beats sibling"
+            os.environ["LLAMA_SERVER"] = "/x/custom"
+            assert serving.find_llama_server(vroot2) == "/x/custom", "env wins"
+        finally:
+            if saved_ls is None:
+                os.environ.pop("LLAMA_SERVER", None)
+            else:
+                os.environ["LLAMA_SERVER"] = saved_ls
+        ok("find_llama_server: env > in-tree bin/ > sibling vinkona; None when absent")
+
         ea = serving.embed_argv(c2, "/x/nomic.gguf")
         assert "--embedding" in ea and "11437" in ea and "-ub" in ea
         ok("embed argv (llama-server --embedding, batch-safe)")

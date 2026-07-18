@@ -201,12 +201,26 @@ port   = 11438
 Use this engine for small boxes or single-model setups; vLLM wins on batch
 throughput, which is what distillation runs are.
 
-## Embed + reranker — nothing to fetch
+## Embed + reranker — llama-server, not vLLM
 
-Both auto-download their GGUFs into `models/` on first start:
-`nomic-embed-text-v1.5.f16.gguf` (~260 MB) and
-`bge-reranker-v2-m3-Q8_0.gguf` (~600 MB). They only need a `llama-server`
-binary on `$PATH` (or `LLAMA_SERVER=/path/to/it`).
+Both run on llama.cpp *by design*: at 137M/568M parameters a vLLM instance's
+per-process overhead would dwarf them, and they must stay up while the big
+exclusive models swap — the CPU reranker and the tiny embedder live happily
+in the margin the `gpu_memory_utilization` fractions leave free.
+
+Their GGUFs auto-download into `models/` on first start
+(`nomic-embed-text-v1.5.f16.gguf` ~260 MB, `bge-reranker-v2-m3-Q8_0.gguf`
+~600 MB). What they DO need is a **`llama-server` binary** — a standalone
+Vinur box builds its own, in-tree:
+
+```bash
+./install.sh --llama     # → bin/llama-server (CUDA when nvcc is present, else CPU)
+```
+
+Resolution order everywhere (serving.py, run-reranker.sh):
+`$LLAMA_SERVER` → `bin/llama-server` → `$PATH` → a sibling Vinkona
+checkout's `../vinkona/assistant/bin/llama-server`. `./vinur.sh start` warns
+upfront when a declared service needs the binary and none is found.
 
 ## Wire the ports, then verify
 

@@ -37,16 +37,32 @@ EMBED_MODEL_URL = ("https://huggingface.co/nomic-ai/nomic-embed-text-v1.5-GGUF"
                    f"/resolve/main/{EMBED_MODEL_FILE}")
 
 
-def _llama_server() -> str:
-    """The llama.cpp server binary: $LLAMA_SERVER wins, else PATH lookup."""
+def find_llama_server(root: Path = ROOT) -> str | None:
+    """Resolve the llama.cpp server binary, or None.  Order: $LLAMA_SERVER,
+    the in-tree build (./install.sh --llama -> bin/), PATH, then a sibling
+    Vinkona checkout's build (one box often has both repos)."""
     exe = os.environ.get("LLAMA_SERVER", "").strip()
     if exe:
         return exe
+    own = root / "bin" / "llama-server"
+    if own.is_file() and os.access(own, os.X_OK):
+        return str(own)
     from shutil import which
     found = which("llama-server")
+    if found:
+        return found
+    sibling = root.parent / "vinkona" / "assistant" / "bin" / "llama-server"
+    if sibling.is_file() and os.access(sibling, os.X_OK):
+        return str(sibling)
+    return None
+
+
+def _llama_server() -> str:
+    found = find_llama_server()
     if not found:
         raise FileNotFoundError(
-            "llama-server not found — install llama.cpp or set LLAMA_SERVER=/path/to/llama-server")
+            "llama-server not found — build it with ./install.sh --llama "
+            "(in-tree), or set LLAMA_SERVER=/path/to/llama-server")
     return found
 
 
@@ -386,6 +402,7 @@ def main(argv: list[str] | None = None) -> None:
     cfg = load_config(cfg_path)
 
     if ns.name == "embed":
+        _llama_server()          # resolve the binary BEFORE the ~260 MB download
         cmd = embed_argv(cfg, ensure_embed_model())
     else:
         entries = {str(e.get("name")): e for e in cfg["serving"]["llms"]}
