@@ -124,13 +124,45 @@ knowledge = { enabled = true, tool_url = "http://127.0.0.1:8771" }
 On the research path, prefer `kb_search` **before** the web (local-first); use
 web for recency or when `low_confidence` is set.
 
+## Running Vinur on its own machine (with its own LMs)
+
+Vinur never serves a chat LM itself — distillation and verification are just
+OpenAI-compatible endpoints in config (`distill_urls` / `extract_urls` /
+`verify_urls`). On a box of its own (say, the big-VRAM machine, with Vinkona
+elsewhere), declare what this machine serves in config.toml's `[serving]`
+table and let `./vinur.sh` supervise all of it — the kb, the vLLM chat
+model(s), the nomic embed endpoint, and the CPU reranker:
+
+```bash
+./install.sh --serving        # + vLLM in its own serving/.venv (GPU box; big download)
+$EDITOR config.toml           # [[serving.llms]] entries + embed/reranker — see the example
+./vinur.sh start              # everything up, watched, logged to var/log/
+./vinur.sh status             # dead services show the reason line from their log
+./vinur.sh logs [svc]         # follow;  restart [svc] / stop as expected
+```
+
+With `[serving]` empty (the default), `./vinur.sh` simply supervises the kb —
+a one-machine Vinkona setup keeps using Vinkona's own tiers as before.
+
+To let a remote Vinkona reach this host, set `host = "0.0.0.0"` **and**
+`auth_token` (the server refuses a LAN bind without a token, because `/ops`
+runs maintenance jobs). On the Vinkona side point `knowledge.tool_url`,
+`knowledge_host.url`, and — for the research hand-off — the exporter at this
+box: with `research.export.folder = "http://this-box:8771"` (plus `token`),
+solved-research drops POST to this host's `/drop` route and land in
+`research_solved_dir` exactly as if the folder were shared. The web control
+panel (`http://this-box:8771/`) works over the same connection, so
+maintenance needs no SSH.
+
 ## Security
 
 - All ingested content is **UNTRUSTED**; the tool returns data, fenced as low-
   trust by Vinkona before any LM reads it. Passages can colour an answer, never
   issue commands.
 - Filenames are treated as **opaque data** — never shelled or prompt-interpolated.
-- Service is **read-only and localhost-bound**; optional Bearer token on `/call`.
+- Service binds **localhost by default**; a non-loopback bind *requires*
+  `auth_token` (Bearer on `/call` and every control route) — the server
+  refuses to start otherwise.
 - Keep parsers (PyMuPDF/Tesseract) patched; parsing needs no network.
 
 ## Layout
@@ -144,7 +176,9 @@ knowledgehost/
   rerank.py     RRF fusion + intent-conditioned heuristic reranker (cross-encoder = drop-in)
   ingest.py     incremental crawl + Wikipedia ZIM; sanitize -> chunk -> embed -> upsert
   tools.py      the kb_search tool (embed+FTS -> fuse -> rerank -> cited passages + confidence)
-  server.py     stdlib HTTP: /health /tools /call
+  server.py     stdlib HTTP: /health /tools /call (+ /drop, control panel)
+  supervisor.py ./vinur.sh's engine — the kb + [serving] services, watched
+  serving.py    exec one declared LM/embed service (vllm | llama.cpp)
   sources/      pdf, epub, html, text, wikipedia extractors (heavy deps lazy)
 tests/          make_fixtures.sh + smoke.py (zero-install end-to-end)
 ```

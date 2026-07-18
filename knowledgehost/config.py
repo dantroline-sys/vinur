@@ -28,11 +28,32 @@ DEFAULTS = {
     "ann_min_rows": 4096,
 
     # ── service ────────────────────────────────────────────────────────────
-    "host": "127.0.0.1",   # bind localhost; it is NEVER on the LAN (read-only).
+    # Bind localhost by default.  To serve another machine (e.g. Vinkona lives
+    # elsewhere), set host = "0.0.0.0" AND set auth_token — the server refuses
+    # a non-loopback bind without one, because /ops runs maintenance jobs.
+    "host": "127.0.0.1",
     # KNOWLEDGE.md suggests 8770, but the music host already claims that port;
     # default to 8771 so the two hosts can co-locate.  Override freely.
     "port": 8771,
     "auth_token": "",      # if set, /call requires  Authorization: Bearer <it>
+
+    # ── standalone serving (./vinur.sh — knowledgehost.supervisor) ──────────
+    # What THIS box serves when Vinur runs without Vinkona (e.g. one big-VRAM
+    # machine hosting the kb plus its own LMs).  Every entry becomes a
+    # supervised service; point embed_url / rerank_url / distill_urls /
+    # extract_urls / verify_urls at the ports chosen here.  Engines:
+    #   "vllm"  — serving/.venv (install with ./install.sh --serving);
+    #             model = a HF id (downloads into var/cache/huggingface) or path
+    #   "llama" — llama-server on $PATH (or $LLAMA_SERVER); model = a GGUF path
+    # Each llms entry: {name, engine, model, port, args=[...], host="127.0.0.1"}.
+    # With everything off (the default) ./vinur.sh just supervises the kb.
+    "serving": {
+        "llms": [],
+        # nomic embeds via llama-server --embedding (the GGUF auto-downloads
+        # into models/ on first start) — pair with embed_url above.
+        "embed": {"enabled": False, "port": 11437, "args": []},
+        "reranker": {"enabled": False},   # run-reranker.sh on rerank_url's port (CPU)
+    },
 
     # Extra HIGH-STAKES query patterns (regex, case-insensitive) OR'd into the built-in
     # rigor heuristic (grounding.default_rigor) — a query matching any of them defaults
@@ -744,6 +765,16 @@ def load_config(path: str | None = None) -> dict:
 
     cfg["extensions"] = [e.lower() if e.startswith(".") else "." + e.lower()
                          for e in cfg["extensions"]]
+
+    # `serving` is the one nested table users set PARTIALLY (e.g. just
+    # [[serving.llms]]) — merge it over the defaults instead of replacing them,
+    # and never alias the DEFAULTS sub-dicts (cfg is a shallow copy).
+    _sdef = DEFAULTS["serving"]
+    _susr = cfg.get("serving") if isinstance(cfg.get("serving"), dict) else {}
+    cfg["serving"] = {
+        k: ({**v, **_susr[k]} if isinstance(v, dict) and isinstance(_susr.get(k), dict)
+            else _susr.get(k, list(v) if isinstance(v, list) else dict(v) if isinstance(v, dict) else v))
+        for k, v in _sdef.items()}
 
     # Path resolution: ~ expands; RELATIVE paths anchor to the knowledge-host
     # root (this package's parent), never the caller's cwd — so the defaults

@@ -5,10 +5,12 @@ Endpoints:
 - ``GET  /tools``    the tool catalogue
 - ``POST /call``     run a tool  {name, arguments}  ->  {ok, result|error}
 
-Read-only and **localhost-bound** (it is never on the LAN).  If ``auth_token``
-is set, ``/call`` requires ``Authorization: Bearer <token>`` — but on the GPU
-box it's co-located with the cascade and needs no tunnel, so a token is
-optional.  Threaded so concurrent tool calls don't queue.
+Localhost-bound by default.  If ``auth_token`` is set, ``/call`` and the
+control-panel routes require ``Authorization: Bearer <token>``; co-located
+with the cascade none is needed.  Binding a non-loopback ``host`` (Vinkona on
+another machine) REQUIRES a token — ``serve`` refuses otherwise, because the
+``/ops`` surface runs maintenance jobs.  Threaded so concurrent tool calls
+don't queue.
 """
 from __future__ import annotations
 
@@ -19,9 +21,9 @@ import signal
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse, parse_qs
 
-# Cap on a POST body we will read into memory.  The control routes only ever carry
-# small JSON; refusing anything larger stops a local process from OOMing the server
-# with a giant Content-Length (the server is localhost-only, but cheap to bound).
+# Cap on a POST body we will read into memory.  The control routes carry small
+# JSON (/drop the largest — a whole research doc); refusing anything larger stops
+# a client from OOMing the server with a giant Content-Length.
 _MAX_BODY = 4 * 1024 * 1024
 
 from . import __version__
@@ -332,7 +334,7 @@ class Handler(BaseHTTPRequestHandler):
         path = urlparse(self.path).path
         if path not in ("/call", "/ops/run", "/ops/stop", "/ops/reload", "/config",
                         "/ops/autopilot", "/library/config", "/source", "/scenario",
-                        "/brain"):
+                        "/brain", "/drop"):
             return self._send_json({"ok": False, "error": "not found"}, 404)
         if not self._authed():
             return self._send_json({"ok": False, "error": "unauthorized"}, 401)
@@ -344,6 +346,17 @@ class Handler(BaseHTTPRequestHandler):
             if not name:
                 return self._send_json({"ok": False, "error": "missing tool name"}, 400)
             return self._send_json(self.server.tools.call(name, req.get("arguments", {})))
+        if path == "/drop":                            # research hand-off over HTTP
+            # A remote Vinkona's exporter posts solved/*.md here instead of
+            # writing a shared folder; ingest mines research_solved_dir either way.
+            from . import research
+            try:
+                return self._send_json(
+                    research.write_drop(self.cfg, req.get("name"), req.get("content")))
+            except ValueError as e:
+                return self._send_json({"ok": False, "error": str(e)}, 400)
+            except OSError as e:
+                return self._send_json({"ok": False, "error": f"write failed: {e}"}, 500)
         if path == "/ops/run":                         # launch a maintenance verb
             try:
                 return self._send_json(
@@ -549,7 +562,23 @@ class KnowledgeHostServer(ThreadingHTTPServer):
                         + ("" if persisted else " (this session only — no config file)")}
 
 
+def check_bind_auth(cfg) -> None:
+    """A non-loopback bind without a token exposes /ops (maintenance jobs) to
+    the whole LAN — refuse it.  Deliberate override: VINUR_ALLOW_UNAUTHED_LAN=1."""
+    import os
+    host = cfg.get("host") or ""
+    if host in ("127.0.0.1", "localhost", "::1", ""):
+        return
+    if cfg.get("auth_token") or os.environ.get("VINUR_ALLOW_UNAUTHED_LAN") == "1":
+        return
+    raise SystemExit(
+        f"refusing to bind {host}:{cfg['port']} without auth_token — the control\n"
+        "panel runs maintenance jobs.  Set auth_token in config.toml (clients send\n"
+        "Authorization: Bearer <it>), or bind host = \"127.0.0.1\".")
+
+
 def serve(cfg, store, tools, kb=None):
+    check_bind_auth(cfg)
     httpd = KnowledgeHostServer(cfg, store, tools, kb)
     # Warm the ANN index now (one-time resident load of ~index-size RAM) so the first
     # `ask` doesn't eat the load — every query is RAM-speed from the first one.

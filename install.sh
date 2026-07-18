@@ -14,6 +14,8 @@
 #   ./install.sh --pdf --epub    # pick formats your collection has
 #   ./install.sh --wikipedia     # libzim, for a Kiwix Wikipedia ZIM
 #   ./install.sh --lance         # LanceDB IVF-PQ backend (Wikipedia scale)
+#   ./install.sh --serving       # + vLLM in its own serving/.venv (a standalone
+#                                #   GPU box serving its own LMs — see vinur.sh)
 #   ./install.sh --minimal       # stdlib only, not even numpy
 #   ./install.sh --no-venv       # install into the active/system interpreter (pip)
 #   ./install.sh --python 3.12 --venv /opt/kb/venv   # version, name, or path
@@ -41,6 +43,7 @@ source ./env.sh          # in-tree var/ caches + tmp — see env.sh
 if [ "${1:-}" = "status" ]; then
   echo "Knowledge host @ $(pwd)"
   [ -d .venv ]  && echo "  venv     .venv ($(du -sh .venv 2>/dev/null | cut -f1))" || echo "  venv     not installed"
+  [ -d serving/.venv ] && echo "  serving  serving/.venv ($(du -sh serving/.venv 2>/dev/null | cut -f1)) — vLLM"
   [ -d var ]    && echo "  data     var/ ($(du -sh var 2>/dev/null | cut -f1)) — indexes, kb.db, caches" || echo "  data     none yet"
   [ -d models ] && echo "  models   models/ ($(du -sh models 2>/dev/null | cut -f1))"
   [ -f config.toml ] && echo "  config   config.toml (yours, kept on uninstall)" || echo "  config   not seeded yet"
@@ -49,7 +52,7 @@ if [ "${1:-}" = "status" ]; then
 fi
 if [ "${1:-}" = "uninstall" ]; then
   purge=0; [ "${2:-}" = "--purge" ] && purge=1
-  rm -rf .venv models var/cache var/tmp var/uv bin
+  rm -rf .venv serving/.venv models var/cache var/tmp var/uv bin
   find . -name __pycache__ -type d -exec rm -rf {} + 2>/dev/null || true
   echo "removed: .venv, models/, bin/, var/cache, var/tmp, var/uv (software + caches)"
   if [ "$purge" -eq 1 ]; then
@@ -76,7 +79,7 @@ VENV_DIR=".venv"
 USE_VENV=1
 WANT_NUMPY=1
 RUN_TEST=1
-WITH_PDF=0; WITH_EPUB=0; WITH_HTML=0; WITH_WIKI=0; WITH_LANCE=0
+WITH_PDF=0; WITH_EPUB=0; WITH_HTML=0; WITH_WIKI=0; WITH_LANCE=0; WITH_SERVING=0
 
 # Print the leading comment block (everything after the shebang up to the first
 # non-comment line), with the leading "# " stripped.
@@ -90,6 +93,8 @@ while [ $# -gt 0 ]; do
     --html)      WITH_HTML=1 ;;
     --wikipedia|--zim) WITH_WIKI=1 ;;
     --lance)     WITH_LANCE=1 ;;
+    --serving)   WITH_SERVING=1 ;;   # vLLM venv (serving/.venv) — GPU box, big download
+
     --minimal|--no-numpy) WANT_NUMPY=0 ;;
     --no-venv)   USE_VENV=0 ;;
     --venv)      VENV_DIR="${2:?--venv needs a path}"; shift ;;
@@ -147,6 +152,14 @@ PY
   else
     say "stdlib-only install (no pip packages requested)"
   fi
+fi
+
+# ── 3b. vLLM serving venv (its own uv project — see serving/pyproject.toml) ─
+if [ "$WITH_SERVING" -eq 1 ]; then
+  say "syncing serving/.venv (vLLM — GPU box only; multi-GB torch/CUDA download)"
+  (cd serving && UV_PROJECT_ENVIRONMENT="$PWD/.venv" vk_uv sync --inexact) \
+    || die "serving sync failed — see above"
+  say "declare the models in config.toml's [[serving.llms]] and start with ./vinur.sh"
 fi
 
 # ── 4. system binaries we cannot pip-install (offer, never block) ───────────

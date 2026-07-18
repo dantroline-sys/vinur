@@ -12,9 +12,38 @@ db_path   = "var/index.db"     # relative paths anchor to this folder (in-tree b
 lance_dir = "var/lance"        # lance tables for the lance backend
 
 # ── service ───────────────────────────────────────────────────────────────-─
-host = "127.0.0.1"      # localhost only; never on the LAN
+# Serving another machine (Vinkona lives elsewhere)?  host = "0.0.0.0" AND set
+# auth_token — the server refuses a LAN bind without one (/ops runs jobs).
+host = "127.0.0.1"      # localhost by default
 port = 8771             # 8770 is the music host; co-locate on 8771
 auth_token = ""         # if set, /call requires Authorization: Bearer <token>
+
+# ── standalone serving (./vinur.sh) ─────────────────────────────────────────
+# What THIS box serves when Vinur runs without Vinkona — e.g. one big-VRAM
+# machine hosting the kb plus its own LMs.  Everything declared here (plus the
+# kb itself) runs under ./vinur.sh start|stop|status|logs.  Point embed_url /
+# rerank_url / distill_urls / extract_urls / verify_urls at the same ports.
+# All off by default: ./vinur.sh then just supervises the kb.
+#
+# [[serving.llms]]                        # primary distiller (vLLM; ./install.sh --serving)
+# name   = "primary"
+# engine = "vllm"                         # weights download into var/cache/huggingface
+# model  = "Qwen/Qwen2.5-32B-Instruct-AWQ"
+# port   = 11438                          # = distill_urls default
+# args   = ["--max-model-len", "16384", "--gpu-memory-utilization", "0.55"]
+#
+# [[serving.llms]]                        # second, different-family verifier/extractor
+# name   = "secondary"
+# engine = "vllm"
+# model  = "mistralai/Mistral-Small-24B-Instruct-2501"
+# port   = 11435                          # = extract_urls default
+# args   = ["--max-model-len", "16384", "--gpu-memory-utilization", "0.30"]
+#
+# [serving.embed]                         # nomic via llama-server --embedding
+# enabled = true                          # (GGUF auto-downloads into models/);
+#                                         # serves embed_url's port (11437)
+# [serving.reranker]
+# enabled = true                          # run-reranker.sh on rerank_url's port (cpu)
 
 # ── embeddings (the nomic endpoint, shared with Vinkona's memory store) ─────────
 embed_url   = "http://127.0.0.1:11437"

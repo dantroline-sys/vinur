@@ -24,6 +24,7 @@ the filename is never interpolated anywhere.
 from __future__ import annotations
 
 import json
+import os
 import re
 
 _FM = re.compile(r"^﻿?---[ \t]*\r?\n(.*?)\r?\n---[ \t]*\r?\n", re.DOTALL)
@@ -64,6 +65,44 @@ def is_research_doc(path: str) -> bool:
         return False
     fm, _ = parse_front_matter(head if "\n---" in head else head + "\n---\n")
     return (fm.get("provenance") or "").strip().lower() == "vinkona"
+
+
+# The exporter names files <sha1[:16]>.md (research_export.question_hash) — the
+# HTTP lane accepts exactly that shape, so a request can never traverse out of
+# the drops folder or claim an arbitrary filename.
+_DROP_NAME = re.compile(r"^[0-9a-f]{16}\.md$")
+
+
+def write_drop(cfg: dict, name, content) -> dict:
+    """HTTP lane of the research hand-off (POST /drop): validate one solved-drop
+    and write it atomically into ``research_solved_dir``, where the crawl mines
+    it exactly as if Vinkona had written the file over a shared filesystem.
+    Byte-identical re-posts are a no-op (``changed: false``) — the exporter can
+    re-send its whole outbox safely."""
+    ddir = cfg.get("research_solved_dir")
+    if not ddir:
+        raise ValueError("research_solved_dir is not configured on this host")
+    if not isinstance(name, str) or not _DROP_NAME.match(name):
+        raise ValueError("drop name must be '<16 hex>.md'")
+    if not isinstance(content, str) or not content.strip():
+        raise ValueError("drop content must be a non-empty string")
+    head = content[:2048]
+    fm, _ = parse_front_matter(head if "\n---" in head else head + "\n---\n")
+    if (fm.get("provenance") or "").strip().lower() != "vinkona":
+        raise ValueError("not a research drop (front-matter 'provenance: vinkona' required)")
+    os.makedirs(ddir, exist_ok=True)
+    path = os.path.join(ddir, name)
+    try:
+        with open(path, "r", encoding="utf-8") as fh:
+            if fh.read() == content:
+                return {"ok": True, "changed": False}
+    except OSError:
+        pass
+    tmp = path + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as fh:
+        fh.write(content)
+    os.replace(tmp, path)
+    return {"ok": True, "changed": True}
 
 
 def _sections(body: str) -> list[tuple[int, str, str]]:

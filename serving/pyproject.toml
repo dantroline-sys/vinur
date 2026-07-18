@@ -1,0 +1,15 @@
+# vLLM serving environment — its OWN uv project, like Vinkona's neutts split:
+# vLLM drags the full torch/CUDA stack, whose pins must never constrain the
+# core .venv (which is stdlib + numpy).  install.sh --serving syncs this into
+# serving/.venv; knowledgehost/serving.py execs serving/.venv/bin/vllm.
+#
+# GPU boxes only.  Weights download into var/cache/huggingface (env.sh's
+# HF_HOME), so the in-tree filesystem guarantee holds — budget tens of GB.
+[project]
+name = "vinur-serving"
+version = "0.1.0"
+description = "vLLM serving venv for a standalone Vinur box"
+requires-python = ">=3.10,<3.13"
+dependencies = [
+    "vllm>=0.8.5",
+]
