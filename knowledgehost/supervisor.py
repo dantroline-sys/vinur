@@ -327,6 +327,9 @@ def cmd_start() -> int:
               "installed — they will show as dead in status.  Build it in-tree with\n"
               "'./install.sh --llama' (or set LLAMA_SERVER=/path/to/llama-server).",
               file=sys.stderr)
+    tk_warn = sv.toolkit_warning(cfg)
+    if tk_warn:
+        print(f"warning: {tk_warn}", file=sys.stderr)
     LOGS.mkdir(parents=True, exist_ok=True)
 
     if os.fork() != 0:                                 # parent: report and leave

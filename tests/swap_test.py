@@ -271,6 +271,45 @@ def main():
                 assert body["ok"] and body["hosting"] and len(body["llms"]) == 4
                 khs2.shutdown()
                 ok("GET /serving/status serves the panel payload (authed)")
+
+                # ── known-failure hints + toolkit preflight ──────────────
+                assert "toolkit missing" in sv.failure_hint(
+                    "x\nRuntimeError: Could not find nvcc and default cuda_home...")
+                assert "gated HF repo" in sv.failure_hint("401 Client Error: Unauthorized")
+                assert "VRAM" in sv.failure_hint("torch.cuda: CUDA out of memory")
+                assert sv.failure_hint("something novel") is None
+                ok("failure_hint maps known crash signatures, ignores the rest")
+
+                # a dead vllm service whose log tail holds the nvcc error gets the hint
+                logs0, sup.LOGS = sup.LOGS, Path(td) / "logs"
+                try:
+                    sup.LOGS.mkdir(parents=True, exist_ok=True)
+                    (sup.LOGS / "llm-good.log").write_text(
+                        "RuntimeError: Could not find nvcc and default cuda_home="
+                        "'/usr/local/cuda' doesn't exist\n[rank0] NCCL teardown noise\n")
+                    sup.STATE.write_text(json.dumps({
+                        "supervisor": os.getpid(),
+                        "services": {"llm-good": 999999}, "standby": {}, "failed": {}}))
+                    res2 = sv.serving_status(wcfg)
+                    dead = {m["name"]: m for m in res2["llms"]}["good"]
+                    assert dead["service"] == "dead", dead
+                    assert "toolkit missing" in dead.get("hint", ""), dead
+                    ok("serving_status attaches the hint from the dead service's log tail")
+                finally:
+                    sup.LOGS = logs0
+
+                fp4cfg = load_config()
+                fp4cfg["serving"] = {**fp4cfg["serving"], "llms": [
+                    {"name": "big", "engine": "vllm", "model": "org/M-NVFP4", "port": 1}]}
+                w = sv.toolkit_warning(fp4cfg, toolkit_present=False)
+                assert w and "WILL fail" in w and "big" in w
+                assert sv.toolkit_warning(fp4cfg, toolkit_present=True) is None
+                fp4cfg["serving"]["llms"][0]["model"] = "org/M-FP8"
+                w = sv.toolkit_warning(fp4cfg, toolkit_present=False)
+                assert w and "WILL fail" not in w
+                fp4cfg["serving"]["llms"] = []
+                assert sv.toolkit_warning(fp4cfg, toolkit_present=False) is None
+                ok("toolkit_warning: loud for NVFP4/modelopt, gentle otherwise, quiet w/o vllm")
             finally:
                 sup.STATE = sup_state0
                 if state0 is None:

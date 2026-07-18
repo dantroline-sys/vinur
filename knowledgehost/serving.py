@@ -274,6 +274,63 @@ def cuda_home_probe(environ: dict = None, prefixes: tuple = ("/usr/local", "/opt
     return None
 
 
+# Known engine-failure signatures → actionable hints.  The Serving tab and
+# status put these next to the dead service so nobody has to re-diagnose a
+# failure mode we've already seen in the wild.
+_FAILURE_HINTS = [
+    ("Could not find nvcc",
+     "CUDA toolkit missing — vLLM's JIT kernels (NVFP4/FP8 MoE on consumer "
+     "Blackwell needs them) can't build. serving/README.md → Troubleshooting "
+     "has the toolkit-only install."),
+    ("CUDA out of memory",
+     "VRAM overflow — lower gpu_memory_utilization / max_model_len, check "
+     "what else is resident (exclusive swap mode exists for this)."),
+    ("401 Client Error",
+     "gated HF repo — accept its license on huggingface.co and export "
+     "HF_TOKEN before starting."),
+    ("GatedRepoError",
+     "gated HF repo — accept its license on huggingface.co and export "
+     "HF_TOKEN before starting."),
+    ("No space left on device",
+     "disk full — weights live in var/cache/huggingface; prune models you "
+     "dropped from the config."),
+]
+
+
+def failure_hint(text: str) -> str | None:
+    """Map a service's dying words to the fix, if it's a failure we know."""
+    for needle, hint in _FAILURE_HINTS:
+        if needle in (text or ""):
+            return hint
+    return None
+
+
+def toolkit_warning(cfg: dict, toolkit_present: bool | None = None) -> str | None:
+    """Start-time preflight: vllm entries declared but no CUDA toolkit on the
+    box.  Loud when a model looks NVFP4/modelopt (on consumer Blackwell that
+    WILL die in the FlashInfer JIT); gentle otherwise (JIT paths MAY need it).
+    toolkit_present injects the detection for tests."""
+    vllm_entries = [e for e in cfg["serving"]["llms"] if e.get("engine") == "vllm"]
+    if not vllm_entries:
+        return None
+    if toolkit_present is None:
+        toolkit_present = bool(os.environ.get("CUDA_HOME") or os.environ.get("CUDA_PATH")
+                               or cuda_home_probe({}))
+    if toolkit_present:
+        return None
+    fp4 = [str(e.get("name")) for e in vllm_entries
+           if "fp4" in str(e.get("model", "")).lower()
+           or str(e.get("quantization", "")).lower() == "modelopt"]
+    if fp4:
+        return (f"no CUDA toolkit (nvcc) found, and {', '.join(fp4)} looks "
+                "NVFP4/modelopt-quantized — on consumer Blackwell that model WILL "
+                "fail in the FlashInfer JIT ('Could not find nvcc').  Install the "
+                "toolkit first: serving/README.md → Troubleshooting.")
+    return ("no CUDA toolkit (nvcc) found — vLLM runs, but JIT kernel paths "
+            "(FlashInfer MoE, some attention backends) will fail if a model "
+            "needs them.  serving/README.md → Troubleshooting.")
+
+
 # ── panel status: is this box hosting models, and are the weights here? ─────
 
 def _tree_size(p: Path) -> int:
@@ -369,6 +426,17 @@ def serving_status(cfg: dict) -> dict:
             line = sup.last_log_line(svc_name)
             if line:
                 d["last_log"] = line[-240:]
+        if d["service"] in ("dead", "failed"):
+            # The signature line is rarely LAST (NCCL/teardown noise follows a
+            # crash) — scan the log tail for failure modes we know the fix for.
+            try:
+                tail = (sup.LOGS / f"{svc_name}.log").read_bytes()[-8192:] \
+                    .decode("utf-8", "replace")
+            except OSError:
+                tail = ""
+            hint = failure_hint(d.get("reason", "") + " " + tail)
+            if hint:
+                d["hint"] = hint
         return d
 
     llms = []

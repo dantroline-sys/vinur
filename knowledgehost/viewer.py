@@ -642,7 +642,8 @@ async function pollServing() {
     const role = m.exclusive ? (m.default ? 'exclusive · boots' : 'exclusive') : 'resident';
     const canSwap = sup.running && m.exclusive && m.service === 'standby' && sw.status !== 'swapping';
     const act = canSwap ? `<button class="toolbtn" onclick="doSwap('${esc(m.name)}')">Swap in</button>` : '';
-    const note = m.reason || m.last_log || (m.weights && m.weights.detail) || '';
+    const note = (m.hint ? '💡 ' + m.hint + ' · ' : '')
+      + (m.reason || m.last_log || (m.weights && m.weights.detail) || '');
     return `<tr><td><b>${esc(m.name)}</b></td>
       <td>${esc(m.model)}<br><span style="opacity:.6">${esc(m.engine)} · :${m.port} · ${role}</span></td>
       <td>${svState(m.service)}</td><td>${svWeights(m.weights)}</td>

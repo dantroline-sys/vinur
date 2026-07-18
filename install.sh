@@ -214,6 +214,16 @@ if [ "$WITH_SERVING" -eq 1 ]; then
   say "syncing serving/.venv (vLLM — GPU box only; multi-GB torch/CUDA download)"
   (cd serving && UV_PROJECT_ENVIRONMENT="$PWD/.venv" vk_uv sync --inexact) \
     || die "serving sync failed — see above"
+  # Heads-up that has bitten in the wild: vLLM's JIT kernel paths (FlashInfer —
+  # the ONLY NVFP4/FP8-MoE implementation on consumer Blackwell) need the CUDA
+  # TOOLKIT (nvcc), which the driver alone doesn't provide.
+  if command -v nvidia-smi >/dev/null 2>&1 && ! command -v nvcc >/dev/null 2>&1 \
+     && [ -z "${CUDA_HOME:-}" ] && [ ! -e /usr/local/cuda ]; then
+    warn "NVIDIA GPU present but no CUDA toolkit (nvcc) found.  NVFP4/FP8-MoE"
+    warn "models (and other JIT kernel paths) will fail to start with"
+    warn "'Could not find nvcc'.  See serving/README.md -> Troubleshooting for"
+    warn "the toolkit-only install (your driver is left untouched)."
+  fi
   say "declare the models in config.toml's [[serving.llms]] and start with ./vinur.sh"
 fi
 
