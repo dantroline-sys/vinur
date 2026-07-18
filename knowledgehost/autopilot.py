@@ -102,6 +102,9 @@ def save_plan(cfg: dict, plan: dict) -> dict:
             "enabled": bool(s.get("enabled", True)),
             "min_interval_s": max(0, int(s.get("min_interval_s", 0) or 0)),
             "label": str(s.get("label", cmd))[:120],
+            # Exclusive-model phase batching: run this step under a specific
+            # [serving] model (swapped in first).  Empty = whatever is loaded.
+            "model": str(s.get("model", "") or "")[:60],
         })
     out = {
         "enabled": bool(plan.get("enabled", False)),
@@ -144,10 +147,13 @@ def due_step(steps: list, last_run: dict, now: float, hold_until: dict | None = 
 
 
 def step_key(step: dict) -> str:
-    """Stable identity for a step (command + its args) so last-run tracking survives
-    reordering in the UI."""
+    """Stable identity for a step (command + its args + its model) so last-run
+    tracking survives reordering in the UI."""
     args = step.get("args") or {}
-    return step["command"] + "(" + ",".join(f"{k}={args[k]}" for k in sorted(args)) + ")"
+    key = step["command"] + "(" + ",".join(f"{k}={args[k]}" for k in sorted(args)) + ")"
+    if step.get("model"):
+        key += f"@{step['model']}"
+    return key
 
 
 class Autopilot:
@@ -226,6 +232,24 @@ class Autopilot:
         key = step_key(step)
         self._state["running_step"] = label
         log.info("autopilot: running %s (%s)", step["command"], label)
+        want = str(step.get("model") or "").strip()
+        if want:
+            # Phase batching on an exclusive GPU: make the step's model resident
+            # first (a no-op when it already is).  Blocking is fine — this thread
+            # runs one step at a time by design, and consecutive steps sharing a
+            # model swap once, not per run.
+            from . import serving as _sv
+            try:
+                self._state["last_reason"] = f"{label}: ensuring model '{want}'"
+                _sv.ensure_active(want, timeout_s=float(
+                    self.cfg["serving"].get("swap_timeout_s", 900)))
+            except (RuntimeError, TimeoutError, OSError) as e:
+                now = time.time()
+                self._last_run[key] = now
+                self._hold_until[key] = now + float(plan.get("idle_interval_s", 60) or 60)
+                self._state["last_reason"] = f"{label}: model swap to {want} failed — {e}"
+                log.warning("autopilot: %s", self._state["last_reason"])
+                return
         try:
             res = self.ops.start(step["command"], step.get("args") or {})
         except ValueError as e:              # bad args (hand-edited plan) — treat as a

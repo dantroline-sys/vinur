@@ -46,9 +46,15 @@ DEFAULTS = {
     #             model = a HF id (downloads into var/cache/huggingface) or path
     #   "llama" — llama-server on $PATH (or $LLAMA_SERVER); model = a GGUF path
     # Each llms entry: {name, engine, model, port, args=[...], host="127.0.0.1"}.
+    # Models too big to co-reside in VRAM: mark them `exclusive = true` — they
+    # form ONE GPU group of which exactly one runs (`default = true` picks the
+    # boot model) and `./vinur.sh swap <name>` / POST /serving/swap / an
+    # autopilot step's "model" key loads another in its place.  Batched phases
+    # (distill under one model, verify under the other) ride on that.
     # With everything off (the default) ./vinur.sh just supervises the kb.
     "serving": {
         "llms": [],
+        "swap_timeout_s": 900,   # weights-load budget before a swap reports error
         # nomic embeds via llama-server --embedding (the GGUF auto-downloads
         # into models/ on first start) — pair with embed_url above.
         "embed": {"enabled": False, "port": 11437, "args": []},

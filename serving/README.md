@@ -38,6 +38,65 @@ enabled = true                           # bge GGUF auto-downloads (~600 MB)
 The two `gpu-memory-utilization` fractions must leave headroom (≤ ~0.9
 total) — the embed server and CUDA fragmentation live in the remainder.
 
+## When two models don't fit: exclusive swap mode
+
+Newer large models can make co-residency impossible — e.g. a ~70 GB 4-bit
+Qwen3.5-122B-A10B, a ~60 GB Mistral Small 4, or a ~45 GB Qwen3-Coder-Next:
+any two of those overflow 96 GB. Mark such entries `exclusive = true` and
+they form one **GPU group of which exactly one runs**; the others sit
+standby and get swapped in on request (stop the resident one, spawn the
+other, wait for `/health` — minutes for big weights, budget in
+`serving.swap_timeout_s`, default 900):
+
+```toml
+[[serving.llms]]
+name      = "primary"                 # boots (default = true)
+engine    = "vllm"
+model     = "Qwen/Qwen3.5-122B-A10B-AWQ"      # ~70 GB — general/research distill
+port      = 11438
+exclusive = true
+default   = true
+args      = ["--max-model-len", "16384", "--gpu-memory-utilization", "0.90"]
+
+[[serving.llms]]
+name      = "secondary"               # standby until swapped in
+engine    = "vllm"
+model     = "mistralai/Mistral-Small-4..."    # ~60 GB — verify / second opinion
+port      = 11435
+exclusive = true
+args      = ["--max-model-len", "16384", "--gpu-memory-utilization", "0.90"]
+```
+
+Three ways to trigger a swap:
+
+```bash
+./vinur.sh swap secondary             # CLI (waits until ready)
+```
+
+```
+POST /serving/swap {"name": "secondary"}    # authed; returns immediately —
+GET  /serving/swap                          # poll until status=ready
+```
+
+and — the one that makes **batched distillation** work unattended — the
+autopilot: each Prioritizer step takes an optional `"model"` key, and the
+step's verb only launches once that model is resident. Order the plan so
+whole phases share a model and each cycle swaps twice, not per document:
+
+```json
+{ "steps": [
+  {"command": "distill", "model": "primary",   "label": "distill backlog"},
+  {"command": "verify",  "model": "secondary", "label": "verify under 2nd model"}
+]}
+```
+
+A swap costs minutes, so never interleave models per item — batch each
+phase over the whole backlog. Also note the alternative: pick one model
+small enough to co-reside with the big one (e.g. a ~45 GB coder primary
+plus a ~24 GB FP8 secondary fits in 96 GB) and skip swapping entirely —
+resident pairs are strictly simpler when the quality trade-off is
+acceptable.
+
 ## engine = "vllm" — what kind of files
 
 vLLM loads **HF-format safetensors repos** (a directory of `*.safetensors` +

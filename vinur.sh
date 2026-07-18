@@ -7,6 +7,8 @@
 #   ./vinur.sh stop             # stop them
 #   ./vinur.sh restart [svc]    # restart everything, or one service
 #   ./vinur.sh status           # what's up (dead services show their log reason)
+#   ./vinur.sh swap <llm>       # exclusive models: load this one in place of the
+#                               #   resident one (waits for /health; minutes for big weights)
 #   ./vinur.sh logs [svc]       # follow logs (Ctrl-C detaches)
 #
 # With no [serving] entries this is simply a supervised ./run.sh.  To serve

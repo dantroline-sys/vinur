@@ -259,6 +259,11 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/tools":
             return self._send_json(self.server.tools.catalogue())
         # ── control panel (auth-gated when a token is set) ──
+        if path == "/serving/swap":                # exclusive-model swap state (poll target)
+            if not self._authed():
+                return self._send_json({"ok": False, "error": "unauthorized"}, 401)
+            from . import serving as sv
+            return self._send_json({"ok": True, **sv.swap_state()})
         if path == "/bundles":                     # modular §16: groups + scenarios + active
             if not self._authed():
                 return self._send_json({"ok": False, "error": "unauthorized"}, 401)
@@ -334,7 +339,7 @@ class Handler(BaseHTTPRequestHandler):
         path = urlparse(self.path).path
         if path not in ("/call", "/ops/run", "/ops/stop", "/ops/reload", "/config",
                         "/ops/autopilot", "/library/config", "/source", "/scenario",
-                        "/brain", "/drop"):
+                        "/brain", "/drop", "/serving/swap"):
             return self._send_json({"ok": False, "error": "not found"}, 404)
         if not self._authed():
             return self._send_json({"ok": False, "error": "unauthorized"}, 401)
@@ -346,6 +351,24 @@ class Handler(BaseHTTPRequestHandler):
             if not name:
                 return self._send_json({"ok": False, "error": "missing tool name"}, 400)
             return self._send_json(self.server.tools.call(name, req.get("arguments", {})))
+        if path == "/serving/swap":                    # request an exclusive-model swap
+            # Async by design: weights take minutes to load, so this returns at
+            # once and the caller polls GET /serving/swap (e.g. oleum's phased
+            # DST runs between its primary and secondary passes).
+            from . import serving as sv
+            name = str(req.get("name") or "")
+            names = [str(e.get("name")) for e in self.cfg["serving"]["llms"]
+                     if e.get("exclusive")]
+            if name not in names:
+                return self._send_json(
+                    {"ok": False, "error": f"'{name}' is not an exclusive serving.llms "
+                     f"entry (have: {', '.join(names) or 'none'})"}, 400)
+            if not sv.swap_state():
+                return self._send_json(
+                    {"ok": False, "error": "no swap state — supervisor not running"}, 409)
+            sv.request_swap(name)
+            return self._send_json({"ok": True, "requested": name,
+                                    "note": "poll GET /serving/swap until status=ready"})
         if path == "/drop":                            # research hand-off over HTTP
             # A remote Vinkona's exporter posts solved/*.md here instead of
             # writing a shared folder; ingest mines research_solved_dir either way.

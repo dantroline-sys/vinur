@@ -4,13 +4,19 @@ One resident process owns every service this machine serves — the declared
 LMs (knowledgehost.serving), the embed endpoint, the CPU reranker, and the
 kb server itself — as direct children in their own process groups:
 
-    python -m knowledgehost.supervisor start|stop|restart [svc]|status|logs [svc]
+    python -m knowledgehost.supervisor start|stop|restart [svc]|status|swap <llm>|logs [svc]
 
 Children log to var/log/<name>.log (truncated on start).  The watchdog
 revives a dead service with backoff and gives up after MAX_RESTARTS in
 WINDOW_S, leaving the reason visible in `status`.  State (exact pids) lives
 in var/run/supervisor.json so a stale run is recovered precisely — no
 pattern-matched pkill.
+
+Exclusive GPU group: llms entries marked `exclusive = true` cannot co-reside
+in VRAM; exactly one runs (the `default = true` one at start) and `swap`
+loads another in its place — stop, spawn, then wait for /health before
+reporting ready (see serving.py's swap protocol; the autopilot's per-step
+"model" key drives it for batched distill-vs-verify phases).
 
 Runs on the .venv interpreter (vinur.sh picks it): config parsing needs
 tomllib, so the floor is the package's own (>= 3.11).  Stdlib only.
@@ -40,29 +46,44 @@ WINDOW_S = 600.0
 
 def load_cfg() -> dict:
     from .config import load_config
+    if os.environ.get("KNOWLEDGEHOST_CONFIG"):
+        return load_config(None)                 # env override (tests, alt deployments)
     p = ROOT / "config.toml"
     return load_config(str(p) if p.exists() else None)
 
 
 def services_for(cfg: dict) -> list[dict]:
-    """Each entry: name, cmd (argv), env (extra), hint (port for status)."""
+    """Each entry: name, cmd (argv), env (extra), hint (port for status).
+
+    llms entries marked `exclusive = true` form ONE GPU group (models that
+    cannot co-reside): only the group's default member autostarts; the rest
+    are standby, brought up by the swap protocol (serving.ensure_active)."""
     py = sys.executable
     svcs: list[dict] = []
+    exclusives = [e for e in cfg["serving"]["llms"] if e.get("exclusive")]
+    default = next((e for e in exclusives if e.get("default")),
+                   exclusives[0] if exclusives else None)
     for e in cfg["serving"]["llms"]:
         name = str(e.get("name") or "")
         if not name:
             raise ValueError("every serving.llms entry needs a name")
         svcs.append({"name": f"llm-{name}", "cmd": [py, "-m", "knowledgehost.serving", name],
-                     "env": {}, "hint": f":{e.get('port', '?')}"})
+                     "env": {}, "hint": f":{e.get('port', '?')}", "entry": name,
+                     "exclusive": bool(e.get("exclusive")),
+                     "autostart": (not e.get("exclusive")) or e is default,
+                     "probe": (str(e.get("host") or "127.0.0.1"), int(e.get("port") or 0))})
     if cfg["serving"]["embed"].get("enabled"):
         svcs.append({"name": "embed", "cmd": [py, "-m", "knowledgehost.serving", "embed"],
-                     "env": {}, "hint": f":{cfg['serving']['embed'].get('port', 11437)}"})
+                     "env": {}, "hint": f":{cfg['serving']['embed'].get('port', 11437)}",
+                     "entry": "", "exclusive": False, "autostart": True})
     if cfg["serving"]["reranker"].get("enabled"):
         rr = urlparse(cfg.get("rerank_url") or "http://127.0.0.1:11439")
         svcs.append({"name": "reranker", "cmd": ["./run-reranker.sh"],
                      "env": {"HOST": rr.hostname or "127.0.0.1", "PORT": str(rr.port or 11439)},
-                     "hint": f":{rr.port or 11439}"})
-    svcs.append({"name": "kb", "cmd": ["./run.sh"], "env": {}, "hint": f":{cfg['port']}"})
+                     "hint": f":{rr.port or 11439}",
+                     "entry": "", "exclusive": False, "autostart": True})
+    svcs.append({"name": "kb", "cmd": ["./run.sh"], "env": {}, "hint": f":{cfg['port']}",
+                 "entry": "", "exclusive": False, "autostart": True})
     return svcs
 
 
@@ -121,6 +142,7 @@ def _killpg(pid: int, sig: int) -> None:
 
 
 def _shutdown(procs: dict) -> None:
+    from . import serving as sv
     for p in procs.values():
         _killpg(p.pid, signal.SIGTERM)
     deadline = time.time() + GRACE_S
@@ -129,14 +151,31 @@ def _shutdown(procs: dict) -> None:
             p.wait(max(0.1, deadline - time.time()))
         except subprocess.TimeoutExpired:
             _killpg(p.pid, signal.SIGKILL)
+    for f in (STATE, sv.SWAP_STATE, sv.SWAP_REQ):
+        try:
+            f.unlink()
+        except OSError:
+            pass
+
+
+def _stop_one(procs: dict, name: str) -> None:
+    p = procs.pop(name, None)
+    if p is None:
+        return
+    _killpg(p.pid, signal.SIGTERM)
     try:
-        STATE.unlink()
-    except OSError:
-        pass
+        p.wait(GRACE_S)
+    except subprocess.TimeoutExpired:
+        _killpg(p.pid, signal.SIGKILL)
+        try:
+            p.wait(5)
+        except subprocess.TimeoutExpired:
+            pass
 
 
-def _run(svcs: list[dict]) -> None:
+def _run(svcs: list[dict], cfg: dict) -> None:
     """The resident loop — runs detached, children in their own groups."""
+    from . import serving as sv
     stop_requested = []
     signal.signal(signal.SIGTERM, lambda *_: stop_requested.append(1))
     signal.signal(signal.SIGINT, lambda *_: stop_requested.append(1))
@@ -144,22 +183,102 @@ def _run(svcs: list[dict]) -> None:
     procs: dict[str, subprocess.Popen] = {}
     restarts: dict[str, list[float]] = {n["name"]: [] for n in svcs}
     failed: dict[str, str] = {}
+    excl = {s["entry"]: s for s in svcs if s.get("exclusive")}
+    active_excl = next((s["entry"] for s in svcs
+                        if s.get("exclusive") and s.get("autostart")), None)
+    swap_timeout = float(cfg["serving"].get("swap_timeout_s", 900))
+
+    def write_swap(status: str, request: str = "", error: str = "") -> None:
+        d = {"active": active_excl, "status": status, "at": time.time()}
+        if request:
+            d["request"] = request
+        if error:
+            d["error"] = error
+        sv.SWAP_STATE.parent.mkdir(parents=True, exist_ok=True)
+        tmp = sv.SWAP_STATE.with_suffix(".tmp")
+        tmp.write_text(json.dumps(d))
+        os.replace(tmp, sv.SWAP_STATE)
 
     def sync_state() -> None:
         write_state({"supervisor": os.getpid(),
                      "services": {n: p.pid for n, p in procs.items()},
                      "hints": {s["name"]: s["hint"] for s in svcs},
+                     "standby": {e: excl[e]["name"] for e in excl if e != active_excl},
                      "failed": failed})
 
     for svc in svcs:
+        if not svc.get("autostart", True):
+            continue
         (LOGS / f"{svc['name']}.log").write_bytes(b"")     # truncate, like a fresh tee
         procs[svc["name"]] = spawn(svc)
         print(f"started {svc['name']} pid={procs[svc['name']].pid}", flush=True)
     sync_state()
+    try:
+        sv.SWAP_REQ.unlink()                               # a stale request must not fire
+    except OSError:
+        pass
+    if excl:
+        write_swap("ready")
+
+    def check_swap() -> None:
+        nonlocal active_excl
+        if not excl or not sv.SWAP_REQ.exists():
+            return
+        try:
+            want = str(json.loads(sv.SWAP_REQ.read_text()).get("name") or "")
+        except (OSError, ValueError):
+            want = ""
+        try:
+            sv.SWAP_REQ.unlink()
+        except OSError:
+            pass
+        if want not in excl:
+            write_swap("error", request=want,
+                       error=f"'{want}' is not an exclusive serving.llms entry")
+            return
+        if want == active_excl and excl[want]["name"] in procs:
+            write_swap("ready")
+            return
+        svc = excl[want]
+        write_swap("swapping", request=want)
+        print(f"swap: {active_excl} -> {want}", flush=True)
+        cur = excl.get(active_excl or "")
+        if cur and cur["name"] != svc["name"]:
+            _stop_one(procs, cur["name"])
+        if svc["name"] not in procs or procs[svc["name"]].poll() is not None:
+            procs.pop(svc["name"], None)                   # a re-request after a timeout
+            (LOGS / f"{svc['name']}.log").write_bytes(b"")  # keeps a live loader running
+            procs[svc["name"]] = spawn(svc)
+        sync_state()
+        host, port = svc["probe"]
+        deadline = time.time() + swap_timeout
+        while time.time() < deadline and not stop_requested:
+            p = procs.get(svc["name"])
+            if p is not None and p.poll() is not None:
+                procs.pop(svc["name"], None)
+                write_swap("error", request=want,
+                           error=f"{svc['name']} exited rc={p.returncode} — "
+                                 f"{last_log_line(svc['name'])}")
+                sync_state()
+                return
+            if sv.probe_ready(host, port):
+                active_excl = want
+                restarts[svc["name"]] = []                 # a fresh model, fresh budget
+                write_swap("ready")
+                sync_state()
+                print(f"swap: {want} ready on :{port}", flush=True)
+                return
+            time.sleep(1.0)
+        if not stop_requested:
+            # Left running (it may still be loading) — a re-request resumes the wait.
+            write_swap("error", request=want,
+                       error=f"not answering /health after {int(swap_timeout)}s "
+                             f"(still loading? re-run the swap to keep waiting)")
 
     by_name = {s["name"]: s for s in svcs}
     while not stop_requested:
         time.sleep(TICK_S)
+        check_swap()
         for name, p in list(procs.items()):
             if p.poll() is None or name in failed:
                 continue
@@ -206,12 +325,14 @@ def cmd_start() -> int:
         st = read_state()
         for name, pid in (st.get("services") or {}).items():
             print(f"  {name:<12} pid={pid}  {st.get('hints', {}).get(name, '')}")
+        for entry, name in (st.get("standby") or {}).items():
+            print(f"  {name:<12} standby — './vinur.sh swap {entry}' loads it")
         return 0
     os.setsid()                                        # child: become the supervisor
     logf = open(LOGS / "supervisor.log", "ab", buffering=0)
     os.dup2(logf.fileno(), 1)
     os.dup2(logf.fileno(), 2)
-    _run(svcs)
+    _run(svcs, cfg)
     os._exit(0)
 
 
@@ -256,6 +377,14 @@ def cmd_status() -> int:
         else:
             line = last_log_line(name)
             print(f"  {name:<12} dead    {('— ' + line) if line else ''}")
+    for entry, name in (st.get("standby") or {}).items():
+        print(f"  {name:<12} standby — './vinur.sh swap {entry}' loads it")
+    from . import serving as sv
+    sw = sv.swap_state()
+    if sw.get("status") == "swapping":
+        print(f"  (swap in progress: -> {sw.get('request')})")
+    elif sw.get("status") == "error":
+        print(f"  (last swap failed: {sw.get('error')})")
     return 0
 
 
@@ -273,6 +402,35 @@ def cmd_restart(target: str | None) -> int:
         return 1
     _killpg(pid, signal.SIGTERM)                       # the watchdog revives it
     print(f"sent TERM to {target} — the supervisor restarts it within ~{int(TICK_S)}s")
+    return 0
+
+
+def cmd_swap(target: str | None) -> int:
+    if not target:
+        print("usage: ./vinur.sh swap <serving.llms name>")
+        return 2
+    if not alive(read_state().get("supervisor", 0)):
+        print("not running — './vinur.sh start'")
+        return 1
+    from . import serving as sv
+    cfg = load_cfg()
+    names = [str(e.get("name")) for e in cfg["serving"]["llms"] if e.get("exclusive")]
+    if target not in names:
+        print(f"'{target}' is not an exclusive serving.llms entry "
+              f"(exclusive entries: {', '.join(names) or 'none'})")
+        return 1
+
+    def progress(st):
+        if st.get("status") == "swapping":
+            print(f"  swapping -> {st.get('request')} (weights loading; this can take minutes)")
+
+    try:
+        sv.ensure_active(target, timeout_s=float(cfg["serving"].get("swap_timeout_s", 900)),
+                         progress=progress)
+    except (RuntimeError, TimeoutError) as e:
+        print(f"swap failed: {e}")
+        return 1
+    print(f"{target} ready")
     return 0
 
 
@@ -320,6 +478,8 @@ def main(argv: list[str] | None = None) -> int:
         return cmd_status()
     if cmd == "restart":
         return cmd_restart(args[1] if len(args) > 1 else None)
+    if cmd == "swap":
+        return cmd_swap(args[1] if len(args) > 1 else None)
     if cmd == "logs":
         return cmd_logs(args[1] if len(args) > 1 else None)
     print(__doc__.split("\n\n")[1])

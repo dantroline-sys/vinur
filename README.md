@@ -143,7 +143,11 @@ $EDITOR config.toml           # [[serving.llms]] entries + embed/reranker — se
 
 Which weights to get (file formats per engine, download commands, where they
 land, a recommended 96 GB pairing) is covered in
-[`serving/README.md`](serving/README.md).
+[`serving/README.md`](serving/README.md) — including **exclusive swap mode**
+for models too big to co-reside: mark entries `exclusive = true` and one runs
+at a time, swapped via `./vinur.sh swap <name>`, `POST /serving/swap`, or a
+Prioritizer step's `"model"` key (so distill batches under one model, then
+verify batches under the other).
 
 With `[serving]` empty (the default), `./vinur.sh` simply supervises the kb —
 a one-machine Vinkona setup keeps using Vinkona's own tiers as before.

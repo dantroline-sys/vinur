@@ -44,6 +44,13 @@ auth_token = ""         # if set, /call requires Authorization: Bearer <token>
 #                                         # serves embed_url's port (11437)
 # [serving.reranker]
 # enabled = true                          # run-reranker.sh on rerank_url's port (cpu)
+#
+# Models too big to co-reside in VRAM: add `exclusive = true` to those llms
+# entries (+ `default = true` on the one that boots).  Exactly one runs at a
+# time; swap with `./vinur.sh swap <name>`, POST /serving/swap, or a
+# Prioritizer step's "model" key (phase-batched distill vs verify).  The
+# weights-load budget is serving.swap_timeout_s (default 900s).
+# See serving/README.md for a worked 96 GB example.
 
 # ── embeddings (the nomic endpoint, shared with Vinkona's memory store) ─────────
 embed_url   = "http://127.0.0.1:11437"
