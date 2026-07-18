@@ -204,6 +204,79 @@ def main():
             assert "swap to secondary failed" in pilot._state["last_reason"]
             assert pilot._hold_until, "failed swap must back the step off"
             ok("autopilot holds the step when the swap fails (verb never launched)")
+            # ── serving_status: weights on disk + service states ────────
+            from knowledgehost import supervisor as sup
+            state0, sup_state0 = os.environ.get("HF_HOME"), sup.STATE
+            os.environ["HF_HOME"] = str(Path(td) / "hf")
+            sup.STATE = Path(td) / "sup.json"          # no supervisor state file
+            try:
+                hub = Path(td) / "hf" / "hub"
+                ok_repo = hub / "models--org--good" / "snapshots" / "s1"
+                ok_repo.mkdir(parents=True)
+                (ok_repo / "config.json").write_text("{}")
+                (ok_repo / "model.safetensors").write_bytes(b"x" * 1024)
+                bad_repo = hub / "models--org--stuck" / "blobs"
+                bad_repo.mkdir(parents=True)
+                (bad_repo / "abc.incomplete").write_bytes(b"x")
+
+                gguf2 = Path(td) / "w.gguf"
+                gguf2.write_bytes(b"GGUF")
+                wtoml = Path(td) / "w.toml"
+                wtoml.write_text(
+                    '[[serving.llms]]\nname = "good"\nengine = "vllm"\n'
+                    'model = "org/good"\nport = 1\nexclusive = true\ndefault = true\n'
+                    '[[serving.llms]]\nname = "stuck"\nengine = "vllm"\n'
+                    'model = "org/stuck"\nport = 2\nexclusive = true\n'
+                    '[[serving.llms]]\nname = "nowhere"\nengine = "vllm"\n'
+                    'model = "org/absent"\nport = 3\n'
+                    f'[[serving.llms]]\nname = "gg"\nengine = "llama"\n'
+                    f'model = "{gguf2}"\nport = 4\n')
+                wcfg = load_config(str(wtoml))
+                res = sv.serving_status(wcfg)
+                by = {m["name"]: m for m in res["llms"]}
+                assert res["hosting"] is True and res["supervisor"]["running"] is False
+                assert by["good"]["weights"]["status"] == "ready"
+                assert by["stuck"]["weights"]["status"] == "incomplete"
+                assert "mid-download" in by["stuck"]["weights"]["detail"]
+                assert by["nowhere"]["weights"]["status"] == "missing"
+                assert "hf download org/absent" in by["nowhere"]["weights"]["detail"]
+                assert by["gg"]["weights"]["status"] == "ready"
+                assert all(m["service"] == "supervisor-down" for m in res["llms"])
+                ok("serving_status: ready / mid-download / missing weights + supervisor-down")
+
+                sup.STATE.write_text(json.dumps({
+                    "supervisor": os.getpid(),           # a live pid
+                    "services": {"llm-good": os.getpid(), "llm-gg": 999999},
+                    "standby": {"stuck": "llm-stuck"},
+                    "failed": {"llm-nowhere": "gave up after 5 restarts"}}))
+                res = sv.serving_status(wcfg)
+                by = {m["name"]: m for m in res["llms"]}
+                assert by["good"]["service"] == "up"
+                assert by["stuck"]["service"] == "standby"
+                assert by["nowhere"]["service"] == "failed" and "gave up" in by["nowhere"]["reason"]
+                assert by["gg"]["service"] == "dead"
+                ok("serving_status: up / standby / failed(reason) / dead from supervisor state")
+
+                # the route the panel polls
+                scfg2 = dict(wcfg)
+                scfg2.update({"host": "127.0.0.1", "port": 0, "auth_token": "tk",
+                              "control_dir": str(Path(td) / "ctrl2")})
+                khs2 = KnowledgeHostServer(scfg2, SimpleNamespace(), SimpleNamespace(), kb=None)
+                threading.Thread(target=khs2.serve_forever, daemon=True).start()
+                req = urllib.request.Request(
+                    f"http://127.0.0.1:{khs2.server_address[1]}/serving/status",
+                    headers={"Authorization": "Bearer tk"})
+                with urllib.request.urlopen(req, timeout=5) as r:
+                    body = json.loads(r.read())
+                assert body["ok"] and body["hosting"] and len(body["llms"]) == 4
+                khs2.shutdown()
+                ok("GET /serving/status serves the panel payload (authed)")
+            finally:
+                sup.STATE = sup_state0
+                if state0 is None:
+                    os.environ.pop("HF_HOME", None)
+                else:
+                    os.environ["HF_HOME"] = state0
         finally:
             sv.SWAP_REQ, sv.SWAP_STATE = req0, st0
 

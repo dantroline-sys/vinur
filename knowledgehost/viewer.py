@@ -114,8 +114,8 @@ const badge = t => `<span class="badge">${esc(t)}</span>`;
 const TABS = [
   ['ask', 'Ask'], ['search', 'Search'], ['raw', 'Raw'], ['nodes', 'Concepts'], ['edges', 'Relations'],
   ['cards', 'Cards'], ['sources', 'Sources'], ['adjudication', 'Adjudication'], ['gaps', 'Gaps'],
-  ['bundles', 'Bundles'], ['library', 'Library'], ['ops', 'Operations'],
-  ['autopilot', 'Prioritizer'], ['settings', 'Settings'],
+  ['bundles', 'Bundles'], ['library', 'Library'], ['serving', 'Serving'],
+  ['ops', 'Operations'], ['autopilot', 'Prioritizer'], ['settings', 'Settings'],
 ];
 let active = 'ask';
 
@@ -176,6 +176,7 @@ function go(k) {
   if (k === 'ask') { $('#results').className = 'empty'; $('#results').textContent = 'Ask the structured KB a what / how / why question.'; $('#aq') && $('#aq').focus(); }
   else if (k === 'search') { $('#results').className = 'empty'; $('#results').textContent = 'Type a query above.'; $('#q') && $('#q').focus(); }
   else if (k === 'ops') { loadOps(); opsTimer = setInterval(() => { if (active === 'ops') pollOps(); }, 2500); }
+  else if (k === 'serving') { loadServing(); opsTimer = setInterval(() => { if (active === 'serving') pollServing(); }, 2500); }
   else if (k === 'settings') { loadSettings(); }
   else if (k === 'autopilot') { loadAutopilot(); }
   else if (k === 'bundles') { loadBundles(); }
@@ -203,6 +204,9 @@ function renderBar(k) {
       `<select id="srcfilter" title="source"></select>
        <button class="toolbtn" onclick="load('raw')">Reload sample</button>`;
     fillSources();
+  } else if (k === 'serving') {
+    $('#bar').innerHTML = tokInput()
+      + ` <button class="toolbtn" onclick="pollServing()">Refresh</button>`;
   } else if (k === 'ops') {
     $('#bar').innerHTML = tokInput()
       + ` <select id="opcmd" onchange="onCmdChange()" title="maintenance command"></select>`
@@ -586,6 +590,83 @@ async function reloadKB() {
   $('#opstatus').textContent = 'reloading KB caches…';
   const r = await postJSON('/ops/reload').catch(e => ({ ok: false, error: '' + e }));
   $('#opstatus').textContent = r.ok ? '✓ KB reloaded' : ('✗ ' + (r.error || 'failed'));
+}
+
+// ── Serving: which models THIS box hosts, weights-on-disk, swap control ─────
+function svChip(txt, c) {
+  return `<span class="badge" style="background:${c}33;border-color:${c}66">${esc(txt)}</span>`;
+}
+function svState(s) {
+  if (s === 'up') return svChip('up', '#22aa66');
+  if (s === 'standby') return svChip('standby', '#888888');
+  if (s === 'failed') return svChip('FAILED', '#cc4444');
+  if (s === 'dead') return svChip('dead', '#cc4444');
+  if (s === 'supervisor-down') return svChip('supervisor down', '#e0a800');
+  return svChip(s || '?', '#888888');
+}
+function svWeights(w) {
+  if (!w) return '';
+  const c = w.status === 'ready' ? '#22aa66' : w.status === 'incomplete' ? '#e0a800' : '#cc4444';
+  const t = 'weights: ' + w.status + (w.size_gb ? ` · ${w.size_gb} GB` : '');
+  const tip = (w.path || '') + (w.detail ? ' — ' + w.detail : '');
+  return `<span class="badge" title="${esc(tip)}" style="background:${c}33;border-color:${c}66">${esc(t)}</span>`;
+}
+async function doSwap(name) {
+  $('#banner').innerHTML = `swapping to <b>${esc(name)}</b> — weights load; this can take minutes…`;
+  const r = await postJSON('/serving/swap', { name }).catch(e => ({ ok: false, error: '' + e }));
+  if (!r.ok) $('#banner').innerHTML = '✗ ' + esc(r.error || 'swap request failed');
+  pollServing();
+}
+async function pollServing() {
+  let r; try { r = await (await authFetch('/serving/status')).json(); } catch (e) { return; }
+  if (!r.ok) { $('#results').className = 'empty';
+    $('#results').textContent = (r.error === 'unauthorized')
+      ? 'enter the auth token above to view Serving' : ('error: ' + r.error); return; }
+  $('#results').className = '';
+  if (!r.hosting) {
+    $('#results').innerHTML = `<p style="opacity:.7">This box hosts <b>no models</b> — the
+      <code>[serving]</code> table in config.toml is empty, so the knowledge host only answers
+      queries and borrows LMs from the endpoints in Settings (distill/extract/verify URLs).
+      To serve models here, declare them in <code>[serving]</code> and start with
+      <code>./vinur.sh</code> — see <code>serving/README.md</code>.</p>`;
+    return;
+  }
+  const sup = r.supervisor || {};
+  const sw = r.swap || {};
+  let banner = sup.running ? '' :
+    `⚠ the process supervisor is not running — states below are from disk only. Start with <code>./vinur.sh start</code>.`;
+  if (sw.status === 'swapping') banner = `⏳ swap in progress → <b>${esc(sw.request || '')}</b> (weights loading)`;
+  else if (sw.status === 'error') banner = `✗ last swap failed: ${esc(sw.error || '')}`;
+  $('#banner').innerHTML = banner;
+  const rows = (r.llms || []).map(m => {
+    const role = m.exclusive ? (m.default ? 'exclusive · boots' : 'exclusive') : 'resident';
+    const canSwap = sup.running && m.exclusive && m.service === 'standby' && sw.status !== 'swapping';
+    const act = canSwap ? `<button class="toolbtn" onclick="doSwap('${esc(m.name)}')">Swap in</button>` : '';
+    const note = m.reason || m.last_log || (m.weights && m.weights.detail) || '';
+    return `<tr><td><b>${esc(m.name)}</b></td>
+      <td>${esc(m.model)}<br><span style="opacity:.6">${esc(m.engine)} · :${m.port} · ${role}</span></td>
+      <td>${svState(m.service)}</td><td>${svWeights(m.weights)}</td>
+      <td style="max-width:340px;font-size:12px;opacity:.8">${esc(note)}</td><td>${act}</td></tr>`;
+  }).join('');
+  const aux = [];
+  if (r.embed && r.embed.enabled) aux.push({ name: 'embed', port: r.embed.port, s: r.embed });
+  if (r.reranker && r.reranker.enabled) aux.push({ name: 'reranker', port: '', s: r.reranker });
+  const auxRows = aux.map(a => `<tr><td>${esc(a.name)}</td>
+      <td><span style="opacity:.6">${a.port ? ':' + a.port : ''}</span></td>
+      <td>${svState(a.s.service)}</td><td>${svWeights(a.s.weights)}</td>
+      <td style="font-size:12px;opacity:.8">${esc(a.s.last_log || (a.s.weights && a.s.weights.detail) || '')}</td><td></td></tr>`).join('');
+  $('#results').innerHTML =
+    `<p style="margin:4px 0 10px">This box <b>hosts models</b> for the knowledge host`
+    + (sup.running ? ` — supervisor pid ${sup.pid}.` : '.')
+    + ` Weight chips show the on-disk state: <i>incomplete</i> during a download <b>and</b> after a
+       failed one (the note column carries the service's last log line — a crash there plus
+       incomplete weights usually means the fetch died: gated repo token, disk, network).</p>
+     <table><tr><th>model</th><th>what</th><th>service</th><th>weights</th><th>note</th><th></th></tr>
+     ${rows}${auxRows}</table>`;
+}
+async function loadServing() {
+  $('#banner').innerHTML = ''; $('#results').className = ''; $('#results').textContent = 'loading serving state…';
+  pollServing();
 }
 
 // ── document library: toggle which subfolders of the trusted root get indexed ──

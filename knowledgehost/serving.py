@@ -189,6 +189,142 @@ def probe_ready(host: str, port: int, timeout_s: float = 1.5) -> bool:
         return False                             # not listening yet
 
 
+# ── panel status: is this box hosting models, and are the weights here? ─────
+
+def _tree_size(p: Path) -> int:
+    total = 0
+    try:
+        for f in p.rglob("*"):
+            try:
+                if f.is_file() and not f.is_symlink():
+                    total += f.stat().st_size
+            except OSError:
+                pass
+    except OSError:
+        pass
+    return total
+
+
+def weights_status(engine: str, model: str) -> dict:
+    """Where the weights for one declared model stand ON DISK:
+    ready | incomplete (mid-download or an interrupted/failed fetch) | missing.
+    The service can be 'up' while vLLM is still downloading — this is the
+    signal that distinguishes 'loading' from 'the fetch died'."""
+    if engine == "llama":
+        p = Path(_anchored(model))
+        if p.is_file():
+            return {"status": "ready", "path": str(p),
+                    "size_gb": round(p.stat().st_size / 2**30, 2)}
+        return {"status": "missing", "path": str(p),
+                "detail": "GGUF not found — see serving/README.md"}
+    if engine == "vllm":
+        mp = Path(model).expanduser()
+        if mp.is_dir():                                # local snapshot directory
+            if any(mp.glob("*.safetensors")):
+                return {"status": "ready", "path": str(mp),
+                        "size_gb": round(_tree_size(mp) / 2**30, 1)}
+            return {"status": "incomplete", "path": str(mp),
+                    "detail": "local dir has no *.safetensors"}
+        hub = Path(os.environ.get("HF_HOME")
+                   or (ROOT / "var" / "cache" / "huggingface")) / "hub"
+        d = hub / ("models--" + model.replace("/", "--"))
+        if not d.is_dir():
+            return {"status": "missing", "path": str(d),
+                    "detail": ("downloads on first start — or pre-fetch with "
+                               f"serving/.venv/bin/hf download {model}")}
+        blobs = d / "blobs"
+        partial = len(list(blobs.glob("*.incomplete"))) if blobs.is_dir() else 0
+        snap_ok = False
+        snaps = d / "snapshots"
+        if snaps.is_dir():
+            for s in snaps.iterdir():
+                if (s / "config.json").exists() and any(s.glob("*.safetensors")):
+                    snap_ok = True
+                    break
+        out = {"path": str(d), "size_gb": round(_tree_size(d) / 2**30, 1)}
+        if partial:
+            out.update(status="incomplete",
+                       detail=f"{partial} file(s) mid-download — in progress, or an "
+                              "interrupted fetch (restarting the service resumes it)")
+        elif snap_ok:
+            out.update(status="ready")
+        else:
+            out.update(status="incomplete",
+                       detail="cache present but no complete snapshot — fetch "
+                              "interrupted? (restarting the service resumes it)")
+        return out
+    return {"status": "unknown", "detail": f"unknown engine '{engine}'"}
+
+
+def serving_status(cfg: dict) -> dict:
+    """Everything the panel's Serving tab shows: declared models, their
+    supervisor state (up/standby/dead/failed + last log line), weights-on-disk
+    status, and the live swap state."""
+    from . import supervisor as sup
+    st = sup.read_state()
+    sup_alive = sup.alive(st.get("supervisor", 0))
+    services = st.get("services") or {}
+    standby = st.get("standby") or {}
+    failed = st.get("failed") or {}
+
+    def svc_state(svc_name: str, entry: str = "") -> dict:
+        if not sup_alive:
+            return {"service": "supervisor-down"}
+        if svc_name in failed:
+            return {"service": "failed", "reason": failed[svc_name]}
+        pid = services.get(svc_name)
+        d: dict = {}
+        if pid and sup.alive(pid):
+            d = {"service": "up", "pid": pid}
+        elif entry and entry in standby:
+            d = {"service": "standby"}
+        else:
+            d = {"service": "dead" if pid else "off"}
+        if d["service"] in ("up", "dead"):
+            line = sup.last_log_line(svc_name)
+            if line:
+                d["last_log"] = line[-240:]
+        return d
+
+    llms = []
+    for e in cfg["serving"]["llms"]:
+        name = str(e.get("name") or "")
+        item = {"name": name, "engine": str(e.get("engine") or ""),
+                "model": str(e.get("model") or ""), "port": e.get("port"),
+                "exclusive": bool(e.get("exclusive")), "default": bool(e.get("default")),
+                "weights": weights_status(str(e.get("engine") or ""),
+                                          str(e.get("model") or ""))}
+        item.update(svc_state(f"llm-{name}", name))
+        llms.append(item)
+
+    emb_cfg = cfg["serving"]["embed"]
+    embed = {"enabled": bool(emb_cfg.get("enabled")), "port": emb_cfg.get("port", 11437)}
+    if embed["enabled"]:
+        p = ROOT / "models" / EMBED_MODEL_FILE
+        embed["weights"] = ({"status": "ready", "path": str(p),
+                             "size_gb": round(p.stat().st_size / 2**30, 2)}
+                            if p.is_file() else
+                            {"status": "missing", "path": str(p),
+                             "detail": "auto-downloads on first start (~260 MB)"})
+        embed.update(svc_state("embed"))
+
+    rr_cfg = cfg["serving"]["reranker"]
+    reranker = {"enabled": bool(rr_cfg.get("enabled"))}
+    if reranker["enabled"]:
+        p = ROOT / "models" / str(cfg.get("rerank_model") or "bge-reranker-v2-m3-Q8_0.gguf")
+        reranker["weights"] = ({"status": "ready", "path": str(p),
+                                "size_gb": round(p.stat().st_size / 2**30, 2)}
+                               if p.is_file() else
+                               {"status": "missing", "path": str(p),
+                                "detail": "auto-downloads on first start (~600 MB)"})
+        reranker.update(svc_state("reranker"))
+
+    return {"hosting": bool(llms or embed["enabled"] or reranker["enabled"]),
+            "supervisor": {"running": sup_alive,
+                           "pid": st.get("supervisor") if sup_alive else None},
+            "swap": swap_state(), "llms": llms, "embed": embed, "reranker": reranker}
+
+
 def main(argv: list[str] | None = None) -> None:
     import argparse
     ap = argparse.ArgumentParser(description="exec one declared serving service")
