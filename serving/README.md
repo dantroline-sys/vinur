@@ -251,31 +251,51 @@ caches are plain directories — delete `var/cache/huggingface/` or files in
 
 ### `RuntimeError: Could not find nvcc and default cuda_home='/usr/local/cuda' doesn't exist`
 
-The engine crashes at startup because it picked a **JIT-compiled attention
-path** — FlashInfer, vLLM's default backend on newer GPUs — which compiles
-kernels at runtime and therefore needs the CUDA **toolkit** (`nvcc`), not
-just the driver. Three fixes, cheapest first:
+The engine crashed inside a **JIT-compiled kernel path**: FlashInfer
+compiles some kernels at first use, which needs the CUDA **toolkit**
+(`nvcc`) — the driver alone isn't enough. Read the traceback to see *which*
+consumer wants it; the two seen in practice:
 
-1. **The toolkit is installed, just not at `/usr/local/cuda`.** The launcher
-   now probes for it (nvcc on `$PATH`, `/usr/local/cuda*`, `/opt/cuda`,
-   `/usr/lib/cuda`) and sets `CUDA_HOME` itself — restart and check the
-   service log for `CUDA_HOME not set — using the toolkit at …`. If it lives
-   somewhere odder, point at it per model:
-   ```toml
-   env = { CUDA_HOME = "/where/cuda/lives" }
+- `gen_cutlass_fused_moe_sm120_module` via
+  `quantization/modelopt.py` — the **NVFP4/FP8 fused-MoE module** on
+  consumer Blackwell (sm120). This is the path MoE models like
+  Qwen3.5-A*B take; there is **no prebuilt escape hatch in the wheel** —
+  attention-backend env vars do NOT help here.
+- an attention backend JIT — for this one alone,
+  `env = { VLLM_ATTENTION_BACKEND = "FLASH_ATTN" }` (or `TRITON_ATTN`)
+  sidesteps the JIT at some throughput cost.
+
+Fixes, in order of preference:
+
+1. **Install the CUDA toolkit — the real fix.** Blackwell (sm120) needs
+   **CUDA ≥ 12.8**. Fedora: `sudo dnf install cuda-toolkit` (NVIDIA repo);
+   Ubuntu: `sudo apt install cuda-toolkit-12-9` (NVIDIA repo).
+   `/usr/local/cuda` appears and the launcher finds it (it also probes
+   `/usr/local/cuda*`, `/opt/cuda`, `/usr/lib/cuda` and nvcc on `$PATH`,
+   and logs `CUDA_HOME not set — using the toolkit at …`; somewhere odder →
+   `env = { CUDA_HOME = "/where/cuda/lives" }`). The **first start then
+   JIT-compiles for several minutes** (one-time; cached in
+   `var/cache/flashinfer` via env.sh) — that's what
+   `serving.swap_timeout_s = 900` is sized for; raise it if a first-boot
+   swap reports a timeout while the log shows compilation running. Bonus:
+   `nvcc` upgrades `./install.sh --llama` to a CUDA build too.
+2. **No system installs:** FlashInfer publishes ahead-of-time artifacts —
+   `flashinfer-cubin`, and `flashinfer-jit-cache` built per CUDA version —
+   that remove the nvcc need. Install into the serving venv from
+   FlashInfer's own index (pick the cuXXX matching the venv's torch):
+   ```bash
+   source ./env.sh
+   vk_uv pip install --python serving/.venv/bin/python3 flashinfer-cubin
+   vk_uv pip install --python serving/.venv/bin/python3 \
+       flashinfer-jit-cache --extra-index-url https://flashinfer.ai/whl/cu129/
    ```
-2. **No toolkit, unblock now:** pin a precompiled backend so nothing JITs:
-   ```toml
-   env = { VLLM_ATTENTION_BACKEND = "FLASH_ATTN" }   # or "TRITON_ATTN" if
-   ```                                               # FA rejects your card
-   Costs some throughput versus FlashInfer on Blackwell-class GPUs, but runs
-   entirely from the wheels' prebuilt kernels.
-3. **The proper fix for a serving box: install the toolkit.** Fedora:
-   `sudo dnf install cuda-toolkit` (NVIDIA repo); Ubuntu:
-   `sudo apt install cuda-toolkit-12-x` (NVIDIA repo). `/usr/local/cuda`
-   appears, FlashInfer JIT works, and NVFP4/FP8 kernels get their
-   best-performing path. Bonus: `nvcc` also upgrades `./install.sh --llama`
-   from a CPU build to a CUDA build of llama-server.
+   (Package/index names move with FlashInfer releases — check its docs if
+   the resolve fails.)
+3. **For the MoE case, worth one free try:** `env =
+   { VLLM_USE_FLASHINFER_MOE_FP4 = "0" }` asks vLLM for its built-in
+   NVFP4-MoE path instead. Whether the wheel actually ships one for sm120
+   varies by version — if the model then fails differently or slows down,
+   revert and use fix 1 or 2.
 
 Either way the Serving panel tab shows the crash line in its note column —
 if a model's service is dead and its weights chip says ready, the reason is

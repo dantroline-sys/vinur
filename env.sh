@@ -17,6 +17,10 @@ KH_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 export XDG_CACHE_HOME="$KH_ROOT/var/cache"
 export HF_HOME="$KH_ROOT/var/cache/huggingface"
 export TMPDIR="$KH_ROOT/var/tmp"
+# vLLM's JIT layers write kernel caches of their own; neither honours
+# XDG_CACHE_HOME, so pin them in-tree too (harmless when unused).
+export FLASHINFER_WORKSPACE_BASE="$KH_ROOT/var/cache/flashinfer"
+export TRITON_CACHE_DIR="$KH_ROOT/var/cache/triton"
 # uv (the python env manager — see vk_uv below): wheel cache + any CPython
 # interpreters it downloads both stay in-tree (the second line matters — the
 # default would be ~/.local/share/uv).
