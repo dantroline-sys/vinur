@@ -268,8 +268,19 @@ consumer wants it; the two seen in practice:
 Fixes, in order of preference:
 
 1. **Install the CUDA toolkit — the real fix.** Blackwell (sm120) needs
-   **CUDA ≥ 12.8**. Fedora: `sudo dnf install cuda-toolkit` (NVIDIA repo);
-   Ubuntu: `sudo apt install cuda-toolkit-12-9` (NVIDIA repo).
+   **CUDA ≥ 12.8**, and for the NVFP4-MoE case this is the ONLY reliable
+   fix: on sm120 the FlashInfer JIT module is effectively the sole NVFP4-MoE
+   implementation, so no env flag routes around it.  Install the TOOLKIT
+   ONLY — never let an installer replace the working driver:
+   - Fedora (NVIDIA's repo lags Fedora releases; the runfile is the
+     dependable route):
+     ```bash
+     wget https://developer.download.nvidia.com/compute/cuda/13.0.0/local_installers/cuda_13.0.0_580.65.06_linux.run
+     sudo sh cuda_13.0.0_*_linux.run --toolkit --silent      # --toolkit = no driver change
+     ```
+     (any current 12.8+/13.x runfile works — check developer.nvidia.com/cuda-downloads)
+   - Ubuntu: `sudo apt install cuda-toolkit-12-9` (NVIDIA repo — the
+     `cuda-toolkit-*` packages never touch the driver; plain `cuda` does).
    `/usr/local/cuda` appears and the launcher finds it (it also probes
    `/usr/local/cuda*`, `/opt/cuda`, `/usr/lib/cuda` and nvcc on `$PATH`,
    and logs `CUDA_HOME not set — using the toolkit at …`; somewhere odder →
