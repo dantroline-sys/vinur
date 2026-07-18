@@ -300,3 +300,22 @@ Fixes, in order of preference:
 Either way the Serving panel tab shows the crash line in its note column —
 if a model's service is dead and its weights chip says ready, the reason is
 an engine error like this one, not a download.
+
+### Benign startup noise (not bugs)
+
+Seen in healthy logs — none of these stop the engine:
+
+- **`warning: '_POSIX_C_SOURCE' redefined`** walls, from
+  `__triton_launcher.c` — Triton JIT-compiling its C launcher stubs. uv's
+  standalone CPython was built against an older glibc baseline than a new
+  distro's headers; gcc warns and compiles anyway. Cosmetic.
+- **`Module vllm.third_party.deep_gemm was found but failed to import`**
+  (with the nvcc AssertionError) — deep_gemm is an *optional* fast-GEMM
+  module; vLLM probes it and falls back. Installing the CUDA toolkit makes
+  it importable (and may add some GEMM throughput); without it this is a
+  no-op warning.
+- **`Directly load ... from the cache`** lines — the torch.compile /
+  AOT caches under `var/cache/vllm` doing their job across restarts.
+
+The line that actually matters is `ERROR ... EngineCore failed to start` —
+diagnose from the traceback directly above it.
