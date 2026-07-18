@@ -141,6 +141,10 @@ $EDITOR config.toml           # [[serving.llms]] entries + embed/reranker — se
 ./vinur.sh logs [svc]         # follow;  restart [svc] / stop as expected
 ```
 
+Which weights to get (file formats per engine, download commands, where they
+land, a recommended 96 GB pairing) is covered in
+[`serving/README.md`](serving/README.md).
+
 With `[serving]` empty (the default), `./vinur.sh` simply supervises the kb —
 a one-machine Vinkona setup keeps using Vinkona's own tiers as before.
 
