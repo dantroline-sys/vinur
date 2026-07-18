@@ -246,3 +246,37 @@ curl -s localhost:8771/health         # the kb itself
 Disk cleanup: `./install.sh uninstall` removes `serving/.venv`; the weight
 caches are plain directories — delete `var/cache/huggingface/` or files in
 `models/` whenever you drop a model from the config.
+
+## Troubleshooting
+
+### `RuntimeError: Could not find nvcc and default cuda_home='/usr/local/cuda' doesn't exist`
+
+The engine crashes at startup because it picked a **JIT-compiled attention
+path** — FlashInfer, vLLM's default backend on newer GPUs — which compiles
+kernels at runtime and therefore needs the CUDA **toolkit** (`nvcc`), not
+just the driver. Three fixes, cheapest first:
+
+1. **The toolkit is installed, just not at `/usr/local/cuda`.** The launcher
+   now probes for it (nvcc on `$PATH`, `/usr/local/cuda*`, `/opt/cuda`,
+   `/usr/lib/cuda`) and sets `CUDA_HOME` itself — restart and check the
+   service log for `CUDA_HOME not set — using the toolkit at …`. If it lives
+   somewhere odder, point at it per model:
+   ```toml
+   env = { CUDA_HOME = "/where/cuda/lives" }
+   ```
+2. **No toolkit, unblock now:** pin a precompiled backend so nothing JITs:
+   ```toml
+   env = { VLLM_ATTENTION_BACKEND = "FLASH_ATTN" }   # or "TRITON_ATTN" if
+   ```                                               # FA rejects your card
+   Costs some throughput versus FlashInfer on Blackwell-class GPUs, but runs
+   entirely from the wheels' prebuilt kernels.
+3. **The proper fix for a serving box: install the toolkit.** Fedora:
+   `sudo dnf install cuda-toolkit` (NVIDIA repo); Ubuntu:
+   `sudo apt install cuda-toolkit-12-x` (NVIDIA repo). `/usr/local/cuda`
+   appears, FlashInfer JIT works, and NVFP4/FP8 kernels get their
+   best-performing path. Bonus: `nvcc` also upgrades `./install.sh --llama`
+   from a CPU build to a CUDA build of llama-server.
+
+Either way the Serving panel tab shows the crash line in its note column —
+if a model's service is dead and its weights chip says ready, the reason is
+an engine error like this one, not a download.

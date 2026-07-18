@@ -152,6 +152,24 @@ def main():
                 os.environ["LLAMA_SERVER"] = saved_ls
         ok("find_llama_server: env > in-tree bin/ > sibling vinkona; None when absent")
 
+        # CUDA_HOME probe (the vLLM 'Could not find nvcc' crash).  PATH is
+        # emptied so a real nvcc on the test box can't shadow the fixtures.
+        saved_path = os.environ.get("PATH", "")
+        os.environ["PATH"] = ""
+        try:
+            assert serving.cuda_home_probe({"CUDA_HOME": "/x"}) is None, "set env wins"
+            assert serving.cuda_home_probe({}, prefixes=(str(Path(td) / "nope"),)) is None
+            croot = Path(td) / "cudaland"
+            for name in ("cuda-12.4", "cuda-13.0"):
+                d = croot / name / "bin"
+                d.mkdir(parents=True)
+                (d / "nvcc").write_text("")
+            got = serving.cuda_home_probe({}, prefixes=(str(croot),))
+            assert got == str(croot / "cuda-13.0"), f"newest toolkit wins: {got}"
+        finally:
+            os.environ["PATH"] = saved_path
+        ok("cuda_home_probe: honours existing env, finds newest cuda-* install")
+
         ea = serving.embed_argv(c2, "/x/nomic.gguf")
         assert "--embedding" in ea and "11437" in ea and "-ub" in ea
         ok("embed argv (llama-server --embedding, batch-safe)")

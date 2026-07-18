@@ -248,6 +248,32 @@ def probe_ready(host: str, port: int, timeout_s: float = 1.5) -> bool:
         return False                             # not listening yet
 
 
+def cuda_home_probe(environ: dict = None, prefixes: tuple = ("/usr/local", "/opt", "/usr/lib")) -> str | None:
+    """vLLM's JIT paths (FlashInfer — its default attention backend on newer
+    GPUs) need the CUDA *toolkit* at runtime and die with "Could not find nvcc
+    and default cuda_home='/usr/local/cuda' doesn't exist" when $CUDA_HOME is
+    unset and that symlink is missing.  Probe the usual spots so a toolkit
+    that IS installed — just not at the default path — gets found.  Returns
+    the toolkit root to use, or None ($CUDA_HOME already set, or none found —
+    see serving/README.md Troubleshooting for the no-toolkit options)."""
+    env = os.environ if environ is None else environ
+    if env.get("CUDA_HOME") or env.get("CUDA_PATH"):
+        return None
+    from shutil import which
+    nv = which("nvcc")
+    if nv:
+        return str(Path(nv).resolve().parent.parent)
+    candidates: list[Path] = []
+    for pre in prefixes:
+        p = Path(pre)
+        candidates.append(p / "cuda")
+        candidates += sorted(p.glob("cuda-*"), reverse=True)   # newest first
+    for c in candidates:
+        if (c / "bin" / "nvcc").is_file():
+            return str(c)
+    return None
+
+
 # ── panel status: is this box hosting models, and are the weights here? ─────
 
 def _tree_size(p: Path) -> int:
@@ -417,6 +443,12 @@ def main(argv: list[str] | None = None) -> None:
         env = entry.get("env")
         if isinstance(env, dict):
             os.environ.update({str(k): str(v) for k, v in env.items()})
+        if entry.get("engine") == "vllm":
+            home = cuda_home_probe()
+            if home:
+                os.environ["CUDA_HOME"] = home
+                os.environ["PATH"] = f"{home}/bin:" + os.environ.get("PATH", "")
+                print(f"CUDA_HOME not set — using the toolkit at {home}", flush=True)
     print("exec:", " ".join(cmd), flush=True)
     os.execvp(cmd[0], cmd)
 
