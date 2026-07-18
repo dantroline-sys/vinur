@@ -107,10 +107,31 @@ def _mapped_flags(entry: dict, table: list) -> list[str]:
     return out
 
 
+# The container engine's default image — pin a tag in config for anything you
+# care about; :latest is only the out-of-box default.
+DEFAULT_VLLM_IMAGE = "docker.io/vllm/vllm-openai:latest"
+
+
+def _container_runtime(entry: dict) -> str:
+    """podman first (daemonless — the supervisor's signal/process ownership
+    works exactly like a plain child), docker accepted.  entry['runtime']
+    overrides detection."""
+    rt = str(entry.get("runtime") or "").strip()
+    if rt:
+        return rt
+    from shutil import which
+    for cand in ("podman", "docker"):
+        if which(cand):
+            return cand
+    raise FileNotFoundError(
+        "no container runtime found — install podman (dnf install podman "
+        "nvidia-container-toolkit), or set runtime=/path on the entry")
+
+
 def llm_argv(entry: dict, root: Path = ROOT) -> list[str]:
     """argv for one llms[] entry ({name, engine, model, port, host, exclusive,
     default, env, args} + the first-class tuning keys in _VLLM_KEYS /
-    ctx_size + n_gpu_layers for llama)."""
+    ctx_size + n_gpu_layers for llama / image + runtime for container)."""
     for k in ("name", "engine", "model", "port"):
         if not entry.get(k):
             raise ValueError(f"serving.llms entry needs '{k}': {entry}")
@@ -118,7 +139,38 @@ def llm_argv(entry: dict, root: Path = ROOT) -> list[str]:
     port = str(int(entry["port"]))
     args = [str(a) for a in (entry.get("args") or [])]
     engine = entry["engine"]
+    if engine == "container":
+        # The official vLLM image via podman/docker: the image carries the
+        # matched CUDA toolkit + compiler the wheels were built against, so
+        # the host needs ONLY the driver — this is the engine that ends the
+        # bleeding-edge-distro toolchain fight (nvcc, gcc ceilings, JIT).
+        rt = _container_runtime(entry)
+        is_podman = "podman" in os.path.basename(rt)
+        hf = root / "var" / "cache" / "huggingface"
+        argv = [rt, "run", "--rm", "--name", f"vinur-llm-{entry['name']}"]
+        if is_podman:
+            # --replace clears a stale same-name container after an unclean
+            # stop; CDI is the toolkit's GPU wiring (nvidia-ctk cdi generate).
+            argv += ["--replace", "--device", "nvidia.com/gpu=all"]
+        else:
+            argv += ["--gpus", "all"]
+        # :z — SELinux shared label; without it a Fedora host denies the
+        # container access to the mounted cache.  --ipc=host per vLLM's docs
+        # (shared memory for its worker processes).
+        argv += ["--ipc=host",
+                 "-p", f"{host}:{port}:8000",
+                 "-v", f"{hf}:/root/.cache/huggingface:z"]
+        for k, v in (entry.get("env") or {}).items():
+            argv += ["-e", f"{k}={v}"]
+        # The image's entrypoint IS `vllm serve` — model is positional, the
+        # same first-class keys map to the same flags.  The inner server
+        # listens on 0.0.0.0:8000; -p above binds it to the host port.
+        return (argv + [str(entry.get("image") or DEFAULT_VLLM_IMAGE),
+                        str(entry["model"])]
+                + _mapped_flags(entry, _VLLM_KEYS) + args)
     if engine == "vllm":
+        # Bare-metal venv.  On bleeding-edge distros whose gcc/glibc outrun
+        # NVIDIA's support matrix, prefer engine = "container" instead.
         vllm = root / "serving" / ".venv" / "bin" / "vllm"
         if not vllm.exists():
             raise FileNotFoundError(
@@ -138,7 +190,7 @@ def llm_argv(entry: dict, root: Path = ROOT) -> list[str]:
         if "ctx_size" in entry:
             argv += ["-c", str(entry["ctx_size"])]
         return argv + args
-    raise ValueError(f"unknown serving engine '{engine}' (vllm | llama)")
+    raise ValueError(f"unknown serving engine '{engine}' (vllm | llama | container)")
 
 
 def embed_argv(cfg: dict, model_path: str) -> list[str]:
@@ -280,13 +332,14 @@ def cuda_home_probe(environ: dict = None, prefixes: tuple = ("/usr/local", "/opt
 _FAILURE_HINTS = [
     ("Could not find nvcc",
      "CUDA toolkit missing — vLLM's JIT kernels (NVFP4/FP8 MoE on consumer "
-     "Blackwell needs them) can't build. serving/README.md → Troubleshooting "
-     "has the toolkit-only install."),
-    ("unsupported GNU version",
-     "system gcc is newer than the CUDA toolkit supports — add "
-     'env = { NVCC_APPEND_FLAGS = "-allow-unsupported-compiler" } to the '
-     "model entry (or -ccbin a versioned g++). serving/README.md → "
+     "Blackwell needs them) can't build. Switch the entry to engine="
+     "\"container\", or install the toolkit: serving/README.md → "
      "Troubleshooting."),
+    ("unsupported GNU version",
+     "system gcc is newer than the CUDA toolkit supports — switch the entry "
+     "to engine=\"container\" (ends the toolchain fight), or add env = "
+     '{ NVCC_APPEND_FLAGS = "-allow-unsupported-compiler" }. '
+     "serving/README.md → Troubleshooting."),
     ("CUDA out of memory",
      "VRAM overflow — lower gpu_memory_utilization / max_model_len, check "
      "what else is resident (exclusive swap mode exists for this)."),
@@ -314,7 +367,8 @@ def toolkit_warning(cfg: dict, toolkit_present: bool | None = None) -> str | Non
     """Start-time preflight: vllm entries declared but no CUDA toolkit on the
     box.  Loud when a model looks NVFP4/modelopt (on consumer Blackwell that
     WILL die in the FlashInfer JIT); gentle otherwise (JIT paths MAY need it).
-    toolkit_present injects the detection for tests."""
+    toolkit_present injects the detection for tests.  engine="container"
+    entries are exempt — the image carries its own toolkit."""
     vllm_entries = [e for e in cfg["serving"]["llms"] if e.get("engine") == "vllm"]
     if not vllm_entries:
         return None
@@ -329,11 +383,13 @@ def toolkit_warning(cfg: dict, toolkit_present: bool | None = None) -> str | Non
     if fp4:
         return (f"no CUDA toolkit (nvcc) found, and {', '.join(fp4)} looks "
                 "NVFP4/modelopt-quantized — on consumer Blackwell that model WILL "
-                "fail in the FlashInfer JIT ('Could not find nvcc').  Install the "
-                "toolkit first: serving/README.md → Troubleshooting.")
+                "fail in the FlashInfer JIT ('Could not find nvcc').  Switch the "
+                "entry to engine = \"container\", or install the toolkit: "
+                "serving/README.md → Troubleshooting.")
     return ("no CUDA toolkit (nvcc) found — vLLM runs, but JIT kernel paths "
             "(FlashInfer MoE, some attention backends) will fail if a model "
-            "needs them.  serving/README.md → Troubleshooting.")
+            "needs them.  engine = \"container\" avoids this entirely; "
+            "serving/README.md → Troubleshooting.")
 
 
 # ── panel status: is this box hosting models, and are the weights here? ─────
@@ -364,7 +420,8 @@ def weights_status(engine: str, model: str) -> dict:
                     "size_gb": round(p.stat().st_size / 2**30, 2)}
         return {"status": "missing", "path": str(p),
                 "detail": "GGUF not found — see serving/README.md"}
-    if engine == "vllm":
+    if engine in ("vllm", "container"):
+        # container mounts the same in-tree HF cache, so one check serves both
         mp = Path(model).expanduser()
         if mp.is_dir():                                # local snapshot directory
             if any(mp.glob("*.safetensors")):
@@ -510,12 +567,17 @@ def main(argv: list[str] | None = None) -> None:
                      f"(have: {', '.join(entries) or 'none'})")
         entry = entries[ns.name]
         cmd = llm_argv(entry)
-        # Per-model environment (env = { VLLM_ATTENTION_BACKEND = "...", ... }):
-        # applied here, at exec time, so the supervisor path and a manual
-        # `python -m knowledgehost.serving <name>` behave identically.
-        env = entry.get("env")
-        if isinstance(env, dict):
-            os.environ.update({str(k): str(v) for k, v in env.items()})
+        if entry.get("engine") == "container":
+            # env went into the argv as -e flags; just guarantee the mounted
+            # cache exists so the runtime doesn't invent it with odd labels.
+            (ROOT / "var" / "cache" / "huggingface").mkdir(parents=True, exist_ok=True)
+        else:
+            # Per-model environment (env = { NVCC_APPEND_FLAGS = "...", ... }):
+            # applied here, at exec time, so the supervisor path and a manual
+            # `python -m knowledgehost.serving <name>` behave identically.
+            env = entry.get("env")
+            if isinstance(env, dict):
+                os.environ.update({str(k): str(v) for k, v in env.items()})
         if entry.get("engine") == "vllm":
             home = cuda_home_probe()
             if home:

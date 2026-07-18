@@ -138,6 +138,55 @@ plus a ~24 GB FP8 secondary fits in 96 GB) and skip swapping entirely —
 resident pairs are strictly simpler when the quality trade-off is
 acceptable.
 
+## engine = "container" — the recommended route on bleeding-edge distros
+
+Bare-metal vLLM needs the host's CUDA toolkit and compiler to be inside
+NVIDIA's support matrix, and on fast-moving distros (Fedora) they usually
+aren't — that's the whole `Could not find nvcc` / `unsupported GNU version`
+saga. `engine = "container"` ends it: the supervisor runs the **official
+vLLM image** as its child (attached `podman run --rm`, so start/stop/
+watchdog/swap behave exactly like any other service), and the image carries
+the matched toolkit + compiler. The host needs **only the NVIDIA driver**.
+
+One-time host setup:
+
+```bash
+sudo dnf install podman nvidia-container-toolkit
+sudo nvidia-ctk cdi generate --output=/etc/cdi/nvidia.yaml   # GPU wiring (CDI)
+```
+
+Then an entry is the `vllm` engine with two extra keys:
+
+```toml
+[[serving.llms]]
+name    = "primary"
+engine  = "container"
+model   = "org/Model-NVFP4"
+port    = 11438
+image   = "docker.io/vllm/vllm-openai:v0.11.0"   # pin a tag; :latest is the default
+kv_cache_dtype         = "fp8"                   # same first-class keys, same flags
+max_model_len          = 16384
+gpu_memory_utilization = 0.90
+```
+
+Details worth knowing:
+
+- **Weights land in the same place** — `var/cache/huggingface` is mounted
+  into the image (SELinux `:z` label applied), so the in-tree guarantee,
+  the Serving tab's weights chips, and pre-downloads all work unchanged.
+- `env = { ... }` goes **into the container** (`-e`); `args` append to the
+  image's `vllm serve` entrypoint after the mapped keys, same as bare metal.
+- First start pulls the image (~10+ GB, one-time; stored in podman's own
+  storage, not this tree) before the model load — budget that into the
+  first `swap_timeout_s` window, or `podman pull` the image beforehand.
+- podman over docker, deliberately: it's daemonless, so the container is a
+  real child of the supervisor and TERM/KILL semantics just work. Docker is
+  accepted (`runtime = "docker"`, uses `--gpus all`) with the caveat that
+  the docker *client* dying doesn't always stop the server-side container.
+- JIT compiles (the FlashInfer sm120 MoE module) happen **inside** the
+  image with its own toolchain — no host nvcc, no gcc ceiling, cached in
+  the mounted HF cache's sibling dirs per image version.
+
 ## engine = "vllm" — what kind of files
 
 vLLM loads **HF-format safetensors repos** (a directory of `*.safetensors` +

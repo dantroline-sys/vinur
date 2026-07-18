@@ -126,6 +126,36 @@ def main():
         assert "-c 8192" in s and "-ngl 0" in s
         ok("llama first-class keys: ctx_size (-c) + n_gpu_layers (-ngl)")
 
+        # container engine: official image under podman/docker
+        centry = {"name": "primary", "engine": "container", "model": "org/M-NVFP4",
+                  "port": 11438, "runtime": "podman",
+                  "image": "docker.io/vllm/vllm-openai:v1",
+                  "kv_cache_dtype": "fp8", "env": {"HF_TOKEN": "hf_x"},
+                  "args": ["--enable-prefix-caching"]}
+        argv = serving.llm_argv(centry, root=Path(td))
+        s = " ".join(argv)
+        assert argv[:4] == ["podman", "run", "--rm", "--name"]
+        assert "vinur-llm-primary" in argv and "--replace" in argv
+        assert "--device nvidia.com/gpu=all" in s and "--ipc=host" in s
+        assert "-p 127.0.0.1:11438:8000" in s
+        assert f"-v {td}/var/cache/huggingface:/root/.cache/huggingface:z" in s
+        assert "-e HF_TOKEN=hf_x" in s
+        img = argv.index("docker.io/vllm/vllm-openai:v1")
+        assert argv[img + 1] == "org/M-NVFP4", "model positional after image"
+        assert "--kv-cache-dtype fp8" in s and argv[-1] == "--enable-prefix-caching"
+        ok("container engine (podman): CDI GPU, :z cache mount, -e env, keys map")
+
+        argv = serving.llm_argv({**centry, "runtime": "docker"}, root=Path(td))
+        s = " ".join(argv)
+        assert "--gpus all" in s and "--replace" not in s
+        ok("container engine (docker): --gpus all, no podman-only flags")
+
+        assert serving.weights_status("container", "org/M")["status"] == "missing"
+        ccfg = {"serving": {"llms": [{"name": "c", "engine": "container",
+                                      "model": "org/M-NVFP4", "port": 1}]}}
+        assert serving.toolkit_warning(ccfg, toolkit_present=False) is None
+        ok("container entries: HF-cache weights check, exempt from toolkit warning")
+
         # llama-server resolution: $LLAMA_SERVER > bin/ > PATH > sibling vinkona
         saved_ls = os.environ.pop("LLAMA_SERVER", None)
         try:

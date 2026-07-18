@@ -68,6 +68,26 @@ auth_token = ""         # if set, /call requires Authorization: Bearer <token>
 # engine = "llama" entries (a single GGUF via llama-server) take: ctx_size (-c),
 # n_gpu_layers (-ngl, default 99), plus the same host/args/env keys.
 #
+# engine = "container" runs the OFFICIAL vLLM image under podman (or docker)
+# instead of the bare-metal venv — the image carries the matched CUDA toolkit
+# and compiler, so the host needs ONLY the driver.  The right engine on
+# bleeding-edge distros (Fedora!) where nvcc/gcc ceilings break JIT kernels.
+# Same keys as "vllm" (they map to the same flags), plus:
+# [[serving.llms]]
+# name    = "primary"
+# engine  = "container"
+# model   = "org/Model-NVFP4"
+# port    = 11438
+# image   = "docker.io/vllm/vllm-openai:v0.11.0"   # PIN a tag (default :latest)
+# runtime = ""                    # auto: podman, then docker
+# kv_cache_dtype = "fp8"
+# max_model_len  = 16384
+# gpu_memory_utilization = 0.90
+# env = { }                       # goes INTO the container (-e)
+# Host setup once:  dnf install podman nvidia-container-toolkit
+#                   sudo nvidia-ctk cdi generate --output=/etc/cdi/nvidia.yaml
+# Weights still land in var/cache/huggingface (mounted into the image).
+#
 # [serving.embed]                 # nomic via llama-server --embedding
 # enabled = true                  # (GGUF auto-downloads into models/);
 #                                 # serves embed_url's port (11437)
