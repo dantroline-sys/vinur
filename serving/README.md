@@ -350,6 +350,13 @@ served_model_name = "big"
 
 `curl -s localhost:11438/v1/models` shows the names the server will accept.
 
+Both sides also self-heal the common case: the kb's LM client reacts to a
+404 by asking the server what it serves and, when there is exactly one
+model, adopts that name for the rest of the run (logged — fix the config to
+make it permanent); Vinkona's remote tiers do the same reconciliation at
+startup. A server hosting *several* names is never guessed at — the error
+lists them instead.
+
 Disk cleanup: `./install.sh uninstall` removes `serving/.venv`; the weight
 caches are plain directories — delete `var/cache/huggingface/` or files in
 `models/` whenever you drop a model from the config.

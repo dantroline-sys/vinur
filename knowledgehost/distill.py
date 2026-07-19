@@ -449,14 +449,59 @@ class DistillLM:
         self.model = cfg["distill_model"]
         self.timeout = cfg["distill_timeout_s"]
         self.max_tokens = cfg.get("distill_max_tokens", 3072)
+        self._name_checked = False
+
+    def _served_ids(self) -> list:
+        try:
+            with urllib.request.urlopen(f"{self.url}/v1/models", timeout=5) as r:
+                data = json.loads(r.read())
+            return [str(d.get("id")) for d in (data.get("data") or []) if d.get("id")]
+        except Exception:               # any shape/transport surprise → "don't know"
+            return []
 
     def _post(self, payload: dict):
-        req = urllib.request.Request(
-            f"{self.url}/v1/chat/completions",
-            data=json.dumps(payload).encode("utf-8"),
-            headers={"Content-Type": "application/json"}, method="POST")
-        with urllib.request.urlopen(req, timeout=self.timeout) as r:
-            return json.loads(r.read())
+        def go(body: dict):
+            req = urllib.request.Request(
+                f"{self.url}/v1/chat/completions",
+                data=json.dumps(body).encode("utf-8"),
+                headers={"Content-Type": "application/json"}, method="POST")
+            with urllib.request.urlopen(req, timeout=self.timeout) as r:
+                return json.loads(r.read())
+        try:
+            return go(payload)
+        except urllib.error.HTTPError as e:
+            # vLLM validates the request "model" name; llama-server ignored it,
+            # so a llama-era name (often an unnoticed DEFAULT) 404s the moment
+            # the endpoint becomes vLLM — and warmup() would read that as
+            # "endpoint down".  On the first 404, ask the server what it
+            # serves: exactly one model → adopt it and retry; otherwise
+            # surface the real names instead of a bare 404.
+            if e.code != 404 or self._name_checked:
+                raise
+            self._name_checked = True
+            served = self._served_ids()
+            if (len(served) == 1 and payload.get("model") == self.model
+                    and served[0] != self.model):
+                logging.getLogger("distill").warning(
+                    "LM at %s serves '%s' — adopting it (config said '%s'; "
+                    "set distill_model/served_model_name to match)",
+                    self.url, served[0], self.model)
+                self.model = served[0]
+                return go({**payload, "model": served[0]})
+            if served:
+                # Log too: warmup() folds any HTTPError into "endpoint down
+                # (skipped)", so without this line the mismatch is invisible
+                # in the only flow that constructs DistillLMs.
+                logging.getLogger("distill").warning(
+                    "LM at %s rejected model name '%s' (404); it serves: %s "
+                    "— set distill_model (or served_model_name on the server) "
+                    "to match", self.url, payload.get("model"), ", ".join(served))
+                raise urllib.error.HTTPError(
+                    e.url, e.code,
+                    f"{e.reason} — model-name mismatch? request sent "
+                    f"'{payload.get('model')}', the server serves: "
+                    f"{', '.join(served)}", e.headers, None)
+            raise
 
     def warmup(self) -> bool:
         try:

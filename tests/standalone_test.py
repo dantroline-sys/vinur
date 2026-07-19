@@ -9,6 +9,7 @@ import os
 import sys
 import tempfile
 import threading
+import urllib.error
 import urllib.request
 from pathlib import Path
 from types import SimpleNamespace
@@ -295,6 +296,81 @@ def main():
                 print("  --    (vinkona checkout not adjacent — client round-trip skipped)")
         finally:
             httpd.shutdown()
+
+    # ── DistillLM: 404 model-name self-heal (llama-server ignored the request
+    #    "model" field; vLLM validates it — llama-era names must reconcile) ──
+    import http.server
+    from knowledgehost.distill import DistillLM
+
+    class _LM(http.server.BaseHTTPRequestHandler):
+        served = ["served-name"]
+
+        def _json(self, code, obj):
+            body = json.dumps(obj).encode()
+            self.send_response(code)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def do_GET(self):
+            self._json(200, {"data": [{"id": i} for i in self.served]})
+
+        def do_POST(self):
+            n = int(self.headers.get("Content-Length") or 0)
+            req = json.loads(self.rfile.read(n))
+            if req.get("model") not in self.served:
+                self._json(404, {"message": "model does not exist"})
+            else:
+                self._json(200, {"choices": [{"message": {"content": "{}"}}]})
+
+        def log_message(self, *a):
+            pass
+
+    lm_srv = http.server.ThreadingHTTPServer(("127.0.0.1", 0), _LM)
+    threading.Thread(target=lm_srv.serve_forever, daemon=True).start()
+    lm_url = f"http://127.0.0.1:{lm_srv.server_address[1]}"
+    lm_cfg = {"distill_url": lm_url, "distill_model": "stale-gguf-name",
+              "distill_timeout_s": 5}
+
+    lm = DistillLM(lm_cfg)
+    assert lm.warmup() is True, "single-model server: 404 should self-heal"
+    assert lm.model == "served-name", lm.model
+    assert lm.warmup() is True
+    ok("DistillLM: stale name adopts the single served id (warmup survives)")
+
+    _LM.served = ["model-a", "model-b"]
+    lm2 = DistillLM(lm_cfg)
+    try:
+        lm2._post({"model": lm2.model, "messages": []})
+        raise AssertionError("ambiguous server must not silently adopt")
+    except urllib.error.HTTPError as e:
+        assert "model-a" in str(e.reason) and "model-b" in str(e.reason), e.reason
+    assert lm2.model == "stale-gguf-name"
+    ok("DistillLM: several served ids -> 404 surfaces them, no silent pick")
+
+    # Through the REAL flow: warmup() folds HTTPError into False, so the
+    # mismatch must reach the operator via the WARNING log instead.
+    import logging as _logging
+
+    class _Grab(_logging.Handler):
+        records = []
+
+        def emit(self, record):
+            type(self).records.append(record.getMessage())
+
+    grab = _Grab()
+    _logging.getLogger("distill").addHandler(grab)
+    try:
+        lm3 = DistillLM(lm_cfg)
+        assert lm3.warmup() is False, "ambiguous server: warmup stays False"
+        warned = [m for m in _Grab.records if "model-a" in m and "model-b" in m]
+        assert warned and "stale-gguf-name" in warned[0], _Grab.records
+    finally:
+        _logging.getLogger("distill").removeHandler(grab)
+    ok("DistillLM: warmup() path logs the served names (not a silent 'down')")
+
+    lm_srv.shutdown()
 
     print(f"standalone_test: {PASS} checks OK")
 
