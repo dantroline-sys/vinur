@@ -245,9 +245,12 @@ def main():
 
         # ── /drop over live HTTP (auth on) ───────────────────────────────
         scfg = load_config()
+        libtoml = Path(td) / "live.toml"
+        libtoml.write_text('# comment kept\nport = 8771\n[serving]\nswap_timeout_s = 60\n')
         scfg.update({"host": "127.0.0.1", "port": 0, "auth_token": "s3cret",
                      "research_solved_dir": str(Path(td) / "solved2"),
-                     "control_dir": str(Path(td) / "ctrl")})
+                     "control_dir": str(Path(td) / "ctrl"),
+                     "_config_path": str(libtoml)})
         tools = SimpleNamespace()
         httpd = KnowledgeHostServer(scfg, SimpleNamespace(), tools, kb=None)
         port = httpd.server_address[1]
@@ -297,6 +300,41 @@ def main():
             noaccept = research.drop_inventory({"research_solved_dir": ""})
             assert noaccept["ok"] and noaccept["accepts"] is False
             ok("GET /drop handshake: 401 unauthed; inventory served; accepts=false w/o dir")
+
+            # ── /library/root: set the trusted root from the panel ───────
+            libroot = Path(td) / "TheLibrary"
+            (libroot / "papers").mkdir(parents=True)
+
+            def post_root(tok, root):
+                req = urllib.request.Request(
+                    f"http://127.0.0.1:{port}/library/root",
+                    data=json.dumps({"root": root}).encode(),
+                    headers={"Content-Type": "application/json",
+                             **({"Authorization": f"Bearer {tok}"} if tok else {})},
+                    method="POST")
+                try:
+                    with urllib.request.urlopen(req, timeout=5) as r:
+                        return r.status, json.loads(r.read())
+                except urllib.error.HTTPError as e:
+                    return e.code, json.loads(e.read())
+
+            code, _r = post_root("", str(libroot))
+            assert code == 401, code
+            code, _r = post_root("s3cret", "relative/path")
+            assert code == 400 and "absolute" in _r["error"], _r
+            code, _r = post_root("s3cret", str(Path(td) / "no-such-dir"))
+            assert code == 400 and "not a directory" in _r["error"], _r
+            code, r = post_root("s3cret", str(libroot))
+            assert code == 200 and r["ok"] and r["root"] == str(libroot), r
+            assert [s["name"] for s in r["subdirs"]] == ["papers"], r
+            assert scfg["library_root"] == str(libroot), "live cfg must update"
+            text = libtoml.read_text()
+            root_at = text.index("library_root")
+            assert root_at < text.index("[serving]"), "must land ABOVE the table"
+            assert "# comment kept" in text and "swap_timeout_s = 60" in text
+            code, r = post_root("s3cret", str(libroot))     # idempotent re-set
+            assert code == 200 and text.count("library_root") == 1
+            ok("/library/root: authed, validated, live-applied, written above [serving]")
 
             # the return leg: open kb gaps ride the handshake, verbatim,
             # most-asked first, closed/blank ones filtered out

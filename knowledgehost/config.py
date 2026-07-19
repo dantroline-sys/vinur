@@ -655,13 +655,16 @@ def update_config_file(path: str, updates: dict) -> dict:
     return applied
 
 
-# ── web-managed library folders (sandboxed under a file-set library_root) ──────────
-# The Settings firewall keeps every path key out of HTTP.  The Library panel is the ONE
-# deliberate, narrow exception: it can toggle which immediate subfolders of a trusted,
-# file-set `library_root` are indexed.  The web only ever sends bare subfolder NAMES; the
-# server maps each to `library_root/<name>` and rejects anything whose realpath isn't
-# strictly contained under the root — so a token holder can pick blessed subtrees but can
-# never repoint the crawler outside them (no '..', no absolute paths, no symlink escape).
+# ── web-managed library folders (sandboxed under library_root) ─────────────────────
+# The Settings firewall keeps path keys out of HTTP; the Library panel carries the
+# deliberate exceptions.  Subfolder toggles are narrow: the web sends bare NAMES,
+# the server maps each to `library_root/<name>` and rejects anything whose realpath
+# isn't strictly contained under the root (no '..', no absolute paths, no symlink
+# escape).  Setting `library_root` ITSELF from the panel is the second, wider
+# exception (added on request — "no config.toml edits for the library"): it is
+# token-gated like the /ops surface, which already accepts filesystem paths for
+# the bulk importers, so it grants a token holder nothing categorically new; the
+# value must name an existing directory and is validated + persisted server-side.
 
 def _library_subdirs(root: str) -> list:
     """Immediate, non-hidden, real (non-symlink) subdirectories of the trusted root,
@@ -717,18 +720,18 @@ def resolve_library_selection(cfg: dict, names) -> list:
     return out
 
 
-def write_library_sources(config_path: str, paths: list) -> list:
-    """Persist library_sources as a TOML array in config.toml IN PLACE, preserving comments
-    and every other line.  Replaces an existing top-level library_sources of ANY shape
-    (bare string, single- or multi-line array); else inserts it before the first [table].
-    Only the containment-validated output of resolve_library_selection should reach here."""
+def _write_toml_top(config_path: str, key: str, rendered: str, comment: str) -> None:
+    """Persist one TOP-LEVEL `key = rendered` in config.toml IN PLACE, preserving
+    comments and every other line.  Replaces an existing top-level value of ANY
+    shape (bare scalar, single- or multi-line array); else inserts it BEFORE the
+    first [table] header — never appended at the end, where a table would
+    swallow it (the load_config warning documents that trap)."""
     import re as _re
     p = Path(config_path).expanduser()
-    arr = "[" + ", ".join(_toml_scalar(x) for x in paths) + "]"
-    newline = f"library_sources = {arr}"
+    newline = f"{key} = {rendered}"
     lines = p.read_text().splitlines() if p.exists() else []
     out, in_table, first_table_at, done = [], False, None, False
-    key_re = _re.compile(r"^\s*library_sources\s*=")
+    key_re = _re.compile(r"^\s*" + _re.escape(key) + r"\s*=")
     it = iter(lines)
     for line in it:
         if line.lstrip().startswith("["):
@@ -748,11 +751,36 @@ def write_library_sources(config_path: str, paths: list) -> list:
             continue
         out.append(line)
     if not done:
-        block = ["", "# --- library folders (set via the Library panel) ---", newline]
+        block = ["", f"# --- {comment} ---", newline]
         at = first_table_at if first_table_at is not None else len(out)
         out[at:at] = block
     _replace_text(p, "\n".join(out) + "\n")
+
+
+def write_library_sources(config_path: str, paths: list) -> list:
+    """Only the containment-validated output of resolve_library_selection should
+    reach here."""
+    arr = "[" + ", ".join(_toml_scalar(x) for x in paths) + "]"
+    _write_toml_top(config_path, "library_sources", arr,
+                    "library folders (set via the Library panel)")
     return list(paths)
+
+
+def set_library_root(cfg: dict, config_path: str, raw) -> str:
+    """Validate + persist a panel-supplied library_root and apply it live.
+    The value must be an absolute path (after ~-expansion) to an existing
+    directory on the SERVER — fail-closed on anything else."""
+    root = os.path.expanduser(str(raw or "").strip())
+    if not root:
+        raise ValueError("library_root cannot be empty")
+    if not os.path.isabs(root):
+        raise ValueError(f"library_root must be an absolute path on the server: {raw!r}")
+    if not os.path.isdir(root):
+        raise ValueError(f"not a directory on the server: {root}")
+    _write_toml_top(config_path, "library_root", _toml_scalar(root),
+                    "library root (set via the Library panel)")
+    cfg["library_root"] = root                        # live — no restart needed
+    return root
 
 
 def load_config(path: str | None = None) -> dict:

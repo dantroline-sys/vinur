@@ -231,6 +231,7 @@ function renderBar(k) {
   } else if (k === 'library') {
     $('#bar').innerHTML = tokInput()
       + ` <button class="toolbtn" onclick="saveLibrarySelection()">Save selection</button>`
+      + ` <button class="toolbtn" onclick="saveLibrarySelection(true)">Save + index now</button>`
       + ` <button class="toolbtn" onclick="loadLibrary()">Refresh</button>`;
   } else {
     $('#bar').innerHTML = `<button class="toolbtn" onclick="load('${k}')">Reload</button>
@@ -678,16 +679,24 @@ async function loadLibrary() {
   catch (e) { $('#results').textContent = 'request failed: ' + e; return; }
   if (!r.ok) { $('#results').className = 'empty'; $('#results').textContent = 'enter the auth token above to manage the Library'; return; }
   LIBCFG = r;
+  const rootForm = (msg) => `<div style="padding:12px;line-height:1.6">${msg}<br>
+      <div style="display:flex;gap:6px;flex-wrap:wrap;margin-top:8px;max-width:560px">
+        <input id="libroot" type="text" value="${esc(r.root || '')}"
+               placeholder="/absolute/path/on/the/server (e.g. /data/library)"
+               style="flex:1;min-width:260px" onkeydown="if(event.key==='Enter')saveLibraryRoot()">
+        <button class="toolbtn" onclick="saveLibraryRoot()">Set root</button>
+      </div>
+      <span style="opacity:.6;font-size:12px">An existing folder on the machine running Vinur.
+      Its immediate subfolders become tickable search collections.</span></div>`;
   if (!r.root) {
     $('#results').className = 'empty';
-    $('#results').innerHTML = '<div style="padding:12px;line-height:1.5">No <code>library_root</code> is set. '
-      + 'Add e.g. <code>library_root = "~/Library"</code> to <code>config.toml</code> on the server and restart, then Refresh.<br>'
-      + '<span style="opacity:.6">The root itself is file-only, never web-editable — the panel only toggles subfolders under it.</span></div>';
+    $('#results').innerHTML = rootForm('No library root is set yet — point one here:');
     return;
   }
   if (!r.root_exists) {
     $('#results').className = 'empty';
-    $('#results').innerHTML = `<div style="padding:12px">library_root <code>${esc(r.root)}</code> is not a directory on the server.</div>`;
+    $('#results').innerHTML = rootForm(
+      `library_root <code>${esc(r.root)}</code> is not a directory on the server — fix it:`);
     return;
   }
   const rows = (r.subdirs || []).map(s =>
@@ -698,7 +707,9 @@ async function loadLibrary() {
     .concat((r.subdirs || []).map(s => `<option value="${esc(s.name)}">${esc(s.name)}</option>`)).join('');
   $('#results').innerHTML =
     `<div style="margin:6px 0 10px;font-size:13px">Trusted root <code>${esc(r.root)}</code> `
-    + `<span style="opacity:.6">— tick the subfolders (each becomes a search <b>collection</b>), Save, then run <b>ingest-library</b> in Operations.</span></div>`
+    + `<a style="cursor:pointer;text-decoration:underline;font-size:12px" `
+    + `onclick="this.parentNode.insertAdjacentHTML('afterend', rootChangeForm()); this.remove()">change…</a> `
+    + `<span style="opacity:.6">— tick the subfolders (each becomes a search <b>collection</b>), then <b>Save + index now</b>.</span></div>`
     + `<table><tr><th>subfolder / collection</th><th></th></tr>${rows}</table>`
     + `<hr style="margin:16px 0;border:none;border-top:1px solid #8884">`
     + `<div style="font-size:13px;margin-bottom:6px"><b>Test search</b> — the exact ranked path Vinkona's research loop calls (BM25${r && r.dense ? ' + dense' : ''} → rerank).</div>`
@@ -735,12 +746,35 @@ async function doLibrarySearch() {
       ${p.path_or_url ? '<div class="src">' + esc(p.path_or_url) + '</div>' : ''}
     </div>`).join('') : '<div class="empty" style="padding:10px">No match in the local library.</div>';
 }
-async function saveLibrarySelection() {
+function rootChangeForm() {
+  return `<div style="display:flex;gap:6px;flex-wrap:wrap;margin:6px 0 10px;max-width:560px">
+    <input id="libroot" type="text" value="${esc((LIBCFG && LIBCFG.root) || '')}"
+           style="flex:1;min-width:260px" onkeydown="if(event.key==='Enter')saveLibraryRoot()">
+    <button class="toolbtn" onclick="saveLibraryRoot()">Set root</button></div>`;
+}
+async function saveLibraryRoot() {
+  const root = ($('#libroot') || {}).value || '';
+  $('#banner').innerHTML = 'saving root…';
+  const r = await postJSON('/library/root', { root: root.trim() })
+    .catch(e => ({ ok: false, error: '' + e }));
+  if (!r.ok) { $('#banner').innerHTML = `<span style="color:#c00">✗ ${esc(r.error || 'failed')}</span>`; return; }
+  $('#banner').innerHTML = '<span style="color:#0a0">✓ root saved — tick subfolders, then Save + index now</span>';
+  loadLibrary();
+}
+async function saveLibrarySelection(index) {
   const active = Array.from(document.querySelectorAll('.libchk:checked')).map(c => c.value);
   $('#banner').innerHTML = 'saving…';
   const r = await postJSON('/library/config', { active }).catch(e => ({ ok: false, error: '' + e }));
   if (!r.ok) { $('#banner').innerHTML = `<span style="color:#c00">✗ ${esc(r.error || 'failed')}</span>`; return; }
-  $('#banner').innerHTML = '<span style="color:#0a0">✓ saved — now run <b>ingest-library</b> in Operations to (re)index</span>';
+  if (index) {
+    const j = await postJSON('/ops/run', { command: 'ingest-library', args: {} })
+      .catch(e => ({ ok: false, error: '' + e }));
+    $('#banner').innerHTML = j.ok
+      ? '<span style="color:#0a0">✓ saved — indexing started (watch it in Operations)</span>'
+      : `<span style="color:#c00">saved, but indexing did not start: ${esc(j.error || 'failed')}</span>`;
+  } else {
+    $('#banner').innerHTML = '<span style="color:#0a0">✓ saved — “Save + index now” (or Operations → ingest-library) to (re)index</span>';
+  }
   loadLibrary();
 }
 

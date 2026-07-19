@@ -373,8 +373,8 @@ class Handler(BaseHTTPRequestHandler):
     def do_POST(self):
         path = urlparse(self.path).path
         if path not in ("/call", "/ops/run", "/ops/stop", "/ops/reload", "/config",
-                        "/ops/autopilot", "/library/config", "/source", "/scenario",
-                        "/brain", "/drop", "/serving/swap"):
+                        "/ops/autopilot", "/library/config", "/library/root",
+                        "/source", "/scenario", "/brain", "/drop", "/serving/swap"):
             return self._send_json({"ok": False, "error": "not found"}, 404)
         if not self._authed():
             return self._send_json({"ok": False, "error": "unauthorized"}, 401)
@@ -453,6 +453,18 @@ class Handler(BaseHTTPRequestHandler):
                 return self._send_json({"ok": False, "error": str(e)}, 400)
             return self._send_json({"ok": True, "applied": applied, "note":
                 "saved — restart to apply, or 'Reload KB' for read-path keys"})
+        if path == "/library/root":                    # set the trusted root itself
+            from .config import library_status, set_library_root
+            cp = self.cfg.get("_config_path")
+            if not cp:
+                return self._send_json(
+                    {"ok": False, "error": "server started without -c; no config file to write"}, 400)
+            try:
+                set_library_root(self.cfg, cp, req.get("root"))
+            except (ValueError, OSError) as e:
+                return self._send_json({"ok": False, "error": str(e)}, 400)
+            return self._send_json({"ok": True, **library_status(self.cfg), "note":
+                "root saved — tick the subfolders to index, Save selection, then index"})
         if path == "/library/config":                  # persist WHICH subfolders are indexed
             from .config import (resolve_library_selection, write_library_sources,
                                  library_status)
