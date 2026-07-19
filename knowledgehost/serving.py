@@ -339,7 +339,17 @@ _FAILURE_HINTS = [
      "system gcc is newer than the CUDA toolkit supports — switch the entry "
      "to engine=\"container\" (ends the toolchain fight), or add env = "
      '{ NVCC_APPEND_FLAGS = "-allow-unsupported-compiler" }. '
+     "This error is HOST-toolchain only: if you meant to run the container, "
+     "the entry isn't — check the 'exec:' line at the top of this log. "
      "serving/README.md → Troubleshooting."),
+    ("unresolvable CDI devices",
+     "podman can't wire the GPU — the CDI spec is missing or stale. Run "
+     "'sudo nvidia-ctk cdi generate --output=/etc/cdi/nvidia.yaml' "
+     "(again after every driver update)."),
+    ("could not select device driver",
+     "docker's daemon doesn't know the NVIDIA runtime — run 'sudo nvidia-ctk "
+     "runtime configure --runtime=docker && sudo systemctl restart docker', "
+     "or use podman (CDI, no daemon config)."),
     ("CUDA out of memory",
      "VRAM overflow — lower gpu_memory_utilization / max_model_len, check "
      "what else is resident (exclusive swap mode exists for this)."),

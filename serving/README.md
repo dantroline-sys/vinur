@@ -153,7 +153,13 @@ One-time host setup:
 ```bash
 sudo dnf install podman nvidia-container-toolkit
 sudo nvidia-ctk cdi generate --output=/etc/cdi/nvidia.yaml   # GPU wiring (CDI)
+# smoke test — CDI injects nvidia-smi into any image:
+podman run --rm --device nvidia.com/gpu=all ubuntu nvidia-smi
 ```
+
+(Using docker instead? Its `--gpus all` needs the daemon configured once:
+`sudo nvidia-ctk runtime configure --runtime=docker && sudo systemctl
+restart docker`. podman needs no daemon step.)
 
 Then an entry is the `vllm` engine with two extra keys:
 
@@ -186,6 +192,16 @@ Details worth knowing:
 - JIT compiles (the FlashInfer sm120 MoE module) happen **inside** the
   image with its own toolchain — no host nvcc, no gcc ceiling, cached in
   the mounted HF cache's sibling dirs per image version.
+- **Which engine actually ran?** The first line of `var/log/llm-<name>.log`
+  is the exact command (`exec: podman run …` vs `exec: …/serving/.venv/bin/
+  vllm serve …`). If a "container" entry still shows host-toolchain errors
+  (`unsupported GNU version`, `Could not find nvcc`), that log line will
+  show it never launched as one — the usual causes are editing the wrong
+  config file (`KNOWLEDGEHOST_CONFIG` wins over `./config.toml`), editing a
+  different entry than the one that boots (the `default = true` exclusive
+  entry), or a TOML slip: `engine = "container"` must sit inside its own
+  `[[serving.llms]]` block *above* any `[serving.llms.env]` sub-table
+  header, or it silently lands in `env`.
 
 ## engine = "vllm" — what kind of files
 
