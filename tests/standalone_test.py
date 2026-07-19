@@ -278,11 +278,31 @@ def main():
             assert code == 401, code
             ok("/drop live: 200+write, idempotent, 401 without/with wrong token")
 
+            # GET /drop: the exporter handshake (accepts + inventory), authed
+            def get_drop(tok):
+                req = urllib.request.Request(
+                    f"http://127.0.0.1:{port}/drop",
+                    headers={"Authorization": f"Bearer {tok}"} if tok else {})
+                try:
+                    with urllib.request.urlopen(req, timeout=5) as r:
+                        return r.status, json.loads(r.read())
+                except urllib.error.HTTPError as e:
+                    return e.code, {}
+
+            code, _ = get_drop("")
+            assert code == 401, code
+            code, hs = get_drop("s3cret")
+            assert code == 200 and hs["ok"] and hs["accepts"], hs
+            assert name in hs["drops"] and len(hs["drops"][name]) == 16, hs
+            noaccept = research.drop_inventory({"research_solved_dir": ""})
+            assert noaccept["ok"] and noaccept["accepts"] is False
+            ok("GET /drop handshake: 401 unauthed; inventory served; accepts=false w/o dir")
+
             # the vinkona exporter's client speaks the same lane
             sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent
                                    / "vinkona" / "assistant"))
             try:
-                from research_export import _post_drop
+                from research_export import _hash16, _post_drop, negotiate_drop
                 assert _post_drop(f"http://127.0.0.1:{port}", "s3cret", name, DROP) is False
                 assert _post_drop(f"http://127.0.0.1:{port}", "s3cret",
                                   "fedcba9876543210.md", DROP) is True
@@ -292,6 +312,17 @@ def main():
                 except Exception as e:
                     assert not isinstance(e, AssertionError)
                 ok("vinkona _post_drop round-trip (idempotent + error surfaced)")
+
+                status, hs = negotiate_drop(f"http://127.0.0.1:{port}", "s3cret")
+                assert status == "ok" and hs["accepts"], (status, hs)
+                # THE cross-repo contract: the host's inventory hash must equal
+                # vinkona's local fingerprint, or skip-if-held would never skip.
+                assert hs["drops"][name] == _hash16(DROP), (hs["drops"][name], _hash16(DROP))
+                status, _ = negotiate_drop(f"http://127.0.0.1:{port}", "wrong")
+                assert status == "denied", status
+                status, _ = negotiate_drop("http://127.0.0.1:1", "s3cret")
+                assert status == "down", status
+                ok("vinkona negotiate_drop vs the real host: ok/denied/down + hash contract")
             except ImportError:
                 print("  --    (vinkona checkout not adjacent — client round-trip skipped)")
         finally:

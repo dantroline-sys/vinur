@@ -272,6 +272,11 @@ class Handler(BaseHTTPRequestHandler):
                 return self._send_json({"ok": True, **sv.serving_status(self.cfg)})
             except Exception as e:                 # pragma: no cover - defensive
                 return self._send_json({"ok": False, "error": f"{type(e).__name__}: {e}"}, 500)
+        if path == "/drop":                        # exporter handshake: accepts? + inventory
+            if not self._authed():
+                return self._send_json({"ok": False, "error": "unauthorized"}, 401)
+            from . import research
+            return self._send_json(research.drop_inventory(self.cfg))
         if path == "/bundles":                     # modular §16: groups + scenarios + active
             if not self._authed():
                 return self._send_json({"ok": False, "error": "unauthorized"}, 401)

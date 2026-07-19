@@ -23,6 +23,7 @@ the filename is never interpolated anywhere.
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import re
@@ -71,6 +72,32 @@ def is_research_doc(path: str) -> bool:
 # HTTP lane accepts exactly that shape, so a request can never traverse out of
 # the drops folder or claim an arbitrary filename.
 _DROP_NAME = re.compile(r"^[0-9a-f]{16}\.md$")
+
+
+def drop_inventory(cfg: dict) -> dict:
+    """GET /drop — the exporter's handshake.  Says whether this host can store
+    drops at all (``accepts``) and what it already holds: ``drops`` maps each
+    solved/*.md name to sha256(content)[:16], so a remote Vinkona can skip
+    byte-identical drops without shipping their bytes.  (The hash recipe is a
+    cross-repo contract with vinkona's research_export._hash16 — change both
+    or neither.)"""
+    ddir = cfg.get("research_solved_dir")
+    if not ddir:
+        return {"ok": True, "accepts": False,
+                "reason": "research_solved_dir is not configured on this host"}
+    drops = {}
+    try:
+        for fn in sorted(os.listdir(ddir)):
+            if not _DROP_NAME.match(fn):
+                continue
+            try:
+                with open(os.path.join(ddir, fn), "rb") as fh:
+                    drops[fn] = hashlib.sha256(fh.read()).hexdigest()[:16]
+            except OSError:
+                continue
+    except OSError:
+        pass                        # outbox not created yet — accepts, holds nothing
+    return {"ok": True, "accepts": True, "count": len(drops), "drops": drops}
 
 
 def write_drop(cfg: dict, name, content) -> dict:
