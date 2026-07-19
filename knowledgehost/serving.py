@@ -351,8 +351,10 @@ _FAILURE_HINTS = [
      "runtime configure --runtime=docker && sudo systemctl restart docker', "
      "or use podman (CDI, no daemon config)."),
     ("CUDA out of memory",
-     "VRAM overflow — lower gpu_memory_utilization / max_model_len, check "
-     "what else is resident (exclusive swap mode exists for this)."),
+     "VRAM overflow — cap max_model_len (models declare huge native "
+     "contexts), lower max_num_seqs / gpu_memory_utilization, use "
+     "kv_cache_dtype=\"fp8\", and check what else is resident (exclusive "
+     "swap mode exists for this). serving/README.md has a worked example."),
     ("401 Client Error",
      "gated HF repo — accept its license on huggingface.co and export "
      "HF_TOKEN before starting."),

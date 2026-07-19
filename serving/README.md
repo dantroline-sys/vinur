@@ -75,6 +75,29 @@ bouncing through 16-bit KV. NVFP4 repos usually auto-detect; if not, set
 `quantization = "modelopt"`. For AWQ/GPTQ on older GPUs, fp8 KV still saves
 memory but verify output quality — those stacks are less exercised with it.
 
+### Worked example: a 73 GB model on a 96 GB card
+
+`torch.OutOfMemoryError` at startup does **not** mean the model is too big.
+vLLM pre-allocates KV cache up to `gpu_memory_utilization × VRAM` and sizes
+its startup profiling for the model's *declared* context (new models
+declare 200K+) at serving-fleet concurrency — untuned, that overshoots any
+card the weights merely fit on. Cap what you'll actually use:
+
+```toml
+max_model_len          = 16384   # the real KV budget — not the native 262144
+max_num_seqs           = 8       # a distill/verify box, not a serving fleet
+gpu_memory_utilization = 0.92    # ~7 GB headroom for CUDA ctx/graphs/JIT workspace
+kv_cache_dtype         = "fp8"   # NVFP4/FP8 checkpoint → double the KV per GB
+```
+
+That's ~73 GB weights + ~14 GB KV + overhead, comfortably inside 95 GB —
+tens of thousands of fp8 KV tokens, plenty for batched distillation. Still
+OOM within a whisker of fitting? `env = { PYTORCH_CUDA_ALLOC_CONF =
+"expandable_segments:True" }` (fragmentation), then `enforce_eager = true`
+(frees CUDA-graph memory, costs some speed). If instead you want *big*
+batch throughput, that's what the smaller pair (~45–60 GB) in swap mode is
+for — 35+ GB of KV instead of 14.
+
 ## When two models don't fit: exclusive swap mode
 
 Newer large models can make co-residency impossible — e.g. a ~70 GB 4-bit
