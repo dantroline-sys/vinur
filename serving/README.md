@@ -331,6 +331,25 @@ curl -s localhost:11438/v1/models     # vLLM answers with the loaded model id
 curl -s localhost:8771/health         # the kb itself
 ```
 
+**Match the model NAMES, not just the ports.** llama-server ignores the
+`model` field in requests; **vLLM validates it** and answers
+`404 The model ... does not exist` on a mismatch — moving a client from
+llama-server to vLLM surfaces every stale name. Give each entry a stable
+role alias and send exactly that from every client:
+
+```toml
+[[serving.llms]]                      # this box
+served_model_name = "big"
+```
+
+- the kb's own write path: `distill_model = "big"` (and `extract_model` /
+  `verify_model` if those point at vLLM entries — their defaults are GGUF
+  *filenames* from the llama-server days);
+- a remote Vinkona using this box as its background LM:
+  `"big_lm": {"remote": true, "url": "http://this-box:11438", "model": "big"}`.
+
+`curl -s localhost:11438/v1/models` shows the names the server will accept.
+
 Disk cleanup: `./install.sh uninstall` removes `serving/.venv`; the weight
 caches are plain directories — delete `var/cache/huggingface/` or files in
 `models/` whenever you drop a model from the config.

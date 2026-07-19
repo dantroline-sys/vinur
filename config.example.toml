@@ -59,7 +59,11 @@ auth_token = ""         # if set, /call requires Authorization: Bearer <token>
 # cpu_offload_gb         = 0      # spill this many GB of weights to RAM (slow,
 #                                 #   but lets an oversized model limp in)
 # swap_space             = 4      # GB of CPU swap for preempted sequences
-# served_model_name      = ""     # the name clients pass as "model" (default: id)
+# served_model_name      = "big"  # the name clients pass as "model" (default: the
+#                                 #   model id above).  vLLM VALIDATES this (404 on
+#                                 #   mismatch; llama-server ignored it) — use a
+#                                 #   stable role alias and set distill_model /
+#                                 #   vinkona's remote big_lm.model to match
 #   # ── escape hatches ────────────────────────────────────────────────────
 # env  = { VLLM_ATTENTION_BACKEND = "FLASHINFER" }   # extra process environment
 # args = ["--enable-prefix-caching"]  # ANY other `vllm serve` flag — appended
