@@ -21,6 +21,7 @@ from __future__ import annotations
 import fnmatch
 import json
 import logging
+import threading
 import time
 import urllib.error
 import urllib.request
@@ -815,6 +816,41 @@ def _precompute_node_embeds(base, gen) -> dict:
     return dict(zip(uniq, vecs))
 
 
+# ── stage counters: what the LM offered vs what survived validation ──────────
+# "0 cards" alone is ambiguous: the LM may have offered no procedures/criteria
+# at all (corpus without how-to/diagnostic content, or the model taking the
+# empty-array exit — both are OPTIONAL in DISTILL_SCHEMA), or offered plenty
+# that validation dropped (format drift after a serving-model change).  These
+# counters make the two cases distinguishable from the log and OPS_RESULT.
+# Reset per distill_corpus run; typed research-drop cards are not tracked here
+# (they come from a separate per-drop call, not the main arrays).
+_STAGE_LOCK = threading.Lock()
+_STAGE = {"proc_offered": 0, "crit_offered": 0, "proc_kept": 0, "crit_kept": 0}
+
+
+def _stage_add(**kw):
+    with _STAGE_LOCK:
+        for k, v in kw.items():
+            _STAGE[k] += v
+
+
+def _stage_reset():
+    with _STAGE_LOCK:
+        for k in _STAGE:
+            _STAGE[k] = 0
+
+
+def stage_stats() -> dict:
+    with _STAGE_LOCK:
+        return dict(_STAGE)
+
+
+def _stage_line() -> str:
+    st = stage_stats()
+    return (f"[LM offered {st['proc_offered']} proc / {st['crit_offered']} crit; "
+            f"kept {st['proc_kept']} / {st['crit_kept']}]")
+
+
 def distill_chunk(kb, lm, embedder, chunk: dict, extraction=None,
                   source_regime=None, narrative=None) -> tuple:
     """Distil one raw chunk into the KB.  Returns (concepts, relations, cards).
@@ -893,6 +929,7 @@ def distill_chunk(kb, lm, embedder, chunk: dict, extraction=None,
         # tolerate a 3-tuple from an older extractor (no criteria array)
         concepts, relations, procedures, *rest = extraction
         criteria = rest[0] if rest else []
+    _stage_add(proc_offered=len(procedures or []), crit_offered=len(criteria or []))
     if not concepts:                          # None (parse fail) or [] (nothing to learn)
         return _finish(0, 0, 0)               # fiction pass may still have content
 
@@ -966,11 +1003,12 @@ def distill_chunk(kb, lm, embedder, chunk: dict, extraction=None,
         reconcile_edge(kb, lm, cand)
         n_rel += 1
 
-    n_card = _distil_procedures(kb, embedder, procedures, nodemap, doc_id,
-                               claim_regime, claim_scope)
-    n_card += _distil_criteria(kb, embedder, criteria, nodemap, doc_id,
-                               claim_regime, claim_scope)
-    return _finish(len(clean), n_rel, n_card, nodemap)
+    n_proc = _distil_procedures(kb, embedder, procedures, nodemap, doc_id,
+                                claim_regime, claim_scope)
+    n_crit = _distil_criteria(kb, embedder, criteria, nodemap, doc_id,
+                              claim_regime, claim_scope)
+    _stage_add(proc_kept=n_proc, crit_kept=n_crit)
+    return _finish(len(clean), n_rel, n_proc + n_crit, nodemap)
 
 
 def distill_narrative(kb, lm, embedder, narr: dict, doc_id, world, nodemap) -> tuple:
@@ -1386,13 +1424,35 @@ def distill_corpus(store, kb, extractors, embedder, cfg, *, limit=None, verifier
     so Vinkona's own research drops can be distilled ahead of a big uncurated corpus."""
     if not extractors:
         raise BackendUnavailable("no distill endpoints available")
+    _stage_reset()
     if verifiers and cfg.get("verify", True):
-        return _distill_pipeline(store, kb, extractors, verifiers, embedder, cfg,
-                                 limit=limit, bundle=bundle)
-    if len(extractors) == 1:
-        return _distill_sequential(store, kb, extractors[0], embedder, cfg,
-                                   limit=limit, bundle=bundle)
-    return _distill_parallel(store, kb, extractors, embedder, cfg, limit=limit, bundle=bundle)
+        res = _distill_pipeline(store, kb, extractors, verifiers, embedder, cfg,
+                                limit=limit, bundle=bundle)
+    elif len(extractors) == 1:
+        res = _distill_sequential(store, kb, extractors[0], embedder, cfg,
+                                  limit=limit, bundle=bundle)
+    else:
+        res = _distill_parallel(store, kb, extractors, embedder, cfg,
+                                limit=limit, bundle=bundle)
+    st = stage_stats()
+    res.update(st)
+    # Card-drought diagnosis: say WHY zero, not just that it was zero.
+    if res.get("chunks") and not res.get("cards"):
+        if st["proc_offered"] or st["crit_offered"]:
+            log.warning(
+                "0 cards stored but the LM offered %d procedure(s) / %d criteria "
+                "this run — validation dropped them all (missing title/steps, or "
+                "chunks whose concepts came back empty).  Format drift after a "
+                "serving-model change is the usual cause.",
+                st["proc_offered"], st["crit_offered"])
+        else:
+            log.info(
+                "0 cards: the LM offered no procedures/criteria across %d chunk(s). "
+                "Either this corpus has no how-to/diagnostic content (normal for "
+                "encyclopedic text — concepts and edges still accrue), or the model "
+                "is taking the empty-array exit under strict json_schema "
+                "(procedures/criteria are optional fields).", res["chunks"])
+    return res
 
 
 def _chunk_bundle(ch) -> str:
@@ -1425,8 +1485,8 @@ def _distill_sequential(store, kb, lm, embedder, cfg, *, limit=None, bundle=None
         relations += nr
         cards += ncard
         if every and done % every == 0:
-            log.info("… distilled %d chunks / %d concepts / %d relations / %d cards (%d done)",
-                     done, concepts, relations, cards, skipped[0])
+            log.info("… distilled %d chunks / %d concepts / %d relations / %d cards (%d done) %s",
+                     done, concepts, relations, cards, skipped[0], _stage_line())
         if limit and done >= limit:
             break
     return {"chunks": done, "concepts": concepts, "relations": relations, "cards": cards,
@@ -1511,7 +1571,8 @@ def _distill_parallel(store, kb, lms, embedder, cfg, *, limit=None, bundle=None)
                     cards += ncard
                     if every and done % every == 0:
                         log.info("… distilled %d chunks / %d concepts / %d relations / "
-                                 "%d cards (%d done)", done, concepts, relations, cards, skipped[0])
+                                 "%d cards (%d done) %s", done, concepts, relations, cards,
+                                 skipped[0], _stage_line())
                     if limit and done >= limit:
                         stop = True
                 if not stop:
@@ -1697,9 +1758,9 @@ def _distill_pipeline(store, kb, extractors, verifiers, embedder, cfg, *, limit=
                 st["cards"] += ncard
                 if every and st["done"] % every == 0:
                     log.info("… distilled %d chunks / %d concepts / %d relations / %d cards "
-                             "(%d rej, %d adj, %d skipped)", st["done"], st["concepts"],
+                             "(%d rej, %d adj, %d skipped) %s", st["done"], st["concepts"],
                              st["relations"], st["cards"], st["rejected"], st["adjusted"],
-                             st["skipped"])
+                             st["skipped"], _stage_line())
                 if limit and st["done"] >= limit:
                     st["stop"] = True
 

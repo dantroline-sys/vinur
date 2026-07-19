@@ -372,6 +372,55 @@ def main():
 
     lm_srv.shutdown()
 
+    # ── distill stage counters: why "0 cards" happened, not just that it did ──
+    from knowledgehost import distill as D
+
+    D._stage_reset()
+    D._stage_add(proc_offered=3, crit_offered=2)
+    D._stage_add(proc_kept=1)
+    s = D.stage_stats()
+    assert (s["proc_offered"], s["crit_offered"], s["proc_kept"], s["crit_kept"]) \
+        == (3, 2, 1, 0), s
+    assert "offered 3 proc / 2 crit" in D._stage_line()
+    ok("stage counters: offered/kept accumulate; progress line renders them")
+
+    import logging as _lg
+
+    class _DGrab(_lg.Handler):
+        msgs = []
+
+        def emit(self, r):
+            type(self).msgs.append(r.getMessage())
+
+    dgrab = _DGrab()
+    D.log.addHandler(dgrab)
+    lvl0 = D.log.level
+    D.log.setLevel(_lg.INFO)
+    seq0 = D._distill_sequential
+    try:
+        # offered-but-dropped -> the validation warning names the counts
+        D._distill_sequential = lambda *a, **k: (D._stage_add(proc_offered=4),
+                                                 {"chunks": 5, "cards": 0})[1]
+        res = D.distill_corpus(None, None, [object()], None, {"verify": False})
+        assert res["proc_offered"] == 4 and res["cards"] == 0
+        assert any("validation dropped" in m for m in _DGrab.msgs), _DGrab.msgs
+        # offered-nothing -> the corpus/empty-array-exit explanation
+        _DGrab.msgs.clear()
+        D._distill_sequential = lambda *a, **k: {"chunks": 5, "cards": 0}
+        res = D.distill_corpus(None, None, [object()], None, {"verify": False})
+        assert res["proc_offered"] == 0
+        assert any("offered no procedures/criteria" in m for m in _DGrab.msgs)
+        # cards flowing -> no diagnosis noise
+        _DGrab.msgs.clear()
+        D._distill_sequential = lambda *a, **k: {"chunks": 5, "cards": 3}
+        D.distill_corpus(None, None, [object()], None, {"verify": False})
+        assert not _DGrab.msgs, _DGrab.msgs
+    finally:
+        D._distill_sequential = seq0
+        D.log.removeHandler(dgrab)
+        D.log.setLevel(lvl0)
+    ok("distill_corpus: 0-card runs log WHICH drought it was; healthy runs stay quiet")
+
     print(f"standalone_test: {PASS} checks OK")
 
 
