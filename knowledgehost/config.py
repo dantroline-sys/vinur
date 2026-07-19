@@ -145,7 +145,11 @@ DEFAULTS = {
     "control_dir": "",
     # Output budget per chunk.  Multi-concept JSON overruns a small cap and gets
     # truncated mid-array (=> unparseable); 3072 comfortably fits a dense chunk
-    # and still leaves room in an 8k-ctx model.
+    # and still leaves room in an 8k-ctx model.  On a big-window serving box
+    # (16k+ vLLM) set 8192: it's a cap, not a target — chunks that finish
+    # early cost the same, and the "truncated — salvaged N concept(s)" warning
+    # means tail concepts are being silently dropped.  Keep prompt (~3k) +
+    # this ≤ the server's max_model_len, or vLLM rejects the request.
     "distill_max_tokens": 3072,
     # link_to_node identity policy (§9.4): bias toward NOT merging (under-merge is
     # recoverable, over-merge is destructive).
