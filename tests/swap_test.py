@@ -343,6 +343,25 @@ def main():
                 assert all(m["service"] == "supervisor-down" for m in res["llms"])
                 ok("serving_status: ready / mid-download / missing weights + supervisor-down")
 
+                # ── stale .incomplete litter must NOT mask a complete snapshot ──
+                # (interrupted first fetch leaves blobs/*.incomplete; the retry
+                # completes under a fresh temp name, so the litter outlives it)
+                lit = hub / "models--org--good" / "blobs"
+                lit.mkdir(parents=True, exist_ok=True)
+                (lit / "old.incomplete").write_bytes(b"x")
+                ws = sv.weights_status("container", "org/good")
+                assert ws["status"] == "ready" and "stale" in ws["detail"], ws
+                # sharded: every shard the index names must resolve, else incomplete
+                snap = hub / "models--org--good" / "snapshots" / "s1"
+                (snap / "model.safetensors.index.json").write_text(json.dumps(
+                    {"weight_map": {"a": "model-00001-of-00002.safetensors",
+                                    "b": "model-00002-of-00002.safetensors"}}))
+                (snap / "model-00001-of-00002.safetensors").write_bytes(b"x")
+                assert sv.weights_status("vllm", "org/good")["status"] == "incomplete"
+                (snap / "model-00002-of-00002.safetensors").write_bytes(b"x")
+                assert sv.weights_status("vllm", "org/good")["status"] == "ready"
+                ok("weights_status: ready beats stale .incomplete; index shards all checked")
+
                 sup.STATE.write_text(json.dumps({
                     "supervisor": os.getpid(),           # a live pid
                     "services": {"llm-good": os.getpid(), "llm-gg": 999999},

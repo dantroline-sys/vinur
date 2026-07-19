@@ -455,6 +455,28 @@ def _tree_size(p: Path) -> int:
     return total
 
 
+def _snapshot_complete(s) -> bool:
+    """A HF-cache snapshot is complete when config.json is present and every
+    weight shard the snapshot NAMES resolves to a real blob — a snapshot
+    entry is a symlink into blobs/, and a broken link means that shard is
+    still mid-download (Path.exists() follows the link).  Sharded models are
+    checked against model.safetensors.index.json, so a fetch that died before
+    creating the last shard's link reads incomplete, not ready."""
+    s = Path(s)
+    if not (s / "config.json").exists():
+        return False
+    idx = s / "model.safetensors.index.json"
+    if idx.exists():
+        try:
+            names = set(json.loads(idx.read_text()).get("weight_map", {}).values())
+        except (OSError, ValueError):
+            names = set()
+        if names:
+            return all((s / n).exists() for n in names)
+    shards = list(s.glob("*.safetensors"))
+    return bool(shards) and all(p.exists() for p in shards)
+
+
 def weights_status(engine: str, model: str) -> dict:
     """Where the weights for one declared model stand ON DISK:
     ready | incomplete (mid-download or an interrupted/failed fetch) | missing.
@@ -488,17 +510,22 @@ def weights_status(engine: str, model: str) -> dict:
         snap_ok = False
         snaps = d / "snapshots"
         if snaps.is_dir():
-            for s in snaps.iterdir():
-                if (s / "config.json").exists() and any(s.glob("*.safetensors")):
-                    snap_ok = True
-                    break
+            snap_ok = any(_snapshot_complete(s) for s in snaps.iterdir())
         out = {"path": str(d), "size_gb": round(_tree_size(d) / 2**30, 1)}
-        if partial:
+        # A COMPLETE snapshot wins: an interrupted first fetch leaves a stale
+        # *.incomplete blob behind, and the successful retry downloads to a
+        # fresh temp name — so the litter outlives the completed download and
+        # must not flip a ready model back to "incomplete".
+        if snap_ok:
+            out.update(status="ready")
+            if partial:
+                out["detail"] = (f"{partial} stale .incomplete file(s) in the blob "
+                                 "cache from an earlier interrupted fetch — harmless; "
+                                 "delete them to reclaim disk")
+        elif partial:
             out.update(status="incomplete",
                        detail=f"{partial} file(s) mid-download — in progress, or an "
                               "interrupted fetch (restarting the service resumes it)")
-        elif snap_ok:
-            out.update(status="ready")
         else:
             out.update(status="incomplete",
                        detail="cache present but no complete snapshot — fetch "
