@@ -420,6 +420,46 @@ def main():
 
     lm_srv.shutdown()
 
+    # ── config loading: library keys + the loud TOML-placement warnings ──────
+    import contextlib
+    import io
+
+    with tempfile.TemporaryDirectory() as td:
+        good = Path(td) / "good.toml"
+        good.write_text('library_root = "lib"\n'
+                        'library_sources = ["lib/papers", "/abs/books"]\n'
+                        '[[serving.llms]]\nname = "p"\nengine = "vllm"\n'
+                        'model = "m"\nport = 1\n')
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            c = load_config(str(good))
+        assert c["library_root"].endswith("/lib") and Path(c["library_root"]).is_absolute()
+        assert c["library_sources"][0].endswith("/lib/papers")
+        assert c["library_sources"][1] == "/abs/books"
+        assert err.getvalue() == "", err.getvalue()
+        ok("library_root/library_sources load + resolve when placed top-level")
+
+        trap = Path(td) / "trap.toml"
+        trap.write_text('[serving]\nswap_timeout_s = 60\n'
+                        'library_root = "lib"\n'          # swallowed by [serving]
+                        'librari_sources = ["x"]\n')      # typo, also inside table
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            c = load_config(str(trap))
+        assert not c["library_root"], "swallowed key must not leak to top level"
+        msg = err.getvalue()
+        assert "library_root" in msg and "INSIDE [serving]" in msg and "ABOVE" in msg, msg
+        ok("a top-level key below a [table] header warns loudly instead of vanishing")
+
+        typo = Path(td) / "typo.toml"
+        typo.write_text('librari_root = "lib"\n')
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            load_config(str(typo))
+        msg = err.getvalue()
+        assert "unknown key 'librari_root'" in msg and "library_root" in msg, msg
+        ok("an unknown/typo'd key warns with the close-match suggestion")
+
     # ── distill stage counters: why "0 cards" happened, not just that it did ──
     from knowledgehost import distill as D
 

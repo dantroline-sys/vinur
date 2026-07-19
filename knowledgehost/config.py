@@ -768,6 +768,29 @@ def load_config(path: str | None = None) -> dict:
         for k, v in file_cfg.items():
             if k in cfg:
                 cfg[k] = _coerce(k, v)
+            else:
+                # An unrecognised key is usually a typo — silence here cost a
+                # real afternoon ("it won't read library_root"), so say it.
+                import difflib
+                import sys
+                close = difflib.get_close_matches(k, list(cfg), 1)
+                print(f"config warning: unknown key '{k}' in {p} is ignored"
+                      + (f" — did you mean '{close[0]}'?" if close else ""),
+                      file=sys.stderr)
+        # The silent TOML trap: everything below a [table] header belongs to
+        # that table, so a top-level key pasted at the END of the file (after
+        # [serving] / [[serving.llms]]) lands INSIDE that table and vanishes.
+        for tbl, tv in file_cfg.items():
+            if not isinstance(tv, dict):
+                continue
+            schema = DEFAULTS.get(tbl)
+            for k in tv:
+                if k in DEFAULTS and not (isinstance(schema, dict) and k in schema):
+                    import sys
+                    print(f"config warning: '{k}' sits INSIDE [{tbl}] and is "
+                          f"ignored there — in TOML everything below a [table] "
+                          f"header belongs to that table.  Move '{k} = …' ABOVE "
+                          f"the first [{tbl}] line in {p}.", file=sys.stderr)
 
     for k in list(cfg):
         env = os.environ.get("KNOWLEDGEHOST_" + k.upper())

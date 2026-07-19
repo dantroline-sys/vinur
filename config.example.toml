@@ -18,6 +18,27 @@ host = "127.0.0.1"      # localhost by default
 port = 8771             # 8770 is the music host; co-locate on 8771
 auth_token = ""         # if set, /call requires Authorization: Bearer <token>
 
+# ── document library (search-only lexical tier) ─────────────────────────────
+# A big, uncurated folder tree the kb indexes for full-text SEARCH ONLY (never
+# distilled into cards): the `library_search` tool + the research loop read it.
+# Empty library_sources ⇒ feature off.  `./ingest.sh` / the ingest-library op
+# builds the index.
+#
+# library_sources = ["/data/library/papers", "/data/library/books"]
+#
+# Optional: a trusted parent folder — the web panel's Library tab may then
+# add/remove SUBFOLDERS of it as sources (it can never point outside it):
+#
+# library_root = "/data/library"
+
+# ─────────────────────────────────────────────────────────────────────────────
+# NOTE ON TOML: every `key = value` above this point is TOP-LEVEL.  Everything
+# BELOW a [table] header (like the [serving] section next) belongs to THAT
+# table — a top-level key pasted at the end of the file is silently swallowed
+# by whatever table precedes it (the loader now warns when that happens).
+# Add new top-level keys ABOVE this line.
+# ─────────────────────────────────────────────────────────────────────────────
+
 # ── standalone serving (./vinur.sh) ─────────────────────────────────────────
 # What THIS box serves when Vinur runs without Vinkona — e.g. one big-VRAM
 # machine hosting the kb plus its own LMs.  Everything declared here (plus the
