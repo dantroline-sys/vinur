@@ -276,7 +276,23 @@ class Handler(BaseHTTPRequestHandler):
             if not self._authed():
                 return self._send_json({"ok": False, "error": "unauthorized"}, 401)
             from . import research
-            return self._send_json(research.drop_inventory(self.cfg))
+            payload = research.drop_inventory(self.cfg)
+            # The return leg of the handshake: open knowledge gaps (queries
+            # kb_ask couldn't answer), most-asked first, VERBATIM — the remote
+            # Vinkona seeds her research queue with them and the eventual
+            # drop's question closes the gap on lower/trim match (close_gap).
+            kb = getattr(self.server, "kb", None)
+            if payload.get("accepts") and kb is not None:
+                try:
+                    payload["gaps"] = [
+                        {"query": g["query_text"], "count": g.get("count", 1),
+                         "intent": g.get("intent") or ""}
+                        for g in kb.list_gaps(200)
+                        if g.get("status") == "open" and (g.get("query_text") or "").strip()
+                    ][:25]
+                except Exception:                  # a gapless/older kb never breaks drops
+                    pass
+            return self._send_json(payload)
         if path == "/bundles":                     # modular §16: groups + scenarios + active
             if not self._authed():
                 return self._send_json({"ok": False, "error": "unauthorized"}, 401)

@@ -298,6 +298,23 @@ def main():
             assert noaccept["ok"] and noaccept["accepts"] is False
             ok("GET /drop handshake: 401 unauthed; inventory served; accepts=false w/o dir")
 
+            # the return leg: open kb gaps ride the handshake, verbatim,
+            # most-asked first, closed/blank ones filtered out
+            httpd.kb = SimpleNamespace(list_gaps=lambda n=100: [
+                {"query_text": "How do  plasmids replicate?", "intent": "ask",
+                 "effect_label": "", "count": 7, "status": "open"},
+                {"query_text": "answered already", "intent": "", "effect_label": "",
+                 "count": 3, "status": "acquired"},
+                {"query_text": "  ", "intent": "", "effect_label": "",
+                 "count": 2, "status": "open"}])
+            code, hs = get_drop("s3cret")
+            assert hs["gaps"] == [{"query": "How do  plasmids replicate?",
+                                   "count": 7, "intent": "ask"}], hs.get("gaps")
+            httpd.kb = None
+            code, hs = get_drop("s3cret")
+            assert "gaps" not in hs, "no kb loaded -> no gaps key, drops still served"
+            ok("handshake return leg: open gaps only, verbatim; absent without a kb")
+
             # the vinkona exporter's client speaks the same lane
             sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent
                                    / "vinkona" / "assistant"))
