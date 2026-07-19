@@ -75,7 +75,7 @@ lives in its own `var/metrics.db`, never inside kb.db; everything degrades
 gracefully (no nvidia-smi → no GPU series; no vLLM → no queue series; the
 page shows what it has and says what it lacks).
 
-### Stage 6 — metrics collector + history API (server only, no UI)
+### Stage 6 — metrics collector + history API (server only, no UI)  ✅
 `knowledgehost/metrics.py`: a sampler thread in the kb server (config
 `stats_interval_s`, default 5, 0 = off; `stats_keep_days`, default 14 —
 both on the Settings allowlist).  Each tick collects:

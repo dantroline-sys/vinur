@@ -466,6 +466,15 @@ DEFAULTS = {
         "fiction":    ["fictional", "interpretive", "conventional"],
     },
 
+    # ── performance telemetry (the Stats tab; VINUR-UI-01 Stage 6) ─────────
+    # A sampler thread banks GPU / vLLM-queue / KB-count history into its own
+    # var/metrics.db so tuning and A/B runs have graphs from day one.  It is
+    # cheap enough to leave on (one nvidia-smi + a couple of local HTTP GETs
+    # per tick); 0 disables it.  Interval/retention changes need a restart.
+    "stats_interval_s": 5.0,
+    "stats_keep_days": 14,
+    "metrics_db": "",             # empty => var/metrics.db in the repo
+
     "log_level": "INFO",
 }
 
@@ -484,13 +493,14 @@ _INT_KEYS = {"port", "embed_batch", "embed_timeout_s", "embed_max_tokens",
              "ann_min_nodes", "ask_pool", "sqlite_mmap_mb", "sqlite_cache_mb",
              "wiki_articles", "wiki_chunk_chars", "wiki_max_chunks", "link_top_k",
              "link_fetch_mult", "link_max_tokens", "refine_source_tokens", "refine_max_tokens",
-             "refine_timeout_s", "unsure_alternatives", "rerank_pool"}
+             "refine_timeout_s", "unsure_alternatives", "rerank_pool", "stats_keep_days"}
 _FLOAT_KEYS = {"min_confidence", "node_sim_high", "node_sim_low", "kb_min_sim",
                "conceptnet_trust", "conceptnet_min_weight", "atomic_trust", "counts_cache_ttl",
                "glucose_trust", "reconcile_min_sim", "causenet_trust", "ask_prior_penalty",
                "auto_merge_sim", "adjudicate_escalate_sim",
                "link_min_sim", "link_min_conf", "link_related_min_conf",
-               "vinkona_trust", "ask_vinkona_penalty", "unsure_min_sim", "stopword_df_ratio"}
+               "vinkona_trust", "ask_vinkona_penalty", "unsure_min_sim", "stopword_df_ratio",
+               "stats_interval_s"}
 _BOOL_KEYS = {"embed_task_prefix", "ocr", "verify", "strict",
               "conceptnet_include_lexical", "ann_search", "ann_mmap", "wiki_semantic",
               "ask_fit_gate", "use_spacy", "library_dense"}
@@ -537,6 +547,8 @@ EDITABLE_SETTINGS = frozenset({
     "verify", "verify_timeout_s", "verify_max_tokens", "verify_batch", "verify_source_chars",
     "extract_timeout_s", "extract_max_tokens", "distill_timeout_s", "distill_max_tokens",
     "distill_parallel",
+    # telemetry cadence/retention (restart to apply; not the db path)
+    "stats_interval_s", "stats_keep_days",
 
     # node identity / read-abstain thresholds
     "node_sim_high", "node_sim_low", "kb_min_sim",
@@ -863,6 +875,8 @@ def load_config(path: str | None = None) -> dict:
         cfg[k] = _abspath(cfg[k])
     if cfg["zim_path"]:
         cfg["zim_path"] = _abspath(cfg["zim_path"])
+    if cfg.get("metrics_db"):
+        cfg["metrics_db"] = _abspath(cfg["metrics_db"])
     if cfg.get("research_solved_dir"):
         cfg["research_solved_dir"] = _abspath(cfg["research_solved_dir"])
     if cfg.get("library_db"):

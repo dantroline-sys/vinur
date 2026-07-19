@@ -186,6 +186,13 @@ class Handler(BaseHTTPRequestHandler):
                 "backend": store.backend, "chunks": store.count(),
                 "dense": store.has_vectors(),
                 "auth_required": bool(self.cfg.get("auth_token"))})
+        if path == "/metrics/history":             # Stats tab: banked telemetry
+            try:
+                mins = min(float((q.get("mins") or ["60"])[0] or 60), 14 * 1440)
+                step = float((q.get("step") or ["0"])[0] or 0)
+            except ValueError:
+                return self._send_json({"ok": False, "error": "bad mins/step"}, 400)
+            return self._send_json(self.server.metrics_store().history(mins, step))
         if path == "/stats":                       # viewer: index breakdown
             by_source = store.stats_by_source() if hasattr(store, "stats_by_source") else {}
             return self._send_json({
@@ -374,13 +381,20 @@ class Handler(BaseHTTPRequestHandler):
         path = urlparse(self.path).path
         if path not in ("/call", "/ops/run", "/ops/stop", "/ops/reload", "/config",
                         "/ops/autopilot", "/library/config", "/library/root",
-                        "/source", "/scenario", "/brain", "/drop", "/serving/swap"):
+                        "/source", "/scenario", "/brain", "/drop", "/serving/swap",
+                        "/metrics/mark"):
             return self._send_json({"ok": False, "error": "not found"}, 404)
         if not self._authed():
             return self._send_json({"ok": False, "error": "unauthorized"}, 401)
         req = self._read_json()
         if req is None:
             return self._send_json({"ok": False, "error": "bad request"}, 400)
+        if path == "/metrics/mark":                    # an A/B boundary, user-labelled
+            label = str(req.get("label") or "").strip()
+            if not label:
+                return self._send_json({"ok": False, "error": "label required"}, 400)
+            self.server.metrics_store().event("mark", label[:200])
+            return self._send_json({"ok": True, "label": label[:200]})
         if path == "/call":
             name = req.get("name")
             if not name:
@@ -543,6 +557,43 @@ class KnowledgeHostServer(ThreadingHTTPServer):
     def master_kb_path(self) -> str:
         return self.cfg.get("_master_kb_path") or self.cfg["kb_path"]
 
+    # ── telemetry (VINUR-UI-01 Stage 6) ───────────────────────────────────────
+    def metrics_store(self):
+        """Lazy: route reads work with or without a live sampler (and tests
+        that construct the server never touch the disk unless they ask)."""
+        if getattr(self, "_mstore", None) is None:
+            from .metrics import MetricsStore, db_path
+            self._mstore = MetricsStore(db_path(self.cfg))
+        return self._mstore
+
+    def start_metrics(self):
+        """Start the always-on sampler.  Called from serve() — the production
+        entry — NOT from __init__, so test-constructed servers stay inert."""
+        iv = float(self.cfg.get("stats_interval_s", 5) or 0)
+        if iv <= 0 or getattr(self, "_sampler", None) is not None:
+            return None
+        from .metrics import Sampler
+        self._sampler = Sampler(
+            self.cfg, self.metrics_store(),
+            counts_fn=self._metric_counts,
+            slow_fn=lambda: {"kb.chunks": self.store.count()},
+            runner=self.ops)
+        self._sampler.start()
+        return self._sampler
+
+    def _metric_counts(self) -> dict:
+        """kb.* series from the cached counts() — reads the CURRENT handle so
+        a scenario hot-swap just changes what gets sampled next tick."""
+        kb = self.kb
+        if kb is None:
+            return {}
+        c = kb.counts()
+        return {"kb.nodes": c.get("nodes", 0), "kb.edges": c.get("edges", 0),
+                "kb.cards": c.get("cards", 0),
+                "kb.distilled": c.get("distilled_chunks", 0),
+                "kb.merge_q": c.get("merge_candidates", 0),
+                "kb.gaps": c.get("gaps", 0)}
+
     def open_master_kb(self):
         """A short-lived KB handle on the MASTER (not the served working copy) for admin
         edits like renaming/regrouping a source — changes must land in the authoring source
@@ -670,6 +721,13 @@ def serve(cfg, store, tools, kb=None):
              store.has_vectors())
     if cfg.get("auth_token"):
         log.info("auth: Bearer token required on /call")
+    # Telemetry: the always-on sampler (Stats tab).  stats_interval_s = 0 disables.
+    try:
+        if httpd.start_metrics() is not None:
+            log.info("metrics: sampling every %ss into %s",
+                     cfg.get("stats_interval_s"), httpd.metrics_store().path)
+    except Exception as e:                              # pragma: no cover
+        log.warning("metrics sampler failed to start (%s) — Stats stays empty", e)
     # Autopilot: start the thread; it no-ops until the saved plan is enabled (Prioritizer tab).
     try:
         httpd.autopilot.start()

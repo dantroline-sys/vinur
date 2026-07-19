@@ -161,6 +161,14 @@ rerank           = "heuristic"
 rerank_url       = "http://127.0.0.1:11439"   # ./run-reranker.sh (llama.cpp --reranking, cpu)
 rerank_model     = "bge-reranker-v2-m3-Q8_0.gguf"
 
+# ── performance telemetry (the Stats tab) ───────────────────────────────────
+# A sampler thread banks GPU (nvidia-smi), vLLM queue (/metrics: requests
+# running/waiting, KV-cache %) and KB-count history into var/metrics.db so
+# tuning and A/B runs have graphs from day one.  Cheap enough to leave on;
+# 0 disables.  Changes need a restart.
+stats_interval_s = 5.0
+stats_keep_days  = 14
+
 log_level = "INFO"
 
 # ── external-oracle consumer pack (VINUR-OPS-01) ────────────────────────────
