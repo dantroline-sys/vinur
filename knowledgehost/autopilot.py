@@ -25,6 +25,14 @@ it holds the LM leases (lm_fast / lm_big); with respect_leases on, the autopilot
 stands down so the two never fight over the GPUs — the mirror of the assistant's
 'pause idle work' button.
 
+Exclusive models (a box whose big LMs can't co-reside): with auto_models on
+(the default) each step swaps in the model its verb's LM lane points at
+(auto_model — distill/refine → the distill_urls entry; link/adjudicate follow
+their `fast` flag; ingest only when it distils inline) before the verb runs.
+Consecutive steps sharing a model swap once, not per run, and the priority
+order doubles as the phase order.  A step's explicit "model" pins it; boxes
+with no [serving] models derive nothing and behave exactly as before.
+
 Config lives in var/autopilot.json (live-editable from the Prioritizer tab); this
 module owns its defaults and the pure step-selection logic (unit-tested).
 """
@@ -47,6 +55,8 @@ DEFAULT_PLAN = {
     "enabled": False,               # opt-in; the Prioritizer tab turns it on
     "idle_interval_s": 60,          # wait this long when a full pass found no work
     "respect_leases": True,         # stand down while the assistant holds the LMs
+    "auto_models": True,            # derive each step's exclusive model from its verb's
+                                    # LM lane (auto_model) unless the step pins one
     "steps": [
         {"command": "ingest",     "args": {},                    "enabled": True,
          "min_interval_s": 900,   "label": "Ingest new/changed documents"},
@@ -78,7 +88,7 @@ def load_plan(cfg: dict) -> dict:
     try:
         if p.exists():
             saved = json.loads(p.read_text())
-            for k in ("enabled", "idle_interval_s", "respect_leases"):
+            for k in ("enabled", "idle_interval_s", "respect_leases", "auto_models"):
                 if k in saved:
                     plan[k] = saved[k]
             if isinstance(saved.get("steps"), list):
@@ -110,6 +120,7 @@ def save_plan(cfg: dict, plan: dict) -> dict:
         "enabled": bool(plan.get("enabled", False)),
         "idle_interval_s": max(5, int(plan.get("idle_interval_s", 60) or 60)),
         "respect_leases": bool(plan.get("respect_leases", True)),
+        "auto_models": bool(plan.get("auto_models", True)),
         "steps": clean_steps or DEFAULT_PLAN["steps"],
     }
     p = plan_path(cfg)
@@ -144,6 +155,37 @@ def due_step(steps: list, last_run: dict, now: float, hold_until: dict | None = 
         if gap >= float(s.get("min_interval_s", 0) or 0):
             return i, s
     return None, None
+
+
+# Automatic model routing: distill/refine always want the big distiller;
+# link/adjudicate follow their `fast` flag to the extract tier; ingest only
+# touches an LM when it distils inline.  Verbs not mapped below (imports,
+# embeds, stats, …) use no chat LM — no swap needed.
+def auto_model(cfg: dict, command: str, args: dict | None = None):
+    """The exclusive [serving] entry `command` needs, or None (no swap):
+    derived from the first URL of the LM lane the verb drives, matched
+    against the exclusive serving entries by host/port.  Returns None for
+    embed-only verbs, non-exclusive (always-resident) endpoints, foreign
+    hosts, and boxes with no [serving] models — so on a classic deployment
+    this changes nothing.  An explicit step "model" always overrides."""
+    args = args or {}
+    if command in ("distill", "refine"):
+        lane = "distill"
+    elif command in ("link", "adjudicate"):
+        lane = "extract" if args.get("fast") else "distill"
+    elif command == "ingest":
+        lane = "distill" if args.get("distill") else None
+    else:
+        lane = None
+    if lane is None:
+        return None
+    urls = cfg.get(lane + "_urls") or []
+    if lane == "extract" and not urls:      # no fast tier configured → the big one
+        urls = cfg.get("distill_urls") or []
+    if not urls:
+        return None
+    from . import serving
+    return serving.exclusive_entry_for_url(cfg, str(urls[0]))
 
 
 def step_key(step: dict) -> str:
@@ -186,7 +228,8 @@ class Autopilot:
         plan = load_plan(self.cfg)
         return {"enabled": plan["enabled"], "running_step": self._state["running_step"],
                 "last_reason": self._state["last_reason"],
-                "respect_leases": plan["respect_leases"]}
+                "respect_leases": plan["respect_leases"],
+                "auto_models": plan.get("auto_models", True)}
 
     # ── the loop ─────────────────────────────────────────────────────────────
     def _leases_held(self, plan) -> bool:
@@ -233,6 +276,12 @@ class Autopilot:
         self._state["running_step"] = label
         log.info("autopilot: running %s (%s)", step["command"], label)
         want = str(step.get("model") or "").strip()
+        if not want and plan.get("auto_models", True):
+            # No pinned model: derive the one this verb's LM lane needs, so
+            # exclusive-GPU boxes swap automatically as the plan progresses.
+            want = auto_model(self.cfg, step["command"], step.get("args") or {}) or ""
+            if want:
+                log.info("autopilot: %s auto-routes to model '%s'", step["command"], want)
         if want:
             # Phase batching on an exclusive GPU: make the step's model resident
             # first (a no-op when it already is).  Blocking is fine — this thread

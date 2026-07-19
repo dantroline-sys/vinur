@@ -186,6 +186,37 @@ def main():
             assert ap.step_key(plan["steps"][0]) != ap.step_key(plan["steps"][1])
             ok("save_plan keeps the model key; step identity includes it")
 
+            # ── automatic model routing: verb lane -> exclusive entry ────
+            assert sv.exclusive_entry_for_url(scfg, "http://127.0.0.1:11438") == "primary"
+            assert sv.exclusive_entry_for_url(scfg, "http://localhost:11435") == "secondary"
+            assert sv.exclusive_entry_for_url(scfg, "http://127.0.0.1:11441") is None
+            assert sv.exclusive_entry_for_url(scfg, "http://10.0.0.7:11438") is None
+            assert sv.exclusive_entry_for_url(scfg, "nonsense") is None
+            ok("exclusive_entry_for_url: local port match; non-exclusive/foreign -> None")
+
+            assert ap.auto_model(scfg, "distill") == "primary"
+            assert ap.auto_model(scfg, "refine") == "primary"
+            assert ap.auto_model(scfg, "link") == "primary"
+            assert ap.auto_model(scfg, "link", {"fast": True}) == "secondary"
+            assert ap.auto_model(scfg, "adjudicate", {"fast": True}) == "secondary"
+            assert ap.auto_model(scfg, "ingest") is None
+            assert ap.auto_model(scfg, "ingest", {"distill": True}) == "primary"
+            assert ap.auto_model(scfg, "import-conceptnet") is None
+            noext = json.loads(json.dumps(scfg))
+            noext["extract_urls"] = []
+            assert ap.auto_model(noext, "link", {"fast": True}) == "primary"
+            plaincfg = json.loads(json.dumps(scfg))
+            plaincfg["serving"]["llms"] = []
+            assert ap.auto_model(plaincfg, "distill") is None
+            ok("auto_model: lanes map to entries; fast flag, fallbacks, no-serving -> None")
+
+            p2 = ap.save_plan(scfg, {"auto_models": False, "steps": plan["steps"]})
+            assert p2["auto_models"] is False
+            assert ap.load_plan(scfg)["auto_models"] is False, "persisted flag survives"
+            p3 = ap.save_plan(scfg, {"steps": plan["steps"]})
+            assert p3["auto_models"] is True, "default is on"
+            ok("auto_models plan flag: persists, defaults on, load_plan backfills")
+
             calls = []
             pilot = ap.Autopilot(scfg, SimpleNamespace(
                 start=lambda c, a: calls.append(c) or {"ok": True},
@@ -204,6 +235,23 @@ def main():
             assert "swap to secondary failed" in pilot._state["last_reason"]
             assert pilot._hold_until, "failed swap must back the step off"
             ok("autopilot holds the step when the swap fails (verb never launched)")
+
+            # ── _run_step auto-routing: no model key needed on the step ──
+            calls.clear()                        # SWAP_STATE is still absent here:
+            pilot._run_step({"command": "distill", "label": "auto"},
+                            {"idle_interval_s": 60, "auto_models": True})
+            assert calls == [], "derived model unavailable -> verb must not launch"
+            assert "swap to primary failed" in pilot._state["last_reason"], \
+                pilot._state["last_reason"]      # ...which proves 'primary' was derived
+            calls.clear()
+            pilot._run_step({"command": "stats", "label": "s"},
+                            {"idle_interval_s": 60, "auto_models": True})
+            assert calls == ["stats"], "embed-only verb: no model derived, runs freely"
+            calls.clear()
+            pilot._run_step({"command": "distill", "label": "off"},
+                            {"idle_interval_s": 60, "auto_models": False})
+            assert calls == ["distill"], "auto_models off: legacy behavior"
+            ok("autopilot derives per-verb models; embed-only and opt-out unaffected")
             # ── serving_status: weights on disk + service states ────────
             from knowledgehost import supervisor as sup
             state0, sup_state0 = os.environ.get("HF_HOME"), sup.STATE

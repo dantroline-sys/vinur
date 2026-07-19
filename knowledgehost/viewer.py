@@ -861,12 +861,14 @@ async function applyScenario() {
 }
 
 // ── Prioritizer: the autopilot plan (ordered auto-run of maintenance verbs) ──
-let APLAN = null, APSPEC = {}, APHELP = {}, ABUNDLES = [], APSTATE = {};
+let APLAN = null, APSPEC = {}, APHELP = {}, ABUNDLES = [], APSTATE = {},
+    AMODELS = [], AAUTO = [];
 async function loadAutopilot() {
   $('#banner').innerHTML = ''; $('#results').className = ''; $('#results').textContent = 'loading plan…';
   let r; try { r = await (await authFetch('/ops/autopilot')).json(); } catch (e) { $('#results').textContent = 'request failed: ' + e; return; }
   if (!r.ok) { $('#results').className = 'empty'; $('#results').textContent = 'enter the auth token above to use the Prioritizer'; return; }
   APLAN = r.plan; APSPEC = r.commands || {}; APHELP = r.help || {}; ABUNDLES = r.bundles || [];
+  AMODELS = r.serving_models || []; AAUTO = r.auto_models || [];
   renderAutopilot(r.state || {});
 }
 function apArgsFields(cmd, args) {
@@ -900,6 +902,7 @@ function renderAutopilot(state) {
   const st = APSTATE.enabled
     ? `<b style="color:#2e7d32">ON</b> — ${esc(APSTATE.running_step || APSTATE.last_reason || 'idle')}`
     : `<b style="color:#999">off</b>`;
+  const showModel = AMODELS.length > 0 || (p.steps || []).some(s => s.model);
   const rows = (p.steps || []).map((s, i) => {
     const opts = Object.keys(APSPEC).sort().map(c =>
       `<option ${c === s.command ? 'selected' : ''} title="${esc((APHELP[c] || {})._ || '')}">${c}</option>`).join('');
@@ -912,6 +915,9 @@ function renderAutopilot(state) {
       <td><select data-f="command" onchange="apCmdChanged()" title="${esc((APHELP[s.command] || {})._ || '')}">${opts}</select></td>
       <td style="max-width:380px">${apArgsFields(s.command, s.args)}</td>
       <td><input data-f="min_interval_s" type="number" min="0" value="${s.min_interval_s || 0}" style="width:90px"></td>
+      ${showModel ? `<td><input data-f="model" value="${esc(s.model || '')}" list="apmlist"
+          style="width:100px" placeholder="${esc(AAUTO[i] ? 'auto: ' + AAUTO[i] : '—')}"
+          title="Exclusive [serving] model swapped in before this step. Empty = automatic (the model the verb's LM lane points at — shown greyed); type a name to pin one."></td>` : ''}
       <td><input data-f="label" value="${esc(s.label || '')}" style="width:200px"></td>
       <td><button class="toolbtn" onclick="delStep(${i})">✕</button></td></tr>`;
   }).join('');
@@ -930,8 +936,14 @@ function renderAutopilot(state) {
        Yield to the assistant (pause while it's using the LMs)</label>
      &nbsp;·&nbsp; <label style="font-size:13px">idle re-check
        <input id="apInterval" type="number" min="5" value="${p.idle_interval_s || 60}" style="width:70px">s</label>
+     ${showModel ? `&nbsp;·&nbsp; <label style="font-size:13px" title="Exclusive [serving] models can't co-reside;
+       with this on, each step automatically swaps in the model its verb's LM lane points at
+       (shown greyed in the model column) before running. Pin a model on a step to override.">
+       <input type="checkbox" id="apAutoModels" ${p.auto_models !== false ? 'checked' : ''}>
+       Automatic model swapping</label>` : ''}
+     <datalist id="apmlist">${AMODELS.map(m => `<option value="${esc(m)}">`).join('')}</datalist>
      <table style="margin-top:10px"><tr><th>order</th><th>on</th><th>command</th><th>arguments</th>
-       <th>min interval s</th><th>label</th><th></th></tr>${rows}</table>`;
+       <th>min interval s</th>${showModel ? '<th>model</th>' : ''}<th>label</th><th></th></tr>${rows}</table>`;
 }
 function apCmdChanged() { APLAN = _readAutopilotForm(); renderAutopilot(APSTATE); }
 function _readAutopilotForm() {
@@ -948,10 +960,13 @@ function _readAutopilotForm() {
     });
     steps.push({ command: cmd, enabled: g('enabled').checked,
                  args, min_interval_s: parseInt(g('min_interval_s').value || '0', 10),
+                 model: g('model') ? g('model').value.trim() : '',
                  label: g('label').value });
   });
+  const am = $('#apAutoModels');
   return { enabled: $('#apEnabled').checked, respect_leases: $('#apLeases').checked,
-           idle_interval_s: parseInt($('#apInterval').value || '60', 10), steps };
+           idle_interval_s: parseInt($('#apInterval').value || '60', 10),
+           auto_models: am ? am.checked : (APLAN.auto_models !== false), steps };
 }
 function moveStep(i, d) { const s = APLAN.steps; const j = i + d;
   if (j < 0 || j >= s.length) return; APLAN = _readAutopilotForm();

@@ -313,10 +313,16 @@ class Handler(BaseHTTPRequestHandler):
                     mkb.close()
             except Exception:
                 bnames = []
-            return self._send_json({"ok": True, "plan": A.load_plan(self.cfg),
+            plan = A.load_plan(self.cfg)
+            excl = [str(e.get("name")) for e in self.cfg["serving"]["llms"]
+                    if e.get("exclusive")]
+            auto = [A.auto_model(self.cfg, s.get("command", ""), s.get("args") or {}) or ""
+                    for s in plan["steps"]]
+            return self._send_json({"ok": True, "plan": plan,
                                     "state": ap.status() if ap else {"enabled": False},
                                     "commands": OPS_COMMANDS, "help": OPS_HELP,
-                                    "bundles": bnames})
+                                    "bundles": bnames,
+                                    "serving_models": excl, "auto_models": auto})
         if path in ("/ops/status", "/ops/log", "/config"):
             if not self._authed():
                 return self._send_json({"ok": False, "error": "unauthorized"}, 401)

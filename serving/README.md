@@ -143,19 +143,26 @@ GET  /serving/swap                          # poll until status=ready
 ```
 
 and — the one that makes **batched distillation** work unattended — the
-autopilot: each Prioritizer step takes an optional `"model"` key, and the
-step's verb only launches once that model is resident. Order the plan so
-whole phases share a model and each cycle swaps twice, not per document:
+autopilot, which routes models **automatically**: with the plan's
+"Automatic model swapping" on (the default), each Prioritizer step swaps in
+the exclusive entry its verb's LM lane points at before running —
+distill/refine follow `distill_urls`, link/adjudicate follow their `fast`
+flag to `extract_urls`, ingest only when it distils inline; embed-only
+verbs derive nothing. So a stock plan on a swap-mode box just works: no
+per-step annotation. The step's optional `"model"` field (visible in the
+Prioritizer table whenever exclusive models exist; the greyed value shows
+what auto would pick) pins a specific entry instead:
 
 ```json
 { "steps": [
-  {"command": "distill", "model": "primary",   "label": "distill backlog"},
-  {"command": "verify",  "model": "secondary", "label": "verify under 2nd model"}
+  {"command": "distill", "label": "distill backlog"},
+  {"command": "refine", "model": "secondary", "label": "refine under the 2nd model"}
 ]}
 ```
 
-A swap costs minutes, so never interleave models per item — batch each
-phase over the whole backlog. Also note the alternative: pick one model
+A swap costs minutes, so never interleave models per item — the priority
+order doubles as the phase order, and consecutive steps sharing a model
+swap once, not per run. Also note the alternative: pick one model
 small enough to co-reside with the big one (e.g. a ~45 GB coder primary
 plus a ~24 GB FP8 secondary fits in 96 GB) and skip swapping entirely —
 resident pairs are strictly simpler when the quality trade-off is

@@ -243,6 +243,30 @@ SWAP_REQ = ROOT / "var" / "run" / "swap.req"
 SWAP_STATE = ROOT / "var" / "run" / "swap.state"
 
 
+def exclusive_entry_for_url(cfg: dict, url: str) -> str | None:
+    """Which exclusive [[serving.llms]] entry answers at `url`?  Ports must
+    match; hosts match when equal, or when both are local (loopback/0.0.0.0).
+    None for non-exclusive entries (always resident — no swap needed), foreign
+    hosts, and unparseable urls.  This is what lets the autopilot derive a
+    step's model from the LM-lane URL its verb drives (auto_models)."""
+    from urllib.parse import urlparse
+    try:
+        p = urlparse(url if "//" in str(url) else f"http://{url}")
+        uhost, uport = (p.hostname or "").lower(), int(p.port or 0)
+    except (ValueError, TypeError, AttributeError):
+        return None
+    if not uport:
+        return None
+    local = {"127.0.0.1", "localhost", "::1", "0.0.0.0", ""}
+    for e in cfg["serving"]["llms"]:
+        if not e.get("exclusive") or int(e.get("port") or 0) != uport:
+            continue
+        ehost = str(e.get("host") or "127.0.0.1").lower()
+        if ehost == uhost or (ehost in local and uhost in local):
+            return str(e.get("name"))
+    return None
+
+
 def swap_state() -> dict:
     try:
         return json.loads(SWAP_STATE.read_text())
