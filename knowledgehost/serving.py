@@ -243,12 +243,12 @@ SWAP_REQ = ROOT / "var" / "run" / "swap.req"
 SWAP_STATE = ROOT / "var" / "run" / "swap.state"
 
 
-def exclusive_entry_for_url(cfg: dict, url: str) -> str | None:
-    """Which exclusive [[serving.llms]] entry answers at `url`?  Ports must
-    match; hosts match when equal, or when both are local (loopback/0.0.0.0).
-    None for non-exclusive entries (always resident — no swap needed), foreign
-    hosts, and unparseable urls.  This is what lets the autopilot derive a
-    step's model from the LM-lane URL its verb drives (auto_models)."""
+def entry_for_url(cfg: dict, url: str, exclusive_only: bool = False) -> dict | None:
+    """The [[serving.llms]] entry that answers at `url`.  Ports must match;
+    hosts match when equal, or when both are local (loopback/0.0.0.0).  None
+    for foreign hosts and unparseable urls.  This is how the distiller learns
+    what ENGINE sits behind an LM-lane URL (vLLM batches; llama.cpp doesn't)
+    and how the autopilot maps a URL to a swappable model."""
     from urllib.parse import urlparse
     try:
         p = urlparse(url if "//" in str(url) else f"http://{url}")
@@ -258,13 +258,24 @@ def exclusive_entry_for_url(cfg: dict, url: str) -> str | None:
     if not uport:
         return None
     local = {"127.0.0.1", "localhost", "::1", "0.0.0.0", ""}
-    for e in cfg["serving"]["llms"]:
-        if not e.get("exclusive") or int(e.get("port") or 0) != uport:
+    for e in (cfg.get("serving") or {}).get("llms") or []:
+        if exclusive_only and not e.get("exclusive"):
+            continue
+        if int(e.get("port") or 0) != uport:
             continue
         ehost = str(e.get("host") or "127.0.0.1").lower()
         if ehost == uhost or (ehost in local and uhost in local):
-            return str(e.get("name"))
+            return e
     return None
+
+
+def exclusive_entry_for_url(cfg: dict, url: str) -> str | None:
+    """Which EXCLUSIVE [[serving.llms]] entry answers at `url`?  None for
+    non-exclusive entries (always resident — no swap needed).  This is what
+    lets the autopilot derive a step's model from the LM-lane URL its verb
+    drives (auto_models)."""
+    e = entry_for_url(cfg, url, exclusive_only=True)
+    return str(e.get("name")) if e else None
 
 
 def swap_state() -> dict:

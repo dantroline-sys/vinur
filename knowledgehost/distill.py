@@ -18,6 +18,7 @@ resumes), rather than poisoning the KB with empties.
 """
 from __future__ import annotations
 
+import copy
 import fnmatch
 import json
 import logging
@@ -1413,21 +1414,69 @@ def verify_endpoints(cfg, log=None) -> list:
         "distill_max_tokens": cfg.get("verify_max_tokens", 1024)})
 
 
+def _endpoint_fanout(cfg, lm) -> int:
+    """How many requests to keep in flight against ONE endpoint.  An explicit
+    `distill_parallel` wins; 0 = auto: an endpoint this box serves with a
+    batching engine ([[serving.llms]] engine = "vllm"/"container") gets 8
+    (capped by the entry's max_num_seqs), because vLLM's continuous batching
+    turns concurrent requests into one GPU batch — most of a big card's
+    throughput lives there.  llama.cpp (single slot by default) and endpoints
+    not in [serving] (remote boxes we can't introspect) stay at 1."""
+    n = int(cfg.get("distill_parallel", 0) or 0)
+    if n:
+        return max(1, n)
+    url = getattr(lm, "url", None)
+    if not url:
+        return 1
+    try:
+        from .serving import entry_for_url
+        e = entry_for_url(cfg, url)
+    except Exception:
+        return 1
+    if e and str(e.get("engine")) in ("vllm", "container"):
+        cap = int(e.get("max_num_seqs") or 0)
+        return min(8, cap) if cap else 8
+    return 1
+
+
+def _fan_out(cfg, lms) -> list:
+    """Expand each endpoint into `_endpoint_fanout` clones so the pool keeps
+    that many requests in flight against it.  The pool/pipeline machinery
+    already handles N endpoint objects; clones just make one batching server
+    count as several.  Clones inherit the (possibly 404-adopted) model name at
+    clone time and heal independently afterwards; one clone == the old
+    one-request-at-a-time behaviour."""
+    out = []
+    for lm in lms:
+        n = _endpoint_fanout(cfg, lm)
+        out.append(lm)
+        out.extend(copy.copy(lm) for _ in range(n - 1))
+        if n > 1:
+            log.info("distill fan-out: %d concurrent requests -> %s "
+                     "(batching engine; distill_parallel=%s)",
+                     n, getattr(lm, "url", "?"), cfg.get("distill_parallel", 0) or "auto")
+    return out
+
+
 def distill_corpus(store, kb, extractors, embedder, cfg, *, limit=None, verifiers=None,
                    bundle=None) -> dict:
     """Distil the not-yet-done chunks.  Resumable (the distilled set is the checkpoint).
     With a verifier tier and the fast `extractors`, runs the decoupled two-tier pipeline
-    (fast extract → big verify → write); otherwise the single-tier path (parallel across
-    >1 endpoint, else sequential).
+    (fast extract → big verify → write); otherwise the single-tier path (parallel when
+    the fanned-out endpoint list has >1 slot, else sequential).  Each endpoint is
+    fanned out to `_endpoint_fanout` concurrent request slots first, so a single
+    vLLM server saturates via continuous batching instead of serving one request
+    at a time.
 
     `bundle` (e.g. "vinkona") restricts the pass to chunks from that provenance bundle,
     so Vinkona's own research drops can be distilled ahead of a big uncurated corpus."""
     if not extractors:
         raise BackendUnavailable("no distill endpoints available")
     _stage_reset()
+    extractors = _fan_out(cfg, extractors)
     if verifiers and cfg.get("verify", True):
-        res = _distill_pipeline(store, kb, extractors, verifiers, embedder, cfg,
-                                limit=limit, bundle=bundle)
+        res = _distill_pipeline(store, kb, extractors, _fan_out(cfg, verifiers),
+                                embedder, cfg, limit=limit, bundle=bundle)
     elif len(extractors) == 1:
         res = _distill_sequential(store, kb, extractors[0], embedder, cfg,
                                   limit=limit, bundle=bundle)

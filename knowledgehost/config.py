@@ -151,6 +151,17 @@ DEFAULTS = {
     # means tail concepts are being silently dropped.  Keep prompt (~3k) +
     # this ≤ the server's max_model_len, or vLLM rejects the request.
     "distill_max_tokens": 3072,
+    # Requests kept in flight PER distill/extract/verify endpoint.  0 = auto:
+    # an endpoint this box serves with a batching engine ([[serving.llms]]
+    # engine = "vllm"/"container") gets 8 (capped by that entry's
+    # max_num_seqs); llama.cpp and endpoints not in [serving] get 1.  vLLM's
+    # continuous batching folds N concurrent requests into one GPU batch —
+    # on a 96GB card that is most of the distillation throughput.  Set it
+    # explicitly for a remote vLLM box this config doesn't serve (auto can't
+    # see its engine), or to 1 to force the old sequential behaviour.
+    # Per-request latency grows with the batch: keep distill_timeout_s
+    # comfortable (batching raises throughput, not single-request speed).
+    "distill_parallel": 0,
     # link_to_node identity policy (§9.4): bias toward NOT merging (under-merge is
     # recoverable, over-merge is destructive).
     "node_sim_high": 0.86,    # ≥ this + alias agreement => same node
@@ -463,7 +474,7 @@ _INT_KEYS = {"port", "embed_batch", "embed_timeout_s", "embed_max_tokens",
              "chunk_target_tokens",
              "chunk_max_tokens", "chunk_overlap_tokens", "default_k",
              "shortlist", "rrf_k", "rerank_timeout_s", "distill_timeout_s",
-             "distill_max_tokens", "ocr_min_chars", "ingest_log_every",
+             "distill_max_tokens", "distill_parallel", "ocr_min_chars", "ingest_log_every",
              "ingest_workers", "ingest_write_batch", "stopword_max", "stopword_min_chunks",
              "extract_timeout_s", "extract_max_tokens",
              "verify_timeout_s", "verify_max_tokens", "ann_min_rows",
@@ -525,6 +536,8 @@ EDITABLE_SETTINGS = frozenset({
     # distillation budgets & the verify pipeline (not URLs/models)
     "verify", "verify_timeout_s", "verify_max_tokens", "verify_batch", "verify_source_chars",
     "extract_timeout_s", "extract_max_tokens", "distill_timeout_s", "distill_max_tokens",
+    "distill_parallel",
+
     # node identity / read-abstain thresholds
     "node_sim_high", "node_sim_low", "kb_min_sim",
     # wikipedia arm

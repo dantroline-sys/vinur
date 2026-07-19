@@ -547,6 +547,49 @@ def main():
         D.log.setLevel(lvl0)
     ok("distill_corpus: 0-card runs log WHICH drought it was; healthy runs stay quiet")
 
+    # ── parallel fan-out: one vLLM endpoint becomes N in-flight request slots ──
+    vcfg = {"verify": False, "ingest_log_every": 0, "serving": {"llms": [
+        {"name": "primary", "engine": "container", "port": 11438, "exclusive": True},
+        {"name": "tiny", "engine": "llama", "port": 11441},
+        {"name": "capped", "engine": "vllm", "port": 11450, "max_num_seqs": 3}]}}
+    lm_v = SimpleNamespace(url="http://127.0.0.1:11438")
+    lm_l = SimpleNamespace(url="http://127.0.0.1:11441")
+    lm_c = SimpleNamespace(url="http://127.0.0.1:11450")
+    lm_r = SimpleNamespace(url="http://10.0.0.7:8000")   # remote: engine unknowable
+    assert D._endpoint_fanout(vcfg, lm_v) == 8
+    assert D._endpoint_fanout(vcfg, lm_l) == 1
+    assert D._endpoint_fanout(vcfg, lm_c) == 3, "entry's max_num_seqs caps auto"
+    assert D._endpoint_fanout(vcfg, lm_r) == 1, "foreign endpoint stays sequential"
+    assert D._endpoint_fanout({**vcfg, "distill_parallel": 4}, lm_r) == 4, "knob wins"
+    assert D._endpoint_fanout({**vcfg, "distill_parallel": 1}, lm_v) == 1, "knob forces serial"
+    fanned = D._fan_out(vcfg, [lm_v, lm_l])
+    assert len(fanned) == 9 and fanned[0] is lm_v
+    assert all(f.url == lm_v.url for f in fanned[:8])
+    assert len({id(f) for f in fanned[:8]}) == 8, "clones are distinct pool entries"
+    ok("_endpoint_fanout/_fan_out: vLLM->8 (max_num_seqs caps), llama/remote->1, knob overrides")
+
+    # dispatch: a single batching endpoint now takes the PARALLEL path
+    got = {}
+    par0, seq0 = D._distill_parallel, D._distill_sequential
+
+    def fake_par(store, kb, lms, embedder, cfg, **k):
+        got["par"] = list(lms)
+        return {"chunks": 0, "cards": 0}
+
+    def fake_seq(store, kb, lm, embedder, cfg, **k):
+        got["seq"] = lm
+        return {"chunks": 0, "cards": 0}
+
+    try:
+        D._distill_parallel, D._distill_sequential = fake_par, fake_seq
+        D.distill_corpus(None, None, [lm_v], None, vcfg)
+        assert len(got.pop("par")) == 8 and "seq" not in got
+        D.distill_corpus(None, None, [lm_l], None, vcfg)
+        assert got.pop("seq") is lm_l and "par" not in got
+    finally:
+        D._distill_parallel, D._distill_sequential = par0, seq0
+    ok("distill_corpus: one vLLM endpoint -> parallel x8; llama endpoint -> sequential")
+
     print(f"standalone_test: {PASS} checks OK")
 
 

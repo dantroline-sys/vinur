@@ -194,6 +194,16 @@ def main():
             assert sv.exclusive_entry_for_url(scfg, "nonsense") is None
             ok("exclusive_entry_for_url: local port match; non-exclusive/foreign -> None")
 
+            # ── entry_for_url: the any-entry lookup (distill fan-out needs the engine) ──
+            e = sv.entry_for_url(scfg, "http://127.0.0.1:11441")
+            assert e and e["name"] == "tiny" and e["engine"] == "llama"
+            assert sv.entry_for_url(scfg, "http://0.0.0.0:11438")["name"] == "primary"
+            assert sv.entry_for_url(scfg, "http://10.0.0.7:11441") is None
+            assert sv.entry_for_url(scfg, "http://127.0.0.1:11441",
+                                    exclusive_only=True) is None
+            assert sv.entry_for_url({}, "http://127.0.0.1:11441") is None
+            ok("entry_for_url: any entry incl. non-exclusive; engine visible; stub cfg safe")
+
             assert ap.auto_model(scfg, "distill") == "primary"
             assert ap.auto_model(scfg, "refine") == "primary"
             assert ap.auto_model(scfg, "link") == "primary"

@@ -168,6 +168,25 @@ plus a ~24 GB FP8 secondary fits in 96 GB) and skip swapping entirely —
 resident pairs are strictly simpler when the quality trade-off is
 acceptable.
 
+### Parallel distillation — saturating the batch engine
+
+Serving a big card with vLLM and then sending it **one request at a time**
+wastes the card: continuous batching is vLLM's whole trick, and a lone
+sequence leaves most of the GPU idle. The distiller therefore fans out
+automatically — when an LM-lane URL (distill/extract/verify) resolves to a
+`[[serving.llms]]` entry with `engine = "vllm"` or `"container"`, it keeps
+**8 requests in flight** against that endpoint (capped by the entry's
+`max_num_seqs`), which vLLM folds into one GPU batch. llama.cpp endpoints
+(one slot by default) and URLs not in `[serving]` stay sequential, exactly
+as before. The top-level `distill_parallel` knob (also in the panel's
+Settings tab) overrides auto: set it explicitly when the LM lives on a
+**remote** vLLM box this config doesn't serve — auto can't see a foreign
+engine — or set `1` to force the old sequential behaviour. Expect a
+per-run log line `distill fan-out: 8 concurrent requests -> …` when it
+engages. Batching raises throughput, not single-request speed: each
+request's latency grows with the batch, so keep `distill_timeout_s`
+comfortable.
+
 ## engine = "container" — the recommended route on bleeding-edge distros
 
 Bare-metal vLLM needs the host's CUDA toolkit and compiler to be inside

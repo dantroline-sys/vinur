@@ -75,7 +75,9 @@ auth_token = ""         # if set, /call requires Authorization: Bearer <token>
 # gpu_memory_utilization = 0.90   # fraction of VRAM vLLM may claim — resident
 #                                 #   PAIRS must sum ≤ ~0.9; a lone exclusive
 #                                 #   model can take 0.90
-# max_num_seqs           = 32     # concurrent sequences cap (batch pressure)
+# max_num_seqs           = 32     # concurrent sequences cap (batch pressure);
+#                                 #   also caps the distiller's auto fan-out
+#                                 #   (top-level distill_parallel below)
 # tensor_parallel        = 1      # GPUs to shard across
 # cpu_offload_gb         = 0      # spill this many GB of weights to RAM (slow,
 #                                 #   but lets an oversized model limp in)
@@ -130,6 +132,16 @@ embed_task_prefix     = true
 embed_query_prefix    = "search_query: "
 embed_document_prefix = "search_document: "
 embed_max_tokens      = 512   # clip inputs to the server's per-sequence window (n_ubatch)
+
+# ── distillation throughput ─────────────────────────────────────────────────
+# Requests kept in flight PER distill/extract/verify endpoint.  0 = auto:
+# endpoints this box serves with engine = "vllm"/"container" get 8 (capped by
+# that entry's max_num_seqs) — vLLM's continuous batching folds them into one
+# GPU batch, which is most of a big card's distillation throughput; llama.cpp
+# and endpoints not in [serving] stay at 1.  Set it explicitly for a REMOTE
+# vLLM box (auto can't see a foreign engine), or 1 to force sequential.
+# Also editable live in the panel's Settings tab.
+distill_parallel = 0
 
 # ── ingestion ─────────────────────────────────────────────────────────────-─
 # Roots crawled for documents. Layout is not assumed; the tree is walked.
