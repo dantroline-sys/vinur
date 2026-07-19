@@ -1,17 +1,18 @@
 """A tiny, dependency-free browser for inspecting the knowledge base.
 
-Tabs let you *peruse* (not just search) everything the pipeline produces, so you
-can debug it:
-  * **Search**       — the real kb_search (dense + sparse + rerank) with scores.
-  * **Raw**          — random ingested chunks (spot OCR/boilerplate problems).
-  * **Concepts**     — distilled nodes: the meaning + provenance.
-  * **Relations**    — typed edges with their mechanism, regime, and any meta
-                       links (disagrees_with / alternative_to / context_variant_of)
-                       — the window into reconciliation.
-  * **Cards**        — procedure cards (how).
-  * **Sources**      — the source registry: trust + epistemic regime per doc.
-  * **Adjudication** — the node-merge queue (ambiguous link_to_node matches).
-  * **Gaps**         — queries the KB couldn't answer.
+Six tabs (two-level nav — see VINUR-UI-01_panel_redesign_plan.md) let you
+*peruse* (not just search) everything the pipeline produces, so you can debug it:
+  * **Ask**        — Answer (kb_ask) · Passages (kb_search with scores).
+  * **Distilled**  — the pipeline's layers in order: Sources (registry: trust +
+                     epistemic regime per doc) → Raw (ingested chunks; spot
+                     OCR/boilerplate problems) → Concepts (distilled nodes) →
+                     Relations (typed edges w/ mechanism, regime, meta links —
+                     the window into reconciliation) → Cards (procedures/criteria).
+  * **Curation**   — the clean-up queues: Adjudication (ambiguous node merges)
+                     · Gaps (queries the KB couldn't answer).
+  * **Operations** — the authed maintenance-job runner + import formats.
+  * **Serving**    — models this box hosts, weights-on-disk, swap control.
+  * **Settings**   — General (scalar tunables) · Bundles · Library · Prioritizer.
 
 No CDN/asset dependencies; everything is inline.
 """
@@ -46,7 +47,18 @@ INDEX_HTML = """<!doctype html>
            border: 1px solid #8886; border-bottom: none; border-radius: 6px 6px 0 0;
            background: #8881; color: CanvasText; }
   .tabs button.active { background: Canvas; font-weight: 600; position: relative; top: 1px; }
-  main { padding: 16px 20px; max-width: 1000px; }
+  .subtabs { display: flex; gap: 6px; flex-wrap: wrap; padding: 0 0 12px; }
+  .subtabs:empty { display: none; }
+  .subtabs button { font: inherit; font-size: 12px; padding: 3px 12px; cursor: pointer;
+           border: 1px solid #8886; border-radius: 14px; background: transparent; color: CanvasText; }
+  .subtabs button.active { background: #4a90d922; border-color: #4a90d9; font-weight: 600; }
+  /* ONE centred column — the page used to hug the left edge of a big screen */
+  .hwrap, main { max-width: 1240px; margin: 0 auto; }
+  main { padding: 16px 20px; }
+  @media (min-width: 1500px) {
+    .hwrap, main { max-width: 1460px; }
+    #results.grid2 { display: grid; grid-template-columns: 1fr 1fr; gap: 0 20px; align-items: start; }
+  }
   .bar { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; margin-bottom: 14px; }
   input, select, button { font: inherit; padding: 7px 10px; border: 1px solid #8886;
            border-radius: 6px; background: Canvas; color: CanvasText; }
@@ -95,12 +107,15 @@ INDEX_HTML = """<!doctype html>
 </head>
 <body>
 <header>
-  <h1>Knowledge Host — viewer</h1>
-  <div id="stats">loading…</div>
-  <div id="live"></div>
-  <div class="tabs" id="tabs"></div>
+  <div class="hwrap">
+    <h1>Knowledge Host — viewer</h1>
+    <div id="stats">loading…</div>
+    <div id="live"></div>
+    <div class="tabs" id="tabs"></div>
+  </div>
 </header>
 <main>
+  <div class="subtabs" id="subtabs"></div>
   <div class="bar" id="bar"></div>
   <div id="tabhelp"></div>
   <div id="banner"></div>
@@ -111,17 +126,36 @@ const $ = s => document.querySelector(s);
 const esc = t => { const d = document.createElement('div'); d.textContent = t == null ? '' : t; return d.innerHTML; };
 const badge = t => `<span class="badge">${esc(t)}</span>`;
 
-const TABS = [
-  ['ask', 'Ask'], ['search', 'Search'], ['raw', 'Raw'], ['nodes', 'Concepts'], ['edges', 'Relations'],
-  ['cards', 'Cards'], ['sources', 'Sources'], ['adjudication', 'Adjudication'], ['gaps', 'Gaps'],
-  ['bundles', 'Bundles'], ['library', 'Library'], ['serving', 'Serving'],
-  ['ops', 'Operations'], ['autopilot', 'Prioritizer'], ['settings', 'Settings'],
+// ── two-level nav: 6 groups over the (unchanged) leaf panels ─────────────────
+// Leaf keys are load-bearing — they key help.json, the loaders and go()'s
+// dispatch — so consolidation happens HERE, at the nav level, only.
+// Distilled runs in pipeline order: provenance → raw text → concepts →
+// relations → cards (each layer is distilled from the one before it).
+const GROUPS = [
+  ['ask', 'Ask', [['ask', 'Answer'], ['search', 'Passages']]],
+  ['distilled', 'Distilled', [['sources', 'Sources'], ['raw', 'Raw'], ['nodes', 'Concepts'],
+                              ['edges', 'Relations'], ['cards', 'Cards']]],
+  ['curation', 'Curation', [['adjudication', 'Adjudication'], ['gaps', 'Gaps']]],
+  ['ops', 'Operations', []],
+  ['serving', 'Serving', []],
+  ['settings', 'Settings', [['settings', 'General'], ['bundles', 'Bundles'],
+                            ['library', 'Library'], ['autopilot', 'Prioritizer']]],
 ];
+const PARENT = {};                    // leaf key -> its group key
+GROUPS.forEach(([g, _l, kids]) => { PARENT[g] = g; kids.forEach(([k]) => PARENT[k] = g); });
+const lastLeaf = {};                  // group key -> the sub-view left open there
 let active = 'ask';
 
 function buildTabs() {
-  $('#tabs').innerHTML = TABS.map(([k, lbl]) =>
+  $('#tabs').innerHTML = GROUPS.map(([k, lbl]) =>
     `<button data-k="${k}" onclick="go('${k}')">${lbl}</button>`).join('');
+}
+
+function renderSubtabs(leaf) {
+  const grp = GROUPS.find(g => g[0] === PARENT[leaf]);
+  const kids = grp ? grp[2] : [];
+  $('#subtabs').innerHTML = kids.length < 2 ? '' : kids.map(([k, lbl]) =>
+    `<button data-k="${k}" class="${k === leaf ? 'active' : ''}" onclick="go('${k}',1)">${lbl}</button>`).join('');
 }
 // ── Help: tab intros from help.json + live import-format probes (/help) ─────
 let HELP = { help: {}, formats: [] };
@@ -166,11 +200,20 @@ function renderHelp(k) {
   box.innerHTML = h;
 }
 
-function go(k) {
+function go(k, leaf) {
+  // A group button reopens the sub-view last used there (or its first).
+  // A group and its default leaf may share a key ('ask', 'settings'), so
+  // sub-tab pills pass leaf=1 to say "this exact panel" — without it the
+  // General/Answer pills would group-redirect straight back to wherever
+  // you just were.  The redirect assigns once and falls through.
+  const grp = leaf ? null : GROUPS.find(g => g[0] === k);
+  if (grp && grp[2].length) k = lastLeaf[k] || grp[2][0][0];
   active = k;
+  lastLeaf[PARENT[k]] = k;
   if (opsTimer) { clearInterval(opsTimer); opsTimer = null; }   // stop polling when leaving Ops
   document.querySelectorAll('#tabs button').forEach(b =>
-    b.classList.toggle('active', b.dataset.k === k));
+    b.classList.toggle('active', b.dataset.k === PARENT[k]));
+  renderSubtabs(k);
   renderBar(k);
   renderHelp(k);
   if (k === 'ask') { $('#results').className = 'empty'; $('#results').textContent = 'Ask the structured KB a what / how / why question.'; $('#aq') && $('#aq').focus(); }
@@ -291,10 +334,11 @@ async function fillSources() {
 }
 
 // ── renderers ────────────────────────────────────────────────────────────────
-function setRows(html, emptyMsg) {
+function setRows(html, emptyMsg, grid) {
   const r = $('#results');
   if (!html) { r.className = 'empty'; r.textContent = emptyMsg; return; }
-  r.className = ''; r.innerHTML = html;
+  r.className = grid ? 'grid2' : '';   // grid2 = two columns on >=1500px screens
+  r.innerHTML = html;
 }
 
 function renderPassages(ps, withScore) {
@@ -306,7 +350,7 @@ function renderPassages(ps, withScore) {
         ${withScore && p.score != null ? '<span class="score">score ' + Number(p.score).toFixed(3) + '</span>' : ''}</div>
       <div class="text">${esc(p.text)}</div>
       ${p.path_or_url ? '<div class="src">' + esc(p.path_or_url) + '</div>' : ''}
-    </div>`).join('') : '', 'No passages.');
+    </div>`).join('') : '', 'No passages.', true);
 }
 
 function renderNodes(ns) {
@@ -316,7 +360,7 @@ function renderNodes(ns) {
         ${(n.aliases && n.aliases.length) ? '<span>aka ' + esc(n.aliases.join(', ')) + '</span>' : ''}</div>
       <div class="text">${esc(n.summary)}</div>
       ${(n.sources && n.sources.length) ? '<div class="src">distilled from: ' + esc(n.sources.join(' · ')) + '</div>' : ''}
-    </div>`).join('') : '', 'No distilled concepts yet — run:  python -m knowledgehost distill');
+    </div>`).join('') : '', 'No distilled concepts yet — run:  python -m knowledgehost distill', true);
 }
 
 function renderEdges(es) {
@@ -333,7 +377,7 @@ function renderEdges(es) {
       ${(e.support && e.support.length) ? '<div class="src">support: ' + esc(e.support.join(' · ')) + '</div>' : ''}
       ${meta}
     </div>`;
-  }).join('') : '', 'No relations yet — distil some sources.');
+  }).join('') : '', 'No relations yet — distil some sources.', true);
 }
 
 // Typed cards (criteria/staging/requirements/decision/playbook/case…) keep their
@@ -365,7 +409,7 @@ function renderCards(cs) {
       ${(c.steps && c.steps.length) ? '<ol class="steps">' + c.steps.map(s => '<li>' + esc(s) + '</li>').join('') + '</ol>' : ''}
       ${c.criteria ? '<div class="text">' + renderPayload(c.criteria) + '</div>' : ''}
       ${(c.support && c.support.length) ? '<div class="src">support: ' + esc(c.support.join(' · ')) + '</div>' : ''}
-    </div>`).join('') : '', 'No cards yet — distil some sources.');
+    </div>`).join('') : '', 'No cards yet — distil some sources.', true);
 }
 
 function renderTable(rows, cols, emptyMsg) {
