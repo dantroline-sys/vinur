@@ -217,8 +217,16 @@ def main():
             assert p3["auto_models"] is True, "default is on"
             ok("auto_models plan flag: persists, defaults on, load_plan backfills")
 
+            # Dead-port config for the hold tests: ports 1/9 answer nothing even
+            # on a box whose REAL services occupy the standard 11438/11435 —
+            # the residency-evidence fallback must not turn holds into runs.
+            deadcfg = json.loads(json.dumps(scfg))
+            deadcfg["serving"]["llms"][0]["port"] = 1       # primary
+            deadcfg["serving"]["llms"][1]["port"] = 9       # secondary
+            deadcfg["distill_urls"] = ["http://127.0.0.1:1"]
+            deadcfg["extract_urls"] = ["http://127.0.0.1:9"]
             calls = []
-            pilot = ap.Autopilot(scfg, SimpleNamespace(
+            pilot = ap.Autopilot(deadcfg, SimpleNamespace(
                 start=lambda c, a: calls.append(c) or {"ok": True},
                 running=lambda: False, result=lambda: {},
                 status=lambda: {"exit_code": 0}))
@@ -252,6 +260,39 @@ def main():
                             {"idle_interval_s": 60, "auto_models": False})
             assert calls == ["distill"], "auto_models off: legacy behavior"
             ok("autopilot derives per-verb models; embed-only and opt-out unaffected")
+
+            # ── residency evidence beats a broken handshake ──────────────
+            # No swap.state (unsupervised/manual serving), but the entry's own
+            # endpoint answers /health: the verb must run, not hold — this is
+            # what keeps card generation alive on a manually-run container.
+            class OkHealth(BaseHTTPRequestHandler):
+                def do_GET(self):
+                    self.send_response(200)
+                    self.send_header("Content-Length", "0")
+                    self.end_headers()
+
+                def log_message(self, *_):
+                    pass
+            hsrv = ThreadingHTTPServer(("127.0.0.1", 0), OkHealth)
+            threading.Thread(target=hsrv.serve_forever, daemon=True).start()
+            hport = hsrv.server_address[1]
+            livecfg = json.loads(json.dumps(scfg))
+            livecfg["serving"]["llms"][0]["port"] = hport   # primary answers here
+            livecfg["distill_urls"] = [f"http://127.0.0.1:{hport}"]
+            calls.clear()
+            pilot_live = ap.Autopilot(livecfg, SimpleNamespace(
+                start=lambda c, a: calls.append(c) or {"ok": True},
+                running=lambda: False, result=lambda: {},
+                status=lambda: {"exit_code": 0}))
+            assert not sv.SWAP_STATE.exists()
+            pilot_live._run_step({"command": "distill", "label": "manual"},
+                                 {"idle_interval_s": 60, "auto_models": True})
+            assert calls == ["distill"], "answering endpoint: verb must run"
+            # (the transient 'proceeding' reason is replaced on completion)
+            assert pilot_live._state["last_reason"] == "ran distill", \
+                pilot_live._state["last_reason"]
+            hsrv.shutdown()
+            ok("handshake down but model answering -> verb runs (manual serving works)")
             # ── serving_status: weights on disk + service states ────────
             from knowledgehost import supervisor as sup
             state0, sup_state0 = os.environ.get("HF_HOME"), sup.STATE

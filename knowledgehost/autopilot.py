@@ -293,12 +293,23 @@ class Autopilot:
                 _sv.ensure_active(want, timeout_s=float(
                     self.cfg["serving"].get("swap_timeout_s", 900)))
             except (RuntimeError, TimeoutError, OSError) as e:
-                now = time.time()
-                self._last_run[key] = now
-                self._hold_until[key] = now + float(plan.get("idle_interval_s", 60) or 60)
-                self._state["last_reason"] = f"{label}: model swap to {want} failed — {e}"
-                log.warning("autopilot: %s", self._state["last_reason"])
-                return
+                # The handshake fails while the model is in fact resident when
+                # the serving group isn't supervisor-managed (manually-run
+                # container, stale/absent swap state).  The gate exists to
+                # avoid running against a swapped-OUT model — and the entry's
+                # own endpoint answering is direct proof it isn't.  Trust the
+                # evidence over the handshake; only hold when it's truly gone.
+                if self._entry_answers(want):
+                    self._state["last_reason"] = (f"{label}: swap handshake failed ({e}) "
+                                                  f"but '{want}' is answering — proceeding")
+                    log.warning("autopilot: %s", self._state["last_reason"])
+                else:
+                    now = time.time()
+                    self._last_run[key] = now
+                    self._hold_until[key] = now + float(plan.get("idle_interval_s", 60) or 60)
+                    self._state["last_reason"] = f"{label}: model swap to {want} failed — {e}"
+                    log.warning("autopilot: %s", self._state["last_reason"])
+                    return
         try:
             res = self.ops.start(step["command"], step.get("args") or {})
         except ValueError as e:              # bad args (hand-edited plan) — treat as a
@@ -333,6 +344,20 @@ class Autopilot:
             self._hold_until.pop(key, None)
             self._state["last_reason"] = f"ran {step['command']}"
         # Loop restarts from the top → priority preemption.
+
+    def _entry_answers(self, name: str) -> bool:
+        """Is the named [serving] entry's own endpoint up right now?  Direct
+        evidence of residency, used when the swap handshake is unavailable."""
+        from . import serving as _sv
+        for e in self.cfg["serving"]["llms"]:
+            if str(e.get("name")) == name:
+                host = str(e.get("host") or "127.0.0.1")
+                try:
+                    return _sv.probe_ready("127.0.0.1" if host == "0.0.0.0" else host,
+                                           int(e.get("port") or 0))
+                except Exception:
+                    return False
+        return False
 
     def _sleep(self, secs):
         self._stop.wait(secs)
