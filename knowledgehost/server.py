@@ -382,7 +382,7 @@ class Handler(BaseHTTPRequestHandler):
         if path not in ("/call", "/ops/run", "/ops/stop", "/ops/reload", "/config",
                         "/ops/autopilot", "/library/config", "/library/root",
                         "/source", "/scenario", "/brain", "/drop", "/serving/swap",
-                        "/metrics/mark"):
+                        "/metrics/mark", "/gaps/close"):
             return self._send_json({"ok": False, "error": "not found"}, 404)
         if not self._authed():
             return self._send_json({"ok": False, "error": "unauthorized"}, 401)
@@ -395,6 +395,16 @@ class Handler(BaseHTTPRequestHandler):
                 return self._send_json({"ok": False, "error": "label required"}, 400)
             self.server.metrics_store().event("mark", label[:200])
             return self._send_json({"ok": True, "label": label[:200]})
+        if path == "/gaps/close":                      # Curation: retire one gap by hand
+            kb = getattr(self.server, "kb", None)
+            if kb is None:
+                return self._send_json({"ok": False, "error": "no KB loaded"}, 400)
+            status = str(req.get("status") or "dismissed")
+            if status not in ("dismissed", "acquired"):
+                return self._send_json(
+                    {"ok": False, "error": "status must be dismissed|acquired"}, 400)
+            n = kb.close_gap(req.get("query") or "", status=status)
+            return self._send_json({"ok": True, "closed": n})
         if path == "/call":
             name = req.get("name")
             if not name:

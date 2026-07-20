@@ -353,6 +353,36 @@ def main():
             assert "gaps" not in hs, "no kb loaded -> no gaps key, drops still served"
             ok("handshake return leg: open gaps only, verbatim; absent without a kb")
 
+            # ── POST /gaps/close: the Curation tab's manual dismiss ────────
+            closed = []
+
+            def post_gap(tok, body):
+                req = urllib.request.Request(
+                    f"http://127.0.0.1:{port}/gaps/close",
+                    data=json.dumps(body).encode(),
+                    headers={"Content-Type": "application/json",
+                             **({"Authorization": f"Bearer {tok}"} if tok else {})},
+                    method="POST")
+                try:
+                    with urllib.request.urlopen(req, timeout=5) as r:
+                        return r.status, json.loads(r.read())
+                except urllib.error.HTTPError as e:
+                    return e.code, json.loads(e.read())
+
+            code, _ = post_gap(None, {"query": "x"})
+            assert code == 401
+            code, _ = post_gap("s3cret", {"query": "x"})       # kb is None right now
+            assert code == 400
+            httpd.kb = SimpleNamespace(
+                close_gap=lambda q, status="acquired": closed.append((q, status)) or 1)
+            code, r = post_gap("s3cret", {"query": "x", "status": "bogus"})
+            assert code == 400 and "dismissed|acquired" in r["error"]
+            code, r = post_gap("s3cret", {"query": "How do  plasmids replicate?"})
+            assert code == 200 and r["closed"] == 1
+            assert closed == [("How do  plasmids replicate?", "dismissed")], closed
+            httpd.kb = None
+            ok("/gaps/close: authed, status-validated, defaults to dismissed")
+
             # the vinkona exporter's client speaks the same lane
             sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent
                                    / "vinkona" / "assistant"))

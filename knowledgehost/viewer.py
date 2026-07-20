@@ -303,7 +303,18 @@ function renderBar(k) {
        <span id="askx">${askExtras()}</span>
        <button class="toolbtn" onclick="doAskGo()">Go</button>`;
   } else if (k === 'overview') {
-    $('#bar').innerHTML = `<button class="toolbtn" onclick="loadOverview()">Reload</button>`;
+    $('#bar').innerHTML = tokInput()
+      + ` <button class="toolbtn" onclick="loadOverview()">Reload</button>
+        <span style="opacity:.6;font-size:13px">token enables the Upkeep actions below</span>`;
+  } else if (k === 'adjudication') {
+    $('#bar').innerHTML = tokInput()
+      + ` <button class="toolbtn" onclick="upkeepRun('adjudicate')" title="clear the ambiguous node-merge queue — one job, watch it under Operations">Run adjudicate now</button>`
+      + ` <button class="toolbtn" onclick="upkeepQueue('adjudicate')" title="append it to the Prioritizer plan instead of running immediately">Queue as step</button>`
+      + ` <button class="toolbtn" onclick="load('adjudication')">Reload</button>`;
+  } else if (k === 'gaps') {
+    $('#bar').innerHTML = tokInput()
+      + ` <button class="toolbtn" onclick="load('gaps')">Reload</button>
+        <span style="opacity:.6;font-size:13px">open gaps flow to Vinkona automatically via the research handshake — dismiss the ones not worth researching</span>`;
   } else if (k === 'raw') {
     $('#bar').innerHTML =
       `<select id="srcfilter" title="source"></select>
@@ -452,7 +463,68 @@ async function loadOverview() {
     + ratios.map(([l, v, note]) =>
         `<tr><td>${esc(l)}</td><td>${v == null ? '—' : esc(String(v.toLocaleString ? v.toLocaleString() : v))}</td>
          <td style="opacity:.7">${esc(note)}</td></tr>`).join('') + '</table>'
-    + (bysrc ? `<div style="margin-top:12px;font-size:13px"><span style="opacity:.6">chunks by source type:</span> ${bysrc}</div>` : ''));
+    + (bysrc ? `<div style="margin-top:12px;font-size:13px"><span style="opacity:.6">chunks by source type:</span> ${bysrc}</div>` : '')
+    + renderUpkeep(kb, r1));
+}
+
+// ── Upkeep: the tidy-up verbs, with WHEN and WHY — run now or queue a step ──
+function renderUpkeep(kb, relPerNode) {
+  const merge = kb.merge_candidates || 0;
+  const acts = [
+    ['link',
+     'Finds typed relations between EXISTING concepts. Run after a big ingest/distill '
+     + 'wave — it is what raises relations-per-concept. Fast-LM eligible.',
+     relPerNode != null ? 'now ' + (Math.round(relPerNode * 100) / 100) + ' rel/concept' : ''],
+    ['adjudicate',
+     'Clears the node-merge queue (pairs too similar to keep apart, too different to '
+     + 'auto-merge). Duplicates dilute retrieval — run when the queue climbs.',
+     merge ? merge + ' queued' + (merge > 50 ? ' — worth clearing' : '') : 'queue empty'],
+    ['refine',
+     'Source-grounded, in-place rewrite of weak or stale cards. Run occasionally — '
+     + 'after corrections land or when new sources touch old topics. Big-LM work.',
+     ''],
+    ['embed-nodes',
+     'Backfills vectors for nodes created without embeddings (the bulk import-* verbs '
+     + 'skip them). Run once after any import; a no-op when nothing is missing.',
+     ''],
+  ];
+  return `<h3 style="margin:18px 0 6px;font-size:14px">Upkeep</h3>
+    <div style="font-size:12px;opacity:.6;margin-bottom:8px">One job at a time (they share the GPU
+    and the KB) — <b>Run now</b> launches it like the Operations tab; <b>Queue as step</b> appends it
+    to the Prioritizer plan (Settings → Prioritizer) to run when the box is idle.  Every run shows up
+    as an event line on Stats.</div>
+    <table><tr><th>verb</th><th>when &amp; why</th><th>signal</th><th></th></tr>`
+    + acts.map(([cmd, why, sig]) =>
+      `<tr><td><code>${esc(cmd)}</code></td><td style="opacity:.8">${esc(why)}</td>
+       <td style="white-space:nowrap">${esc(sig)}</td>
+       <td style="white-space:nowrap">
+         <button class="toolbtn" style="font-size:12px;padding:3px 9px" onclick="upkeepRun('${cmd}')">Run now</button>
+         <button class="toolbtn" style="font-size:12px;padding:3px 9px" onclick="upkeepQueue('${cmd}')">Queue as step</button>
+       </td></tr>`).join('') + '</table>';
+}
+
+async function upkeepRun(cmd) {
+  const r = await postJSON('/ops/run', { command: cmd, args: {} })
+    .catch(e => ({ ok: false, error: '' + e }));
+  $('#banner').innerHTML = `<div class="note">${r.ok
+    ? '▶ ' + esc(cmd) + ' started — follow it under Operations; it will appear as an event line on Stats'
+    : '✗ ' + esc(r.error || 'failed — auth token?')}</div>`;
+}
+
+async function upkeepQueue(cmd) {
+  let r0;
+  try { r0 = await (await authFetch('/ops/autopilot')).json(); }
+  catch (e) { r0 = { ok: false, error: '' + e }; }
+  if (!r0.ok) {
+    $('#banner').innerHTML = `<div class="note">✗ ${esc(r0.error || 'failed — auth token?')}</div>`;
+    return;
+  }
+  const plan = r0.plan || {};
+  (plan.steps = plan.steps || []).push({ command: cmd, args: {}, enabled: true });
+  const r = await postJSON('/ops/autopilot', { plan }).catch(e => ({ ok: false, error: '' + e }));
+  $('#banner').innerHTML = `<div class="note">${r.ok
+    ? '✓ ' + esc(cmd) + ' queued as a Prioritizer step — reorder or edit it under Settings → Prioritizer'
+    : '✗ ' + esc(r.error || 'failed')}</div>`;
 }
 
 // ── renderers ────────────────────────────────────────────────────────────────
@@ -564,10 +636,35 @@ async function load(kind) {
     if (kind === 'adjudication') return renderTable(rows,
       [['node_a', 'node A'], ['node_b', 'node B'], ['similarity', 'sim'],
        ['reason', 'reason'], ['status', 'status']], 'Adjudication queue empty.');
-    if (kind === 'gaps') return renderTable(rows,
-      [['query_text', 'query'], ['intent', 'intent'], ['count', 'count'], ['status', 'status']],
-      'No knowledge gaps logged.');
+    if (kind === 'gaps') return renderGaps(rows);
   } catch (e) { $('#results').textContent = 'request failed: ' + e; }
+}
+
+// gaps get a per-row dismiss; rows are index-keyed (query text is untrusted —
+// it must never be interpolated into an onclick attribute)
+let GAPROWS = [];
+
+function renderGaps(rows) {
+  GAPROWS = rows || [];
+  if (!GAPROWS.length) return setRows('', 'No knowledge gaps logged.');
+  const head = '<tr><th>query</th><th>intent</th><th>count</th><th>status</th><th></th></tr>';
+  const body = GAPROWS.map((r, i) =>
+    `<tr><td>${esc(r.query_text)}</td><td>${esc(r.intent)}</td><td>${esc(r.count)}</td>
+     <td>${esc(r.status)}</td><td>${r.status === 'open'
+       ? `<button class="toolbtn" style="font-size:11px;padding:2px 8px" onclick="dismissGap(${i})">dismiss</button>`
+       : ''}</td></tr>`).join('');
+  setRows('<table>' + head + body + '</table>');
+}
+
+async function dismissGap(i) {
+  const q = (GAPROWS[i] || {}).query_text;
+  if (!q) return;
+  const r = await postJSON('/gaps/close', { query: q, status: 'dismissed' })
+    .catch(e => ({ ok: false, error: '' + e }));
+  $('#banner').innerHTML = `<div class="note">${r.ok
+    ? '✓ dismissed ' + (r.closed || 0) + ' gap(s)'
+    : '✗ ' + esc(r.error || 'failed — auth token?')}</div>`;
+  if (r.ok) load('gaps');
 }
 
 const BAND_COLOR = { high: '#22aa66', medium: '#e0a800', low: '#f5a623', contra: '#d9534f', none: '#888' };

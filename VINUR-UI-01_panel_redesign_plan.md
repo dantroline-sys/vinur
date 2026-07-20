@@ -54,7 +54,7 @@ concept, cards per 100 distilled chunks, merge-queue depth, open gaps) from
 the existing `/stats` + `/kb` counts; per-class counts as badges on the
 sub-tab pills.  Server change only if a count is missing and cheap.
 
-### Stage 4 — upkeep + curation actions
+### Stage 4 — upkeep + curation actions  ✅
 Overview gains an **Upkeep** box: refine / link / adjudicate / embed-nodes,
 each with a when/why note, a "Run now" (existing authed `POST /ops/run`) and
 a "Queue as Prioritizer step" (existing `/ops/autopilot`).  Signal chips
