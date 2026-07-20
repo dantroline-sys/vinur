@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import logging
 import os
+import re
 import subprocess
 import tempfile
 
@@ -19,6 +20,43 @@ from . import MissingDependency
 log = logging.getLogger("knowledgehost.sources.pdf")
 
 _errors_muted = False
+
+_PAGENO = re.compile(r"^\s*(page\s+)?\d{1,4}(\s+of\s+\d{1,4})?\s*$", re.I)
+
+
+def _strip_furniture(pages: list[str]) -> list[str]:
+    """Remove running headers/footers and bare page numbers.
+
+    A furniture line is one that (digits normalised away) recurs at the top or
+    bottom of ≥30% of pages — the running title/author/journal banner — or is a
+    bare page number.  Only the EDGES of each page are touched (first/last two
+    non-blank lines), so a body line that happens to match a banner is safe.
+    Needs ≥6 pages to establish a pattern; fewer pass through untouched."""
+    if len(pages) < 6:
+        return pages
+    norm = lambda ln: re.sub(r"\d+", "#", ln.strip()).lower()
+    seen: dict[str, int] = {}
+    edges = []
+    for p in pages:
+        idx = [i for i, ln in enumerate(p.splitlines()) if ln.strip()]
+        edge = set(idx[:2] + idx[-2:])
+        edges.append(edge)
+        lines = p.splitlines()
+        for i in edge:
+            k = norm(lines[i])
+            if k and k != "#":
+                seen[k] = seen.get(k, 0) + 1
+    thresh = max(3, int(len(pages) * 0.3))
+    banner = {k for k, n in seen.items() if n >= thresh}
+    out = []
+    for p, edge in zip(pages, edges):
+        kept = []
+        for i, ln in enumerate(p.splitlines()):
+            if i in edge and (_PAGENO.match(ln) or norm(ln) in banner):
+                continue
+            kept.append(ln)
+        out.append("\n".join(kept))
+    return out
 
 
 def _fitz():
@@ -133,6 +171,10 @@ def extract(path: str, cfg: dict):
                     pass
             if text.strip():
                 blocks.append((cur_heading, text))
+        # page furniture (running headers/footers, bare page numbers) is noise
+        # to the distiller and pollutes chunk text — strip it corpus-wide here
+        stripped = _strip_furniture([t for _, t in blocks])
+        blocks = [(h, t) for (h, _), t in zip(blocks, stripped) if t.strip()]
     finally:
         try:
             doc.close()

@@ -272,8 +272,10 @@ class KB:
         -- recard checkpoint: the cards-only re-pass (conversational card families)
         -- has covered this chunk — stamped by BOTH the full distill (which extracts
         -- the families inline) and the recard sweep, so a swept corpus stays swept.
+        -- `version` = the family roster the sweep offered (distill.RECARD_VERSION):
+        -- an older stamp re-opens the chunk for ONLY the families added since.
         CREATE TABLE IF NOT EXISTS recarded_chunks(
-            chunk_id TEXT PRIMARY KEY, recarded_at REAL);
+            chunk_id TEXT PRIMARY KEY, recarded_at REAL, version INTEGER DEFAULT 1);
 
         CREATE TABLE IF NOT EXISTS node_merge_candidates(
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -336,6 +338,22 @@ class KB:
         self._maybe_commit()
         self.migrate_card_layout()                # add §10 card columns to an existing DB
         self.migrate_source_layout()              # add the modular-bundle tag column
+        self.migrate_recard_version()             # add the family-version stamp
+
+    def migrate_recard_version(self) -> bool:
+        """Add the `version` stamp to a recarded_chunks created before family
+        versioning.  DEFAULT 1 back-fills existing rows correctly: they were
+        swept with the version-1 roster (the original four families)."""
+        cols = {r["name"] for r in self._raw.execute(
+            "PRAGMA table_info(recarded_chunks)").fetchall()}
+        if "version" in cols:
+            return False
+        with self._lock:
+            self._raw.execute(
+                "ALTER TABLE recarded_chunks ADD COLUMN version INTEGER DEFAULT 1")
+            self._raw.commit()
+        log.info("recarded_chunks: added family-version stamp")
+        return True
 
     def migrate_source_layout(self) -> list:
         """Add the modular-bundle tag (§16) and the licence columns (§16.4) to a
@@ -1173,13 +1191,23 @@ class KB:
         self._maybe_commit()
 
     def is_recarded(self, chunk_id) -> bool:
-        return self.db.execute("SELECT 1 FROM recarded_chunks WHERE chunk_id=?",
-                              (chunk_id,)).fetchone() is not None
+        return self.recard_version(chunk_id) >= 1
 
-    def mark_recarded(self, chunk_id):
+    def recard_version(self, chunk_id) -> int:
+        """The family-roster version this chunk was swept with; 0 = never."""
+        r = self.db.execute("SELECT version FROM recarded_chunks WHERE chunk_id=?",
+                            (chunk_id,)).fetchone()
+        return int(r[0] or 1) if r else 0
+
+    def mark_recarded(self, chunk_id, version: int = 1):
+        """Stamp the sweep version — upsert keeps the HIGHEST version seen, so a
+        concurrent older pass can never regress a chunk's roster."""
         self.db.execute(
-            "INSERT OR IGNORE INTO recarded_chunks(chunk_id,recarded_at) VALUES(?,?)",
-            (chunk_id, time.time()))
+            "INSERT INTO recarded_chunks(chunk_id,recarded_at,version) VALUES(?,?,?) "
+            "ON CONFLICT(chunk_id) DO UPDATE SET "
+            "recarded_at=excluded.recarded_at, "
+            "version=max(version, excluded.version)",
+            (chunk_id, time.time(), int(version)))
         self._maybe_commit()
 
     # ── viewer/eval support ──────────────────────────────────────────────────

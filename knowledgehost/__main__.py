@@ -275,7 +275,7 @@ def _run_recard(cfg, store, embedder, log, *, limit=None, bundle=None) -> int:
                                           limit=limit, bundle=bundle)
         log.info("recard: %s", stats)
         log.info("kb: %s", kb.counts())
-        ops_mod.emit_result(stats.get("chunks", 0) > 0 or stats.get("fiction", 0) > 0,
+        ops_mod.emit_result(stats.get("chunks", 0) > 0 or stats.get("no_menu", 0) > 0,
                             **stats)
     except BackendUnavailable as e:
         log.error("aborted (resumable): %s", e)

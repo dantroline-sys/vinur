@@ -162,6 +162,12 @@ DEFAULTS = {
     # Per-request latency grows with the batch: keep distill_timeout_s
     # comfortable (batching raises throughput, not single-request speed).
     "distill_parallel": 0,
+    # Chunk zones the distiller SKIPS (zones.classify: document furniture where
+    # nothing distillable lives — bibliographies also mint junk concepts).  The
+    # text stays in the store and FTS (library search still finds it); removing
+    # a zone here re-opens those chunks on the next distill pass.  "code" is a
+    # valid zone but never a sensible skip — code chunks get a tailored lens.
+    "distill_skip_zones": ["references", "toc", "index", "boilerplate"],
     # link_to_node identity policy (§9.4): bias toward NOT merging (under-merge is
     # recoverable, over-merge is destructive).
     "node_sim_high": 0.86,    # ≥ this + alias agreement => same node
@@ -506,7 +512,8 @@ _BOOL_KEYS = {"embed_task_prefix", "ocr", "verify", "strict",
               "ask_fit_gate", "use_spacy", "library_dense"}
 _LIST_KEYS = {"sources", "extensions", "distill_urls", "extract_urls", "verify_urls",
               "encrypted_bundles", "library_sources", "stopwords_extra",
-              "high_stakes_extra", "ops_regions", "ask_exclude_facets"}
+              "high_stakes_extra", "ops_regions", "ask_exclude_facets",
+              "distill_skip_zones"}
 
 
 def _coerce(key: str, value):
@@ -546,7 +553,7 @@ EDITABLE_SETTINGS = frozenset({
     # distillation budgets & the verify pipeline (not URLs/models)
     "verify", "verify_timeout_s", "verify_max_tokens", "verify_batch", "verify_source_chars",
     "extract_timeout_s", "extract_max_tokens", "distill_timeout_s", "distill_max_tokens",
-    "distill_parallel",
+    "distill_parallel", "distill_skip_zones",
     # telemetry cadence/retention (restart to apply; not the db path)
     "stats_interval_s", "stats_keep_days",
 

@@ -813,9 +813,12 @@ def main():
         or json.dumps({"misconceptions": [{"claim": "c", "truth": "t"}]}))
     ex2 = dl2.extract_extras({"text": "x"}, "empirical")
     assert ex2["misconceptions"] and ex2["branches"] == []
-    assert seen_schema[0] is D.RECARD_SCHEMA
+    assert set(seen_schema[0]["properties"]) == set(D.EXTRA_CARD_KEYS)
+    dl2.extract_extras({"text": "x"}, "empirical", families=("misconceptions",))
+    assert set(seen_schema[1]["properties"]) == {"misconceptions"}, \
+        "a families subset must narrow the schema too"
     assert dl2.extract_extras({"text": "x"}, "fictional") is None \
-        and len(seen_schema) == 1, "fiction must not spend an LM call"
+        and len(seen_schema) == 2, "fiction must not spend an LM call"
     dl2._content = lambda *a, **k: "not json"
     assert dl2.extract_extras({"text": "x"}, "empirical") == {}
     ok("recard: cards-only schema + regime menus + fiction short-circuit")
@@ -830,17 +833,18 @@ def main():
 
     class RecKB:
         def __init__(self, distilled, recarded, regimes):
-            self.distilled, self.recarded = set(distilled), set(recarded)
+            self.distilled = set(distilled)
+            self.recarded = dict(recarded)              # chunk_id -> version
             self.regimes, self.cards = regimes, []
 
         def is_distilled(self, cid):
             return cid in self.distilled
 
-        def is_recarded(self, cid):
-            return cid in self.recarded
+        def recard_version(self, cid):
+            return self.recarded.get(cid, 0)
 
-        def mark_recarded(self, cid):
-            self.recarded.add(cid)
+        def mark_recarded(self, cid, version=1):
+            self.recarded[cid] = max(self.recarded.get(cid, 0), version)
 
         def get_source(self, doc_id):
             r = self.regimes.get(doc_id)
@@ -864,48 +868,163 @@ def main():
         max_tokens = 256
         calls = []
 
-        def extract_extras(self, chunk, regime=None):
-            RecLM.calls.append((chunk["id"], regime))
+        def extract_extras(self, chunk, regime=None, families=None):
+            RecLM.calls.append((chunk["id"], regime, tuple(families or ())))
             return {"misconceptions": [{"claim": "x causes y", "truth": "it does not",
                                         "concept": "X-Y link"}]}
 
     rc_chunks = [
         {"id": "c1", "path_or_url": "doc://a", "title": "A", "text": "t"},  # eligible
         {"id": "c2", "path_or_url": "doc://b", "title": "B", "text": "t"},  # not distilled yet
-        {"id": "c3", "path_or_url": "doc://c", "title": "C", "text": "t"},  # already recarded
+        {"id": "c3", "path_or_url": "doc://c", "title": "C", "text": "t"},  # swept, current ver
         {"id": "c4", "path_or_url": "doc://f", "title": "F", "text": "t"},  # fiction: no LM call
     ]
-    rkb = RecKB(distilled={"c1", "c3", "c4"}, recarded={"c3"},
+    rkb = RecKB(distilled={"c1", "c3", "c4"}, recarded={"c3": D.RECARD_VERSION},
                 regimes={"doc://f": "fictional"})
     rcfg = {"distill_parallel": 1, "ingest_log_every": 0}
     rstats = D.recard_corpus(RecStore(rc_chunks), rkb, [RecLM()], StubEmb(), rcfg)
     assert rstats["chunks"] == 1 and rstats["cards"] == 1, rstats
-    assert rstats["fiction"] == 1 and rstats["skipped"] == 2, rstats
+    assert rstats["no_menu"] == 1 and rstats["skipped"] == 2, rstats
     assert rstats["extra_offered"] == 1 and rstats["extra_kept"] == 1
-    assert RecLM.calls == [("c1", None)]
-    assert "c1" in rkb.recarded and "c4" in rkb.recarded and "c2" not in rkb.recarded
+    assert RecLM.calls == [("c1", None, D.EXTRA_CARD_KEYS)]
+    assert rkb.recarded.get("c1") == D.RECARD_VERSION
+    assert rkb.recarded.get("c4") == D.RECARD_VERSION and "c2" not in rkb.recarded
     assert rkb.cards == [("n:x-y link", "misconception")]
     rstats2 = D.recard_corpus(RecStore(rc_chunks), rkb, [RecLM()], StubEmb(), rcfg)
     assert rstats2["chunks"] == 0 and rstats2["skipped"] == 4, rstats2
     assert len(RecLM.calls) == 1, "second sweep must not re-spend LM calls"
     ok("recard_corpus: distilled-not-recarded only, fiction marked free, resumable")
 
+    # ── family versioning: an old stamp re-opens the chunk for NEW families ──
+    RecLM.calls = []
+    rkb2 = RecKB(distilled={"c1"}, recarded={"c1": 1}, regimes={})
+    rstats3 = D.recard_corpus(RecStore(rc_chunks[:1]), rkb2, [RecLM()], StubEmb(), rcfg)
+    assert rstats3["chunks"] == 1, rstats3
+    assert RecLM.calls == [("c1", None, ("enumerations",))], \
+        "a v1-stamped chunk must be asked ONLY for the families added since"
+    assert rkb2.recarded["c1"] == D.RECARD_VERSION
+    hist = RecKB(distilled={"c1"}, recarded={"c1": 1},
+                 regimes={"doc://a": "historical"})
+    RecLM.calls = []
+    D.recard_corpus(RecStore(rc_chunks[:1]), hist, [RecLM()], StubEmb(), rcfg)
+    assert RecLM.calls and RecLM.calls[0][2] == ("enumerations",)
+    ok("versioned recard: v1 stamp -> enumerations only; stamp advances")
+
     # ── full distill stamps the recard checkpoint (swept corpus stays swept) ─
     seq_marks = []
     kb_seq = SimpleNamespace(
         is_distilled=lambda cid: False,
         mark_distilled=lambda cid: seq_marks.append(("d", cid)),
-        mark_recarded=lambda cid: seq_marks.append(("r", cid)),
+        mark_recarded=lambda cid, v=1: seq_marks.append(("r", cid, v)),
         batch=lambda: contextlib.nullcontext())
     dc0 = D.distill_chunk
     D.distill_chunk = lambda *a, **k: (1, 0, 0)
     try:
-        D._distill_sequential(RecStore([{"id": "z1"}]), kb_seq, RecLM(), StubEmb(),
-                              {"ingest_log_every": 0})
+        D._distill_sequential(RecStore([{"id": "z1", "text": "prose."}]), kb_seq,
+                              RecLM(), StubEmb(), {"ingest_log_every": 0})
     finally:
         D.distill_chunk = dc0
-    assert ("d", "z1") in seq_marks and ("r", "z1") in seq_marks, seq_marks
-    ok("full distill stamps recarded too — recard never re-charges fresh corpus")
+    assert ("d", "z1") in seq_marks and ("r", "z1", D.RECARD_VERSION) in seq_marks, seq_marks
+    ok("full distill stamps recarded at the CURRENT version")
+
+    # ── zones: structural furniture detection; body wins on doubt ───────────
+    from knowledgehost import zones as Z
+
+    refs = "\n".join(f"[{i}] Author, A. ({1990 + i}). Title of paper {i}. "
+                     f"Journal of Things, vol. {i}, pp. {i}0-{i}9."
+                     for i in range(1, 9))
+    toc = "\n".join(f"Chapter {i}: The Part About {i} ....... {i * 9}"
+                    for i in range(1, 8))
+    idx = "\n".join(f"aardvark{i}, {i}, {i + 3}-{i + 9}" for i in range(1, 10))
+    boiler = ("© 2021 Example House.\nAll rights reserved.\nISBN 978-0-00-000000-0\n"
+              "No part of this publication may be reproduced.")
+    code = "\n".join(["def frob(x):", "    y = x + 1", "    return y * 2",
+                      "class Widget:", "    def __init__(self):",
+                      "        self.n = 0", "import os", "for i in range(3):",
+                      "    print(i)"])
+    prose = ("Sara's children were named in the record. The wives of Henry VIII "
+             "were Catherine of Aragon, Anne Boleyn, Jane Seymour, Anne of "
+             "Cleves, Catherine Howard, and Catherine Parr. Each marriage "
+             "shaped the succession. The court watched closely.")
+    assert Z.classify("", refs) == "references"
+    assert Z.classify("3.1 References", "Some short text.") == "references"
+    assert Z.classify("", toc) == "toc"
+    assert Z.classify("Contents", "anything at all here.") == "toc"
+    assert Z.classify("", idx) == "index"
+    assert Z.classify("Index", "x") == "index"
+    assert Z.classify("", boiler) == "boilerplate"
+    assert Z.classify("", code) == "code"
+    assert Z.classify("", prose) == "body", "rosters/genealogy must stay body"
+    assert Z.classify("Chapter 2 > The Kings", prose) == "body"
+    ok("zones: references/toc/index/boilerplate/code by shape; prose stays body")
+
+    # ── zone skip wiring: pending generators drop furniture, stash the zone ──
+    zkb = RecKB(distilled=set(), recarded={}, regimes={})
+    zchunks = [{"id": "b1", "path_or_url": "d://1", "text": prose, "section": ""},
+               {"id": "r1", "path_or_url": "d://1", "text": refs, "section": ""},
+               {"id": "k1", "path_or_url": "d://1", "text": code, "section": ""}]
+    zc = [0, 0]
+    got_z = list(D._pending_chunks(RecStore(zchunks), zkb, zc, cfg={}))
+    assert [c["id"] for c in got_z] == ["b1", "k1"] and zc == [0, 1], (got_z, zc)
+    assert got_z[0]["zone"] == "body" and got_z[1]["zone"] == "code"
+    assert not list(D._pending_chunks(RecStore(zchunks), zkb, [0, 0],
+                                      cfg={"distill_skip_zones": ["references", "code"]}))[1:]
+    assert D._zone_skip_set({}) == frozenset(("references", "toc", "index", "boilerplate"))
+    assert D._zone_skip_set({"distill_skip_zones": []}) == frozenset()
+    ok("pending generators: furniture skipped + counted, zone stashed, knob works")
+
+    # ── code lens: a code-zone chunk changes the extraction instructions ─────
+    assert "CODE-DOMINANT" in D._system_for({"zone": "code"}, "empirical")
+    assert "CODE-DOMINANT" not in D._system_for({}, "empirical")
+    assert "CODE-DOMINANT" in D._recard_system({"zone": "code"}, "empirical")
+    ok("code lens rides both the full-distill and recard prompts")
+
+    # ── enumerations: the roster family (cleaner, menu, storage, question) ───
+    assert D._clean_enum({"relation": "wives", "items": [
+        {"name": "Catherine of Aragon", "note": "annulled"},
+        {"name": "Anne Boleyn"}, {"name": ""}],
+        "complete": True}) == {
+            "relation": "wives",
+            "items": [{"name": "Catherine of Aragon", "note": "annulled"},
+                      {"name": "Anne Boleyn"}],
+            "count": 2, "complete": True}
+    single = D._clean_enum({"relation": "children", "items": [{"name": "Isaac"}]})
+    assert single["count"] == 1 and "complete" not in single, \
+        "an enumeration of one is valid (the children of Sara)"
+    assert D._clean_enum({"items": [{"name": "x"}]}) == {}, "no relation, no roster"
+    assert "`enumerations` entry" in D._system_for({}, "historical")
+    assert "`enumerations` entry" not in D._recard_system(
+        {}, "empirical", ("branches",))
+    added.clear()
+    n = D._distil_extras(stubkb, StubEmb(), {
+        "enumerations": [{"title": "The wives of Henry VIII",
+                          "concept": "Henry VIII", "relation": "wives",
+                          "items": [{"name": "Catherine of Aragon"},
+                                    {"name": "Anne Boleyn"}], "complete": True}],
+    }, {}, "doc2", lambda c: "historical", lambda r: None)
+    assert n == 1 and added[0][1] == "enumeration" and added[0][0] == "n:henry viii"
+    assert added[0][3]["count"] == 2 and added[0][3]["complete"] is True
+    ok("enumerations: gated roster payload stored on the owner concept")
+
+    # ── pdf furniture: running banners + page numbers stripped at the edges ──
+    from knowledgehost.sources import pdf as pdfmod
+    body_lines = ["The abbey kept meticulous harvest records.",
+                  "Trade routes shifted after the flood.",
+                  "A new loom design spread through the guilds.",
+                  "The census listed every household by name.",
+                  "Grain prices fell for a decade afterwards.",
+                  "The bridge toll funded the town wall.",
+                  "Apprentices served seven years by charter.",
+                  "The mill changed hands three times."]
+    pages = [f"THE JOURNAL OF EXAMPLES  Vol. 3\n{body_lines[i]}\n"
+             f"{body_lines[(i + 1) % 8]}\nPage {i + 10}" for i in range(8)]
+    out = pdfmod._strip_furniture(pages)
+    assert all("JOURNAL OF EXAMPLES" not in p for p in out)
+    assert all(body_lines[i] in out[i] for i in range(8)), "body must survive"
+    assert all("Page" not in p for p in out)
+    short = ["A\nB", "C\nD"]
+    assert pdfmod._strip_furniture(short) == short, "too few pages: untouched"
+    ok("pdf furniture: banners/page numbers stripped, body kept, small docs safe")
 
     # ── recard registered end-to-end: ops verb, autopilot step + big-LM lane ─
     from knowledgehost import autopilot as AP_
