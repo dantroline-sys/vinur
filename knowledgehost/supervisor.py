@@ -495,6 +495,9 @@ def cmd_start() -> int:
     tk_warn = sv.toolkit_warning(cfg)
     if tk_warn:
         print(f"warning: {tk_warn}", file=sys.stderr)
+    px_warn = sv.proxy_warning(cfg)
+    if px_warn:
+        print(f"warning: {px_warn}", file=sys.stderr)
     LOGS.mkdir(parents=True, exist_ok=True)
 
     if os.fork() != 0:                                 # parent: report and leave

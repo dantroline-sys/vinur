@@ -167,14 +167,86 @@ def hf_env(cfg: dict, engine: str, root: Path = ROOT) -> dict:
     return out
 
 
+_PROXY_KEYS = ("http_proxy", "https_proxy", "all_proxy")
+# Never proxy the box's own services: the kb talks to its LMs over loopback,
+# and a proxy that swallows those is a very confusing outage.
+_LOCAL_HOSTS = ("localhost", "127.0.0.1", "::1")
+
+
+def _local_no_proxy(cfg: dict, current: str) -> str:
+    hosts = [h.strip() for h in (current or "").split(",") if h.strip()]
+    extra = list(_LOCAL_HOSTS)
+    for e in (cfg.get("serving") or {}).get("llms") or []:
+        h = str(e.get("host") or "").strip()
+        if h and h not in ("0.0.0.0", "::"):
+            extra.append(h)
+    for h in extra:
+        if h not in hosts:
+            hosts.append(h)
+    return ",".join(hosts)
+
+
+def proxy_env(cfg: dict) -> dict:
+    """Outbound-proxy environment for a serving engine.
+
+    Nothing in the stack reads OS proxy settings: vLLM does no proxying of its
+    own, huggingface_hub goes through requests (env vars only on Linux — no
+    GNOME/KDE settings) and the Xet backend through reqwest (env vars again).
+    So a proxied network must be declared, either in the shell or as
+    http_proxy/https_proxy/no_proxy in config.toml — and for engine="container"
+    it MUST be declared here, because host env doesn't cross into a container.
+
+    no_proxy always gains loopback and the declared serving hosts."""
+    out: dict = {}
+    for key in _PROXY_KEYS:
+        val = str(cfg.get(key) or os.environ.get(key)
+                  or os.environ.get(key.upper()) or "").strip()
+        if val:
+            out[key] = out[key.upper()] = val
+    if not out:
+        return {}                                  # no proxy: touch nothing
+    no_p = _local_no_proxy(cfg, str(cfg.get("no_proxy")
+                                    or os.environ.get("no_proxy")
+                                    or os.environ.get("NO_PROXY") or ""))
+    out["no_proxy"] = out["NO_PROXY"] = no_p
+    return out
+
+
+def proxy_warning(cfg: dict) -> str | None:
+    """Start-time preflight: a proxy is set in the SHELL but loopback isn't
+    exempt, so the host's own LM/embed calls would be sent to the proxy."""
+    if any(os.environ.get(k) or os.environ.get(k.upper()) for k in _PROXY_KEYS):
+        no_p = (os.environ.get("no_proxy") or os.environ.get("NO_PROXY") or "")
+        have = {h.strip() for h in no_p.split(",")}
+        if not have & set(_LOCAL_HOSTS):
+            return ("a proxy is set in the environment but no_proxy doesn't "
+                    "exempt loopback — this box's own calls to its LMs "
+                    "(127.0.0.1:…) would be sent to the proxy and fail. "
+                    "Add: export no_proxy=localhost,127.0.0.1,::1  (env.sh does "
+                    "this for services it starts; this warning is about your shell).")
+    return None
+
+
+def engine_env(cfg: dict, engine: str, root: Path = ROOT) -> dict:
+    """Everything a serving engine needs in its environment that isn't its
+    argv: Hugging Face auth/transfer, and proxy settings when the network
+    needs them."""
+    return {**hf_env(cfg, engine, root), **proxy_env(cfg)}
+
+
 # Secrets must never reach a log file: the exec: line prints the full argv,
 # and a container's env rides IN the argv as `-e KEY=value` pairs.
 _SECRET_ENV = re.compile(
     r"^([A-Za-z0-9_]*(?:TOKEN|SECRET|PASSWORD|API_KEY)[A-Za-z0-9_]*)=(.+)$")
 
 
+# A proxy URL routinely carries credentials in its userinfo (http://u:pw@host).
+_URL_USERINFO = re.compile(r"(://)[^/@\s]+:[^/@\s]+@")
+
+
 def redact_argv(cmd: list) -> list:
-    return [_SECRET_ENV.sub(r"\1=***", str(a)) for a in cmd]
+    return [_URL_USERINFO.sub(r"\1***:***@", _SECRET_ENV.sub(r"\1=***", str(a)))
+            for a in cmd]
 
 
 def container_name(entry_name: str) -> str:
@@ -916,10 +988,10 @@ def main(argv: list[str] | None = None) -> None:
             sys.exit(f"no serving.llms entry named '{ns.name}' "
                      f"(have: {', '.join(entries) or 'none'})")
         entry = entries[ns.name]
-        hf = hf_env(cfg, str(entry.get("engine") or ""))
+        hf = engine_env(cfg, str(entry.get("engine") or ""))
         if entry.get("engine") == "container":
-            # HF auth/transfer env must ride INTO the container as -e flags
-            # (host env doesn't cross); an explicit entry env still wins.
+            # HF auth/transfer + proxy env must ride INTO the container as -e
+            # flags (host env doesn't cross); an explicit entry env still wins.
             entry = {**entry, "env": {**hf, **dict(entry.get("env") or {})}}
         cmd = llm_argv(entry)
         if entry.get("engine") == "container":
@@ -930,7 +1002,7 @@ def main(argv: list[str] | None = None) -> None:
             # Per-model environment (env = { NVCC_APPEND_FLAGS = "...", ... }):
             # applied here, at exec time, so the supervisor path and a manual
             # `python -m knowledgehost.serving <name>` behave identically.
-            # HF env first — an explicit entry env overrides it.
+            # HF/proxy env first — an explicit entry env overrides it.
             os.environ.update(hf)
             env = entry.get("env")
             if isinstance(env, dict):

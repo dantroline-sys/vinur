@@ -26,6 +26,15 @@ export TRITON_CACHE_DIR="$KH_ROOT/var/cache/triton"
 # default would be ~/.local/share/uv).
 export UV_CACHE_DIR="$KH_ROOT/var/cache/uv"
 export UV_PYTHON_INSTALL_DIR="$KH_ROOT/var/uv/python"
+# On a proxied network, never proxy the box's own services: the kb reaches its
+# LMs over loopback, and Python's urllib has no built-in localhost bypass.
+if [ -n "${http_proxy:-}${https_proxy:-}${HTTP_PROXY:-}${HTTPS_PROXY:-}" ]; then
+    case ",${no_proxy:-},${NO_PROXY:-}," in
+        *,127.0.0.1,*) : ;;
+        *) export no_proxy="${no_proxy:+$no_proxy,}localhost,127.0.0.1,::1"
+           export NO_PROXY="$no_proxy" ;;
+    esac
+fi
 mkdir -p "$KH_ROOT/var/cache" "$KH_ROOT/var/tmp"
 
 # ── vk_require_tools: check for system tools, offer to install the missing ──

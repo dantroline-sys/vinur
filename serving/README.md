@@ -314,6 +314,38 @@ so you see the real sizes). Deleting a whole `models--…` folder un-downloads
 that model and nothing else; deleting stray `*.incomplete` blobs is always
 safe — a resumed fetch writes under a fresh name.
 
+### Behind a proxy
+
+**Nothing in this stack reads your OS or desktop proxy settings.** vLLM does no
+proxying of its own; the downloads happen in `huggingface_hub` (via `requests`)
+and, for Xet transfers, in a Rust `reqwest` client. On Linux both read the
+environment and nothing else — no GNOME/KDE settings, no `/etc` config. So the
+proxy has to be handed over explicitly:
+
+```toml
+http_proxy  = "http://proxy.example.internal:3128"
+https_proxy = "http://proxy.example.internal:3128"
+no_proxy    = "corp.internal"          # loopback is added for you
+```
+
+Setting it in the shell works too, but config.toml is the reliable place:
+
+- the supervisor's children inherit the environment the supervisor was
+  started with, and a systemd unit or cron start has no login shell;
+- **`engine = "container"` gets no host environment at all** — proxy vars must
+  ride in as `-e` flags, which is exactly what these keys do.
+
+`no_proxy` always gains `localhost,127.0.0.1,::1` plus every declared serving
+host: the knowledge host calls its own LMs over loopback, and Python's urllib
+has no built-in localhost bypass, so a proxy that swallows those requests looks
+like every model on the box going down at once. `./vinur.sh start` warns if
+your shell has a proxy set without that exemption. Credentials embedded in a
+proxy URL are redacted from the `exec:` log line.
+
+If a download fails only under Xet, set `HF_HUB_DISABLE_XET=1` to fall back to
+plain HTTPS through `requests` — a proxy that inspects TLS sometimes upsets the
+Xet client's connection reuse.
+
 **Gated repos** (Llama, some Mistral originals): accept the license on
 huggingface.co once, create a read token there, and export it before
 starting: `export HF_TOKEN=hf_...`. The recommended pair above is not gated.

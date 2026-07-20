@@ -708,6 +708,45 @@ def main():
     assert "hf_token" not in _ss(), "a secret must never surface in the panel schema"
     ok("hf_env: cfg token wins, transfer flag guarded by venv; argv redacted")
 
+    # ── proxy: nothing in the stack reads OS proxy settings, so we pass it ───
+    pcfg = {"serving": {"llms": [{"name": "a", "host": "10.0.0.5"}]},
+            "http_proxy": "http://proxy.corp:3128"}
+    px = sv.proxy_env(pcfg)
+    assert px["http_proxy"] == px["HTTP_PROXY"] == "http://proxy.corp:3128", px
+    # loopback must never go through a proxy — the kb calls its own LMs there —
+    # and a declared serving host is local traffic too
+    for h in ("localhost", "127.0.0.1", "::1", "10.0.0.5"):
+        assert h in px["no_proxy"].split(","), (h, px)
+    assert px["no_proxy"] == px["NO_PROXY"]
+    env0 = {k: os.environ.get(k) for k in ("http_proxy", "HTTP_PROXY", "no_proxy")}
+    try:
+        for k in env0:
+            os.environ.pop(k, None)
+        assert sv.proxy_env({"serving": {"llms": []}}) == {}   # unproxied box: untouched
+        assert sv.proxy_warning({}) is None
+        # a shell proxy with no loopback exemption is the trap worth naming
+        os.environ["http_proxy"] = "http://proxy.corp:3128"
+        assert "no_proxy doesn't exempt loopback" in (sv.proxy_warning({}) or "")
+        os.environ["no_proxy"] = "localhost,127.0.0.1"
+        assert sv.proxy_warning({}) is None
+        # the shell's proxy is inherited by an engine when config doesn't set one
+        inherited = sv.proxy_env({"serving": {"llms": []}})
+        assert inherited["http_proxy"] == "http://proxy.corp:3128", inherited
+        # …and engine_env is what the exec path applies: HF auth + proxy together,
+        # which is what makes a CONTAINER (no host env) able to download at all
+        merged = sv.engine_env({"serving": {"llms": []}, "hf_token": "hf_x"}, "container")
+        assert merged["HF_TOKEN"] == "hf_x" and merged["http_proxy"], merged
+    finally:
+        for k, v in env0.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+    # credentials in a proxy URL must not land in the exec: log line
+    red = sv.redact_argv(["podman", "-e", "http_proxy=http://bob:hunter2@proxy:3128"])
+    assert "hunter2" not in red[-1] and "***:***@proxy:3128" in red[-1], red
+    ok("proxy_env: passed to engines, loopback exempt, warning + credentials redacted")
+
     print(f"swap_test: {PASS} checks OK")
 
 

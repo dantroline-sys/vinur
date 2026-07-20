@@ -171,6 +171,17 @@ DEFAULTS = {
     # venv that ships that package instead (serving.hf_env picks per engine).
     "hf_token": "",
     "hf_transfer": True,
+    # Outbound proxy, for a box that reaches the internet through one.  NOTHING
+    # in the stack reads OS/desktop proxy settings — vLLM proxies nothing
+    # itself, huggingface_hub (requests) and the Xet backend (reqwest) read
+    # these environment variables and no more.  Leave empty to inherit the
+    # shell's; set them here when services are started by the supervisor, and
+    # ALWAYS for engine="container" (host env does not cross into a container).
+    # Loopback and the declared serving hosts are added to no_proxy for you —
+    # the host's own LM calls must never go out through a proxy.
+    "http_proxy": "",
+    "https_proxy": "",
+    "no_proxy": "",
     # Chunk zones the distiller SKIPS (zones.classify: document furniture where
     # nothing distillable lives — bibliographies also mint junk concepts).  The
     # text stays in the store and FTS (library search still finds it); removing

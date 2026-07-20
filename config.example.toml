@@ -157,6 +157,23 @@ distill_parallel = 0
 hf_token    = ""
 hf_transfer = true
 
+# ── Outbound proxy (only if this box reaches the internet through one) ───────
+# NOTHING in the serving stack reads OS or desktop proxy settings.  vLLM does
+# no proxying of its own; huggingface_hub goes through requests and the Xet
+# backend through reqwest, and on Linux both read ONLY these environment
+# variables.  So a proxy has to be declared — in the shell before ./vinur.sh,
+# or here, which is the reliable place because:
+#   * the supervisor's children inherit whatever the supervisor was started
+#     with, and a systemd unit or a cron start has no login shell, and
+#   * engine = "container" gets NO host environment at all — proxy settings
+#     must ride in as -e flags, which is what setting them here does.
+# Loopback and every declared serving host are added to no_proxy automatically
+# (the kb calls its own LMs; those must never leave the box).  Credentials in
+# a proxy URL are redacted from the exec: log line.
+# http_proxy  = "http://proxy.example.internal:3128"
+# https_proxy = "http://proxy.example.internal:3128"
+# no_proxy    = "corp.internal"
+
 # Chunk ZONES the distiller skips — document furniture with nothing to learn
 # (bibliographies also mint junk concepts from author names).  Zoning is
 # structural (line shapes, zones.py), computed at distill time, never stored:
