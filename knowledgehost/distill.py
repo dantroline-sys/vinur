@@ -229,9 +229,121 @@ DISTILL_SCHEMA = {
                 "required": ["title"],
             },
         },
+        # conditional guidance: WHICH way to go, given the situation (+ what to
+        # ASK when the context doesn't yet discriminate between the options)
+        "branches": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "title": {"type": "string"},
+                    "concept": {"type": "string"},
+                    "situation": {"type": "string"},
+                    "options": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "properties": {"when": {"type": "string"},
+                                           "then": {"type": "string"},
+                                           "because": {"type": "string"}},
+                            "required": ["when", "then"],
+                        },
+                    },
+                    "ask_next": {"type": "array", "items": {"type": "string"}},
+                    "default": {"type": "string"},
+                    "regime": {"type": "string",
+                               "enum": ["empirical", "conventional", "fictional",
+                                        "interpretive", "historical", ""]},
+                    "evidence": {"type": "string"},
+                },
+                "required": ["title", "options"],
+            },
+        },
+        # fault ISOLATION: symptom → likely causes, cheapest test first
+        "troubleshooting": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "title": {"type": "string"},
+                    "concept": {"type": "string"},
+                    "symptom": {"type": "string"},
+                    "causes": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "properties": {"cause": {"type": "string"},
+                                           "likelihood": {"type": "string",
+                                                          "enum": ["common", "occasional",
+                                                                   "rare", ""]},
+                                           "test": {"type": "string"},
+                                           "fix": {"type": "string"}},
+                            "required": ["cause"],
+                        },
+                    },
+                    "regime": {"type": "string",
+                               "enum": ["empirical", "conventional", "fictional",
+                                        "interpretive", "historical", ""]},
+                    "evidence": {"type": "string"},
+                },
+                "required": ["title", "causes"],
+            },
+        },
+        # what NORMALLY happens after an event/action — and what would be alarming
+        "expectations": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "title": {"type": "string"},
+                    "concept": {"type": "string"},
+                    "after": {"type": "string"},
+                    "timeline": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "properties": {"phase": {"type": "string"},
+                                           "normal": {"type": "string"},
+                                           "alarming": {"type": "string"}},
+                            "required": ["phase", "normal"],
+                        },
+                    },
+                    "red_flags": {"type": "array", "items": {"type": "string"}},
+                    "regime": {"type": "string",
+                               "enum": ["empirical", "conventional", "fictional",
+                                        "interpretive", "historical", ""]},
+                    "evidence": {"type": "string"},
+                },
+                "required": ["title", "timeline"],
+            },
+        },
+        # a common false belief the passage CORRECTS
+        "misconceptions": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "concept": {"type": "string"},
+                    "claim": {"type": "string"},
+                    "truth": {"type": "string"},
+                    "why_believed": {"type": "string"},
+                    "regime": {"type": "string",
+                               "enum": ["empirical", "conventional", "fictional",
+                                        "interpretive", "historical", ""]},
+                    "evidence": {"type": "string"},
+                },
+                "required": ["claim", "truth"],
+            },
+        },
     },
     "required": ["concepts"],
 }
+
+# The four conversational card families (VINUR card brainstorm, 2026-07-20).
+# Kept OUT of _CORE: each regime's menu below offers only the shapes its text
+# can plausibly yield, so the prompt stays sharp (offer-everything is how a
+# schema slot ends up never filled).
+EXTRA_CARD_KEYS = ("branches", "troubleshooting", "expectations", "misconceptions")
 
 # The prompt is assembled per chunk: a shared CORE (what to extract, how to build
 # REUSABLE hub structure and BRANCHING question coverage) plus a per-text-type LENS
@@ -342,6 +454,53 @@ _SECURITY = (
 )
 
 
+# Per-type elicitation for the conversational card families.  Written in the
+# same register as _CORE: a crisp WHEN-trigger per type, so the LM fills a slot
+# only when the passage actually has that shape.
+_EXTRA_CARD_PROMPTS = {
+    "branches": (
+        "- branches: WHEN the passage gives CONDITIONAL guidance — different "
+        "situations lead to different actions or paths ('if X do A; if Y prefer "
+        "B') — emit a `branches` entry: `title`, the `concept`, the `situation` "
+        "it arises in, `options` [{when, then, because}], `ask_next` (the "
+        "question(s) that would DISCRIMINATE between the options when the "
+        "context doesn't yet say — what you would ask to learn which branch "
+        "applies), and a `default` when one is stated. This is how an assistant "
+        "knows where to go next in a scenario — never flatten a genuine fork "
+        "into a single procedure.\n"),
+    "troubleshooting": (
+        "- troubleshooting: WHEN the passage explains diagnosing a FAILURE or "
+        "problem ('X doesn't work / hurts / won't start'), emit a "
+        "`troubleshooting` entry: `title`, `concept`, the `symptom`, and "
+        "`causes` ordered most-likely / cheapest-to-test first, each {cause, "
+        "likelihood: common|occasional|rare, test, fix}. This is fault "
+        "ISOLATION (which cause is it) — distinct from `criteria` (does a "
+        "label fit).\n"),
+    "expectations": (
+        "- expectations: WHEN the passage says what NORMALLY happens after an "
+        "event, action or exposure — and what would be abnormal — emit an "
+        "`expectations` entry: `title`, `concept`, `after` (the event), a "
+        "`timeline` [{phase, normal, alarming}], and `red_flags`. This is how "
+        "the base answers 'is this normal?' — don't leave it buried in prose.\n"),
+    "misconceptions": (
+        "- misconceptions: WHEN the passage CORRECTS a common false belief, "
+        "emit a `misconceptions` entry: the `concept`, the false `claim` as "
+        "commonly stated, the `truth`, and `why_believed` (why the belief "
+        "persists) when given. Only corrections the passage itself makes — "
+        "never invent controversy.\n"),
+}
+
+# Which extra families each text type is OFFERED (empty for fiction — the §8
+# narrative pass owns that lane).  None-key = format-fallback default.
+_EXTRA_MENU = {
+    "empirical": EXTRA_CARD_KEYS,
+    "conventional": ("branches", "troubleshooting", "misconceptions"),
+    "interpretive": ("branches", "misconceptions"),
+    "historical": ("misconceptions",),
+    "fictional": (),
+}
+
+
 def _system_for(chunk: dict, regime: str | None = None) -> str:
     """Assemble the extraction prompt adapted to the source's text type.  `regime`
     is the source's EFFECTIVE regime (honours a registry re-tag) when known; else we
@@ -351,7 +510,9 @@ def _system_for(chunk: dict, regime: str | None = None) -> str:
         stype = (chunk.get("source_type") or "unknown").strip().lower()
         regime = TYPE_REGIME.get(stype, "empirical")
     lens = _LENS.get(regime, _LENS["empirical"])
-    return _CORE + lens + _SECURITY
+    menu = _EXTRA_MENU.get(regime, EXTRA_CARD_KEYS)
+    extra = "".join(_EXTRA_CARD_PROMPTS[k] for k in menu)
+    return _CORE + extra + lens + _SECURITY
 
 
 def _user_prompt(chunk: dict) -> str:
@@ -545,19 +706,21 @@ class DistillLM:
             return None
 
     def extract(self, chunk: dict, regime: str | None = None):
-        """Return (concepts, relations, procedures, criteria).  concepts is None if
-        nothing parsed.  `regime` selects the text-type lens (the source's effective
-        regime); omitted => derived from the chunk's format.  Raises BackendUnavailable
-        if the endpoint is unreachable."""
+        """Return (concepts, relations, procedures, criteria, extras) — extras is
+        {family: [items]} for the conversational card families (EXTRA_CARD_KEYS).
+        concepts is None if nothing parsed.  `regime` selects the text-type lens
+        (the source's effective regime); omitted => derived from the chunk's
+        format.  Raises BackendUnavailable if the endpoint is unreachable."""
         content = self._content(_system_for(chunk, regime), _user_prompt(chunk),
                                 DISTILL_SCHEMA, self.max_tokens)
         if content is None:
             log.warning("no distillation content — skipping chunk")
-            return None, [], [], []
+            return None, [], [], [], {}
         try:
             obj = json.loads(_first_json(content))
             return (obj.get("concepts") or []), (obj.get("relations") or []), \
-                   (obj.get("procedures") or []), (obj.get("criteria") or [])
+                   (obj.get("procedures") or []), (obj.get("criteria") or []), \
+                   {k: (obj.get(k) or []) for k in EXTRA_CARD_KEYS}
         except (ValueError, AttributeError):
             # Truncated (hit max_tokens) or malformed — recover whatever concept
             # objects DID complete rather than losing the chunk (rest is lost).
@@ -565,9 +728,9 @@ class DistillLM:
             if salvaged:
                 log.warning("distillation output truncated — salvaged %d concept(s); "
                             "raise distill_max_tokens if frequent", len(salvaged))
-                return salvaged, [], [], []
+                return salvaged, [], [], [], {}
             log.warning("unparseable distillation output — skipping chunk")
-            return None, [], [], []
+            return None, [], [], [], {}
 
     def extract_typed(self, chunk: dict, card_type: str) -> dict:
         """One hinted typed card (requirements/decision/playbook/case) from a research
@@ -826,7 +989,8 @@ def _precompute_node_embeds(base, gen) -> dict:
 # Reset per distill_corpus run; typed research-drop cards are not tracked here
 # (they come from a separate per-drop call, not the main arrays).
 _STAGE_LOCK = threading.Lock()
-_STAGE = {"proc_offered": 0, "crit_offered": 0, "proc_kept": 0, "crit_kept": 0}
+_STAGE = {"proc_offered": 0, "crit_offered": 0, "proc_kept": 0, "crit_kept": 0,
+          "extra_offered": 0, "extra_kept": 0}   # the conversational families
 
 
 def _stage_add(**kw):
@@ -848,8 +1012,9 @@ def stage_stats() -> dict:
 
 def _stage_line() -> str:
     st = stage_stats()
-    return (f"[LM offered {st['proc_offered']} proc / {st['crit_offered']} crit; "
-            f"kept {st['proc_kept']} / {st['crit_kept']}]")
+    return (f"[LM offered {st['proc_offered']} proc / {st['crit_offered']} crit / "
+            f"{st['extra_offered']} conv; "
+            f"kept {st['proc_kept']} / {st['crit_kept']} / {st['extra_kept']}]")
 
 
 def distill_chunk(kb, lm, embedder, chunk: dict, extraction=None,
@@ -925,12 +1090,13 @@ def distill_chunk(kb, lm, embedder, chunk: dict, extraction=None,
     # `extraction` lets a worker thread do the slow LM call off the KB lock; when
     # absent we extract here (sequential path).
     if extraction is None:
-        concepts, relations, procedures, criteria = lm.extract(chunk, src_regime)  # may raise BackendUnavailable
-    else:
-        # tolerate a 3-tuple from an older extractor (no criteria array)
-        concepts, relations, procedures, *rest = extraction
-        criteria = rest[0] if rest else []
-    _stage_add(proc_offered=len(procedures or []), crit_offered=len(criteria or []))
+        extraction = lm.extract(chunk, src_regime)   # may raise BackendUnavailable
+    # tolerate 3-/4-tuples from an older/stubbed extractor (no criteria/extras)
+    concepts, relations, procedures, *rest = extraction
+    criteria = rest[0] if rest else []
+    extras = rest[1] if len(rest) > 1 and isinstance(rest[1], dict) else {}
+    _stage_add(proc_offered=len(procedures or []), crit_offered=len(criteria or []),
+               extra_offered=sum(len(v or []) for v in extras.values()))
     if not concepts:                          # None (parse fail) or [] (nothing to learn)
         return _finish(0, 0, 0)               # fiction pass may still have content
 
@@ -1008,8 +1174,10 @@ def distill_chunk(kb, lm, embedder, chunk: dict, extraction=None,
                                 claim_regime, claim_scope)
     n_crit = _distil_criteria(kb, embedder, criteria, nodemap, doc_id,
                               claim_regime, claim_scope)
-    _stage_add(proc_kept=n_proc, crit_kept=n_crit)
-    return _finish(len(clean), n_rel, n_proc + n_crit, nodemap)
+    n_extra = _distil_extras(kb, embedder, extras, nodemap, doc_id,
+                             claim_regime, claim_scope)
+    _stage_add(proc_kept=n_proc, crit_kept=n_crit, extra_kept=n_extra)
+    return _finish(len(clean), n_rel, n_proc + n_crit + n_extra, nodemap)
 
 
 def distill_narrative(kb, lm, embedder, narr: dict, doc_id, world, nodemap) -> tuple:
@@ -1190,6 +1358,186 @@ def _distil_criteria(kb, embedder, criteria, nodemap, doc_id,
         kb.add_surface_question("card", cid, q, qv)
         n += 1
     return n
+
+
+# ── the conversational card families (branch / troubleshooting / expectation /
+#    misconception) — payload cleaners return {} when the item lacks its shape ──
+
+def _clean_branch(b: dict) -> dict:
+    opts = []
+    for o in (b.get("options") or []):
+        if not isinstance(o, dict):
+            continue
+        when = sanitize.clean(str(o.get("when") or ""), 160).strip()
+        then = sanitize.clean(str(o.get("then") or ""), 240).strip()
+        if not (when and then):
+            continue
+        item = {"when": when, "then": then}
+        why = sanitize.clean(str(o.get("because") or ""), 200).strip()
+        if why:
+            item["because"] = why
+        opts.append(item)
+        if len(opts) >= 8:
+            break
+    ask = [sanitize.clean(str(q), 160).strip()
+           for q in (b.get("ask_next") or [])[:4] if str(q).strip()]
+    # a fork needs >=2 ways out — OR one way plus the question that reveals it
+    if len(opts) < 2 and not (opts and ask):
+        return {}
+    out = {"options": opts}
+    sit = sanitize.clean(b.get("situation") or "", 240).strip()
+    if sit:
+        out["situation"] = sit
+    if ask:
+        out["ask_next"] = ask
+    dflt = sanitize.clean(b.get("default") or "", 200).strip()
+    if dflt:
+        out["default"] = dflt
+    return out
+
+
+def _clean_trouble(t: dict) -> dict:
+    causes = []
+    for c in (t.get("causes") or []):
+        if not isinstance(c, dict):
+            continue
+        cause = sanitize.clean(str(c.get("cause") or ""), 200).strip()
+        if not cause:
+            continue
+        item = {"cause": cause}
+        lk = (c.get("likelihood") or "").strip().lower()
+        if lk in ("common", "occasional", "rare"):
+            item["likelihood"] = lk
+        for k, cap in (("test", 200), ("fix", 240)):
+            v = sanitize.clean(str(c.get(k) or ""), cap).strip()
+            if v:
+                item[k] = v
+        causes.append(item)
+        if len(causes) >= 8:
+            break
+    if not causes:
+        return {}
+    out = {"causes": causes}
+    sym = sanitize.clean(t.get("symptom") or "", 240).strip()
+    if sym:
+        out["symptom"] = sym
+    return out
+
+
+def _clean_expect(e: dict) -> dict:
+    phases = []
+    for p in (e.get("timeline") or []):
+        if not isinstance(p, dict):
+            continue
+        phase = sanitize.clean(str(p.get("phase") or ""), 120).strip()
+        normal = sanitize.clean(str(p.get("normal") or ""), 240).strip()
+        if not (phase and normal):
+            continue
+        item = {"phase": phase, "normal": normal}
+        alarm = sanitize.clean(str(p.get("alarming") or ""), 240).strip()
+        if alarm:
+            item["alarming"] = alarm
+        phases.append(item)
+        if len(phases) >= 8:
+            break
+    if not phases:
+        return {}
+    out = {"timeline": phases}
+    after = sanitize.clean(e.get("after") or "", 200).strip()
+    if after:
+        out["after"] = after
+    flags = [sanitize.clean(str(f), 200).strip()
+             for f in (e.get("red_flags") or [])[:6] if str(f).strip()]
+    if flags:
+        out["red_flags"] = flags
+    return out
+
+
+def _clean_miscon(m: dict) -> dict:
+    claim = sanitize.clean(m.get("claim") or "", 300).strip()
+    truth = sanitize.clean(m.get("truth") or "", 400).strip()
+    if not (claim and truth):
+        return {}
+    out = {"claim": claim, "truth": truth}
+    why = sanitize.clean(m.get("why_believed") or "", 300).strip()
+    if why:
+        out["why_believed"] = why
+    return out
+
+
+# family -> (card_type, cleaner, embed-text builder, retrieval question builder)
+_EXTRA_SPECS = {
+    "branches": ("branch", _clean_branch,
+                 lambda t, p: f"{t}. {p.get('situation', '')}. "
+                              + " / ".join(o["when"] for o in p["options"]),
+                 lambda t, p: f"Which option applies for {t}?"),
+    "troubleshooting": ("troubleshooting", _clean_trouble,
+                        lambda t, p: f"{t}. {p.get('symptom', '')}. "
+                                     + ", ".join(c["cause"] for c in p["causes"][:8]),
+                        lambda t, p: f"Why is {p.get('symptom') or t} happening "
+                                     f"and how do you fix it?"),
+    "expectations": ("expectation", _clean_expect,
+                     lambda t, p: f"{t}. after {p.get('after', '')}. "
+                                  + "; ".join(ph["normal"] for ph in p["timeline"][:6]),
+                     lambda t, p: f"What is normal after {p.get('after') or t}?"),
+    "misconceptions": ("misconception", _clean_miscon,
+                       lambda t, p: f"{p['claim']} {p['truth']}",
+                       lambda t, p: f"Is it true that {p['claim']}"),
+}
+
+
+def _distil_extras(kb, embedder, extras, nodemap, doc_id,
+                   claim_regime, claim_scope) -> int:
+    """Store the conversational card families.  Mirrors _distil_criteria: each
+    kept item is attached to its concept node (created if the generic pass
+    didn't) and embedded on its identifying text + a retrieval question, and
+    its content rides the generic typed-card payload (`criteria` column) — so
+    rendering, fit-gating and the one-card-factory principle all hold."""
+    total = 0
+    for family, items in (extras or {}).items():
+        spec = _EXTRA_SPECS.get(family)
+        if not spec or not items:
+            continue
+        ctype, cleaner, embed_text, question = spec
+        kept = []
+        for it in items[:8]:
+            if not isinstance(it, dict):
+                continue
+            pay = cleaner(it)
+            if not pay:
+                continue
+            title = sanitize.clean(
+                it.get("title") or (f"Misconception: {pay['claim']}"
+                                    if family == "misconceptions" else ""), 200).strip()
+            if not title:
+                continue
+            kept.append((it, pay, title))
+        if not kept:
+            continue
+        need = []
+        for it, _pay, title in kept:
+            lab = (it.get("concept") or title).strip()
+            if lab.lower() not in nodemap and lab.lower() not in {n.lower() for n in need}:
+                need.append(lab)
+        for lab, v in zip(need, _embed_all(embedder, need)):
+            nid, _ = kb.link_to_node(lab, "concept", v)
+            nodemap[lab.lower()] = nid
+        card_vecs = _embed_all(embedder, [embed_text(t, p) for _, p, t in kept])
+        qs = [question(t, p) for _, p, t in kept]
+        q_vecs = _embed_all(embedder, qs)
+        for (it, pay, title), cv, q, qv in zip(kept, card_vecs, qs, q_vecs):
+            lab = (it.get("concept") or title).strip().lower()
+            node_id = nodemap.get(lab)
+            if not node_id:
+                continue
+            creg = claim_regime(it)
+            cid, _ = kb.add_card(
+                node_id, title=title, card_type=ctype, criteria=pay,
+                regime=creg, scope=claim_scope(creg), doc_id=doc_id,
+                evidence=sanitize.clean(it.get("evidence") or "", 200), embedding=cv)
+            kb.add_surface_question("card", cid, q, qv)
+            total += 1
+    return total
 
 
 # ── typed cards from research-drop hints (brains) ───────────────────────────────
@@ -1487,20 +1835,20 @@ def distill_corpus(store, kb, extractors, embedder, cfg, *, limit=None, verifier
     res.update(st)
     # Card-drought diagnosis: say WHY zero, not just that it was zero.
     if res.get("chunks") and not res.get("cards"):
-        if st["proc_offered"] or st["crit_offered"]:
+        if st["proc_offered"] or st["crit_offered"] or st["extra_offered"]:
             log.warning(
-                "0 cards stored but the LM offered %d procedure(s) / %d criteria "
-                "this run — validation dropped them all (missing title/steps, or "
-                "chunks whose concepts came back empty).  Format drift after a "
-                "serving-model change is the usual cause.",
-                st["proc_offered"], st["crit_offered"])
+                "0 cards stored but the LM offered %d procedure(s) / %d criteria / "
+                "%d conversational card(s) this run — validation dropped them all "
+                "(missing title/steps/options, or chunks whose concepts came back "
+                "empty).  Format drift after a serving-model change is the usual "
+                "cause.", st["proc_offered"], st["crit_offered"], st["extra_offered"])
         else:
             log.info(
-                "0 cards: the LM offered no procedures/criteria across %d chunk(s). "
-                "Either this corpus has no how-to/diagnostic content (normal for "
-                "encyclopedic text — concepts and edges still accrue), or the model "
-                "is taking the empty-array exit under strict json_schema "
-                "(procedures/criteria are optional fields).", res["chunks"])
+                "0 cards: the LM offered no procedures/criteria/conversational "
+                "cards across %d chunk(s).  Either this corpus has none of those "
+                "shapes (normal for encyclopedic text — concepts and edges still "
+                "accrue), or the model is taking the empty-array exit under strict "
+                "json_schema (all card arrays are optional fields).", res["chunks"])
     return res
 
 
@@ -1771,10 +2119,12 @@ def _distill_pipeline(store, kb, extractors, verifiers, embedder, cfg, *, limit=
                     ch, reg, gen, narr = b
                     if j in res:
                         co, rl, pr, vs = res[j]
-                        # Carry the draft's criteria through — the verifier only vets
-                        # concepts/relations/procedures, and rebuilding a 3-tuple here
-                        # silently dropped every diagnostic-criteria card in pipeline mode.
-                        gen = (co, rl, pr, b[2][3] if len(b[2]) > 3 else [])
+                        # Carry the draft's criteria AND extras through — the verifier
+                        # only vets concepts/relations/procedures, and rebuilding a
+                        # short tuple here once silently dropped every diagnostic-
+                        # criteria card in pipeline mode (same trap for extras).
+                        gen = (co, rl, pr, b[2][3] if len(b[2]) > 3 else [],
+                               b[2][4] if len(b[2]) > 4 else {})
                         with lock:
                             st["rejected"] += vs["rejected"]
                             st["adjusted"] += vs["adjusted"]

@@ -708,6 +708,92 @@ def main():
         D._distill_parallel, D._distill_sequential = par0, seq0
     ok("distill_corpus: one vLLM endpoint -> parallel x8; llama endpoint -> sequential")
 
+    # ── conversational card families: cleaners are shape-gated ──────────────
+    b = D._clean_branch({"situation": "s", "options": [
+        {"when": "cold", "then": "use A", "because": "b"},
+        {"when": "hot", "then": "use B"}, {"when": "", "then": "x"}],
+        "ask_next": ["Which temp?"], "default": "A"})
+    assert len(b["options"]) == 2 and b["ask_next"] == ["Which temp?"]
+    assert b["default"] == "A" and b["options"][0]["because"] == "b"
+    assert D._clean_branch({"options": [{"when": "x", "then": "y"}]}) == {}, \
+        "one option and no ask_next is not a fork"
+    assert D._clean_branch({"options": [{"when": "x", "then": "y"}],
+                            "ask_next": ["q?"]})["options"]
+    t = D._clean_trouble({"symptom": "won't start", "causes": [
+        {"cause": "dead battery", "likelihood": "common", "test": "lights?", "fix": "charge"},
+        {"cause": "no fuel", "likelihood": "bogus"}, {}]})
+    assert [c["cause"] for c in t["causes"]] == ["dead battery", "no fuel"]
+    assert "likelihood" not in t["causes"][1] and t["symptom"] == "won't start"
+    e = D._clean_expect({"after": "vaccination", "timeline": [
+        {"phase": "day 1", "normal": "sore arm", "alarming": "hives"},
+        {"phase": "", "normal": "x"}], "red_flags": ["anaphylaxis"]})
+    assert len(e["timeline"]) == 1 and e["red_flags"] == ["anaphylaxis"]
+    m = D._clean_miscon({"claim": "sugar causes hyperactivity",
+                         "truth": "trials show no effect", "why_believed": "expectancy"})
+    assert m["why_believed"] == "expectancy"
+    assert D._clean_miscon({"claim": "x"}) == {}
+    ok("conversational cleaners: shape-gated, enum-guarded, junk dropped")
+
+    # ── regime menus: each text type is offered only its plausible shapes ───
+    sysE = D._system_for({"source_type": "pdf"}, "empirical")
+    sysH = D._system_for({}, "historical")
+    sysF = D._system_for({}, "fictional")
+    for marker in ("`branches` entry", "`troubleshooting` entry",
+                   "`expectations` entry", "`misconceptions` entry"):
+        assert marker in sysE, marker
+    assert "`misconceptions` entry" in sysH and "`troubleshooting` entry" not in sysH
+    assert not any(f"`{k}` entry" in sysF for k in D.EXTRA_CARD_KEYS)
+    ok("regime menus: empirical gets all four, historical trims, fiction none")
+
+    # ── extract(): 5-tuple with the extras dict; parse-fail keeps shape ─────
+    dl = D.DistillLM({"distill_url": "http://x", "distill_model": "m",
+                      "distill_timeout_s": 5})
+    payload = {"concepts": [{"label": "L", "kind": "k", "summary": "s", "evidence": "e"}],
+               "branches": [{"title": "T", "options": [{"when": "a", "then": "b"},
+                                                       {"when": "c", "then": "d"}]}],
+               "misconceptions": [{"claim": "c", "truth": "t"}]}
+    dl._content = lambda *a, **k: json.dumps(payload)
+    co, rl, pr, cr, ex = dl.extract({"text": "x"}, "empirical")
+    assert co and ex["branches"] and ex["misconceptions"]
+    assert ex["troubleshooting"] == [] and ex["expectations"] == []
+    dl._content = lambda *a, **k: None
+    assert dl.extract({"text": "x"}) == (None, [], [], [], {})
+    ok("extract: extras dict rides the tuple; no-content keeps the 5-shape")
+
+    # ── _distil_extras: stored as typed cards on their concept nodes ────────
+    class StubEmb:
+        def embed_many(self, texts, task="document"):
+            return [[0.0]] * len(texts)
+
+    added = []
+    stubkb = SimpleNamespace(
+        link_to_node=lambda lab, kind, v, **k: ("n:" + lab.lower(), True),
+        add_card=lambda node_id, **k: (
+            added.append((node_id, k["card_type"], k["title"], k["criteria"]))
+            or ("cid%d" % len(added), True)),
+        add_surface_question=lambda *a, **k: None)
+    nodemap = {}
+    n = D._distil_extras(stubkb, StubEmb(), {
+        "branches": [{"title": "Pick lubricant", "concept": "Lubrication",
+                      "options": [{"when": "cold", "then": "A"},
+                                  {"when": "hot", "then": "B"}],
+                      "ask_next": ["Operating temperature?"]}],
+        "misconceptions": [{"claim": "X causes Y", "truth": "no effect found"}],
+        "troubleshooting": [{"title": "bad", "causes": []}],   # shape-gated out
+    }, nodemap, "doc1", lambda c: "empirical", lambda r: None)
+    assert n == 2, n
+    assert sorted(x[1] for x in added) == ["branch", "misconception"]
+    bt = next(x for x in added if x[1] == "branch")
+    assert bt[3]["ask_next"] == ["Operating temperature?"]
+    assert bt[0] == "n:lubrication" and "lubrication" in nodemap
+    mt = next(x for x in added if x[1] == "misconception")
+    assert mt[2].startswith("Misconception:")
+    D._stage_reset()
+    D._stage_add(extra_offered=3, extra_kept=1)
+    assert "3 conv" in D._stage_line() and D.stage_stats()["extra_kept"] == 1
+    D._stage_reset()
+    ok("_distil_extras: branch + misconception stored, junk gated, counters wired")
+
     print(f"standalone_test: {PASS} checks OK")
 
 
