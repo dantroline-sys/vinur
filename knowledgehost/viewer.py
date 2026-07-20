@@ -12,6 +12,8 @@ Six tabs (two-level nav — see VINUR-UI-01_panel_redesign_plan.md) let you
                      · Gaps (queries the KB couldn't answer).
   * **Operations** — the authed maintenance-job runner + import formats.
   * **Serving**    — models this box hosts, weights-on-disk, swap control.
+  * **Stats**      — graphed telemetry (GPU / vLLM queue / throughput) with
+                     op + mark event lines, for tuning and A/B runs.
   * **Settings**   — General (scalar tunables) · Bundles · Library · Prioritizer.
 
 No CDN/asset dependencies; everything is inline.
@@ -59,6 +61,39 @@ INDEX_HTML = """<!doctype html>
     .hwrap, main { max-width: 1460px; }
     #results.grid2 { display: grid; grid-template-columns: 1fr 1fr; gap: 0 20px; align-items: start; }
   }
+  /* ── Stats tab: small-multiple SVG time-series (validated 4-slot palette;
+        light steps re-stepped for dark under prefers-color-scheme) ── */
+  :root { --s1:#2a78d6; --s2:#008300; --s3:#e87ba4; --s4:#eda100;
+          --cgrid:#e1e0d9; --caxis:#c3c2b7; --cmuted:#898781; }
+  @media (prefers-color-scheme: dark) {
+    :root { --s1:#3987e5; --s3:#d55181; --s4:#c98500;
+            --cgrid:#2c2c2a; --caxis:#383835; }
+  }
+  .charts { display: grid; grid-template-columns: repeat(auto-fill, minmax(360px, 1fr));
+            gap: 14px; align-items: start; }
+  .chartcard { border: 1px solid #8883; border-radius: 8px; padding: 10px 12px; }
+  .chartcard .ct { font-weight: 600; font-size: 13px; margin-bottom: 2px; }
+  .chartcard .cu { opacity: .55; font-weight: 400; }
+  .chartcard svg { display: block; width: 100%; }
+  .chartcard svg:focus { outline: 1px solid var(--s1); outline-offset: 2px; }
+  .clegend { display: flex; gap: 12px; flex-wrap: wrap; font-size: 12px;
+             opacity: .85; margin: 2px 0 4px; }
+  .clegend i { display: inline-block; width: 14px; height: 0; border-top: 2px solid;
+               border-radius: 1px; vertical-align: middle; margin-right: 5px; }
+  .ctable { margin-top: 6px; font-size: 12px; }
+  .ctable > summary { cursor: pointer; opacity: .55; list-style: none; }
+  .ctable table { font-size: 11px; }
+  .ctable td, .ctable th { padding: 2px 6px; font-variant-numeric: tabular-nums; }
+  #cktip { position: fixed; z-index: 10; pointer-events: none; display: none;
+           background: Canvas; border: 1px solid #8886; border-radius: 6px;
+           padding: 6px 9px; font-size: 12px; box-shadow: 0 2px 8px #0003; }
+  #cktip .tv { font-weight: 600; font-variant-numeric: tabular-nums; }
+  #cktip .tn { opacity: .7; margin-left: 6px; }
+  #cktip .tt { opacity: .55; font-size: 11px; margin-bottom: 3px; }
+  #cktip i { display: inline-block; width: 10px; height: 0; border-top: 2px solid;
+             border-radius: 1px; vertical-align: middle; margin-right: 5px; }
+  .evchips { display: flex; gap: 6px; flex-wrap: wrap; margin: 0 0 10px; font-size: 12px; }
+  .evchips .badge { margin: 0; }
   .bar { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; margin-bottom: 14px; }
   input, select, button { font: inherit; padding: 7px 10px; border: 1px solid #8886;
            border-radius: 6px; background: Canvas; color: CanvasText; }
@@ -121,6 +156,7 @@ INDEX_HTML = """<!doctype html>
   <div id="banner"></div>
   <div id="results" class="empty">…</div>
 </main>
+<div id="cktip"></div>
 <script>
 const $ = s => document.querySelector(s);
 const esc = t => { const d = document.createElement('div'); d.textContent = t == null ? '' : t; return d.innerHTML; };
@@ -138,6 +174,7 @@ const GROUPS = [
   ['curation', 'Curation', [['adjudication', 'Adjudication'], ['gaps', 'Gaps']]],
   ['ops', 'Operations', []],
   ['serving', 'Serving', []],
+  ['stats', 'Stats', []],
   ['settings', 'Settings', [['settings', 'General'], ['bundles', 'Bundles'],
                             ['library', 'Library'], ['autopilot', 'Prioritizer']]],
 ];
@@ -220,6 +257,7 @@ function go(k, leaf) {
   else if (k === 'search') { $('#results').className = 'empty'; $('#results').textContent = 'Type a query above.'; $('#q') && $('#q').focus(); }
   else if (k === 'ops') { loadOps(); opsTimer = setInterval(() => { if (active === 'ops') pollOps(); }, 2500); }
   else if (k === 'serving') { loadServing(); opsTimer = setInterval(() => { if (active === 'serving') pollServing(); }, 2500); }
+  else if (k === 'stats') { loadStatsTab(); opsTimer = setInterval(() => { if (active === 'stats') loadStatsTab(true); }, 10000); }
   else if (k === 'settings') { loadSettings(); }
   else if (k === 'autopilot') { loadAutopilot(); }
   else if (k === 'bundles') { loadBundles(); }
@@ -250,6 +288,14 @@ function renderBar(k) {
   } else if (k === 'serving') {
     $('#bar').innerHTML = tokInput()
       + ` <button class="toolbtn" onclick="pollServing()">Refresh</button>`;
+  } else if (k === 'stats') {
+    $('#bar').innerHTML =
+      `<select id="strange" onchange="loadStatsTab()" title="time range">`
+      + STAT_RANGES.map(([l, m]) =>
+          `<option value="${m}"${m === STAT_MINS ? ' selected' : ''}>last ${l}</option>`).join('')
+      + `</select>
+       <button class="toolbtn" onclick="loadStatsTab()">Refresh</button>
+       <span style="opacity:.6;font-size:13px">auto-refreshes every 10 s while open</span>`;
   } else if (k === 'ops') {
     $('#bar').innerHTML = tokInput()
       + ` <select id="opcmd" onchange="onCmdChange()" title="maintenance command"></select>`
@@ -1091,6 +1137,307 @@ async function saveSettings() {
     : '✗ ' + esc(r.error || 'failed')}</div>`;
   if (r.ok) loadSettings();
 }
+
+// ── Stats tab: banked telemetry → small-multiple SVG time-series ────────────
+// The dataviz contract this follows: ONE axis per panel (util and temp are
+// separate panels, never dual-axis), 2px lines, hairline grid, a legend for
+// ≥2 series (one series: the title names it), crosshair + tooltip that lists
+// EVERY series at the hovered time, and a per-chart data table — the relief
+// channel for the two light-mode hues that sit below 3:1 on a light surface.
+// Palette = the first four validated categorical slots (light/dark stepped
+// via the CSS vars above); text always wears text tokens, never series color.
+const STAT_RANGES = [['15 m', 15], ['1 h', 60], ['6 h', 360], ['24 h', 1440], ['7 d', 10080]];
+const SLOTS = ['var(--s1)', 'var(--s2)', 'var(--s3)', 'var(--s4)'];
+let STAT_MINS = 60, STATS_DATA = null, CHARTREG = {};
+
+async function loadStatsTab(silent) {
+  const sel = $('#strange');
+  if (sel) STAT_MINS = +sel.value || 60;
+  if (!silent) { $('#results').className = 'empty'; $('#results').textContent = 'loading…'; }
+  try { STATS_DATA = await (await fetch(`metrics/history?mins=${STAT_MINS}`)).json(); }
+  catch (e) { if (!silent) $('#results').textContent = 'request failed: ' + e; return; }
+  renderStatsCharts();
+}
+
+function deriveRate(pts, perSec) {
+  // cumulative counter → rate; a negative delta (restart/reset) becomes a gap
+  const out = [];
+  for (let i = 1; i < pts.length; i++) {
+    const dt = pts[i][0] - pts[i - 1][0], dv = pts[i][1] - pts[i - 1][1];
+    if (dt <= 0) continue;
+    out.push([pts[i][0], dv < 0 ? null : dv / dt * (perSec ? 1 : 60)]);
+  }
+  return out;
+}
+
+function statPanels(S) {
+  const P = [];
+  const pick = re => Object.keys(S).filter(k => re.test(k)).sort();
+  const gpuPanel = (suffix, title, unit, opts = {}) => {
+    const keys = pick(new RegExp('^gpu[0-9]+[.]' + suffix + '$'));
+    if (!keys.length) return;
+    P.push({ title, unit, ymax: opts.ymax, series: keys.map((k, i) => ({
+      name: k.split('.')[0], color: SLOTS[i % 4],
+      pts: opts.scale ? S[k].map(pt => [pt[0], pt[1] / opts.scale]) : S[k] })) });
+  };
+  gpuPanel('util', 'GPU utilisation', '%', { ymax: 100 });
+  // VRAM charts against the card's TOTAL, so headroom (the
+  // gpu_memory_utilization question) reads at a glance
+  let vtot = 0;
+  pick(/^gpu[0-9]+[.]vram_total_mb$/).forEach(k =>
+    S[k].forEach(pt => { if (pt[1] > vtot) vtot = pt[1]; }));
+  gpuPanel('vram_mb', 'VRAM used', 'GB', { scale: 1024, ymax: vtot ? vtot / 1024 : undefined });
+  gpuPanel('power_w', 'Power draw', 'W');
+  gpuPanel('temp_c', 'Temperature', '°C');
+  const q = pick(/^vllm[.].+[.](running|waiting)$/);
+  if (q.length) {
+    const entries = [...new Set(q.map(k => k.split('.')[1]))].sort();
+    P.push({ title: 'vLLM queue', unit: 'requests', series: q.map(k => {
+      const parts = k.split('.'), entry = parts[1], which = parts[2];
+      return { name: entries.length > 1 ? entry + ' ' + which : which,
+               color: SLOTS[(entries.indexOf(entry) * 2 + (which === 'waiting' ? 1 : 0)) % 4],
+               pts: S[k] };
+    }) });
+  }
+  const kv = pick(/^vllm[.].+[.]kv_pct$/);
+  if (kv.length) P.push({ title: 'KV-cache usage', unit: '%', ymax: 100,
+    series: kv.map((k, i) => ({ name: kv.length > 1 ? k.split('.')[1] : 'KV cache',
+                                color: SLOTS[i % 4], pts: S[k] })) });
+  const tok = pick(/^vllm[.].+[.](gen|prompt)_toks$/);
+  if (tok.length) {
+    const entries = [...new Set(tok.map(k => k.split('.')[1]))].sort();
+    const ser = tok.map(k => {
+      const parts = k.split('.'), entry = parts[1], which = parts[2] === 'gen_toks' ? 'generated' : 'prompt';
+      return { name: entries.length > 1 ? entry + ' ' + which : which,
+               color: SLOTS[(entries.indexOf(entry) * 2 + (which === 'prompt' ? 1 : 0)) % 4],
+               pts: deriveRate(S[k], true) };
+    }).filter(s => s.pts.length);
+    if (ser.length) P.push({ title: 'Token throughput', unit: 'tok/s', series: ser });
+  }
+  // fixed spec order → fixed slot per entity, even when one series is absent
+  const rateSpec = [['kb.distilled', 'chunks distilled'], ['kb.nodes', 'concepts'],
+                    ['kb.edges', 'relations'], ['kb.cards', 'cards']];
+  const rs = [];
+  rateSpec.forEach(([k, n], i) => {
+    if (S[k] && S[k].length > 1) rs.push({ name: n, color: SLOTS[i], pts: deriveRate(S[k]) });
+  });
+  if (rs.length) P.push({ title: 'Distillation throughput', unit: 'per min', series: rs });
+  const backSpec = [['kb.merge_q', 'merge queue'], ['kb.gaps', 'open gaps']];
+  const bs = [];
+  backSpec.forEach(([k, n], i) => {
+    if (S[k] && S[k].length) bs.push({ name: n, color: SLOTS[i], pts: S[k] });
+  });
+  if (bs.length) P.push({ title: 'Curation backlog', unit: 'items', series: bs });
+  return P;
+}
+
+function niceMax(v) {
+  if (!(v > 0)) return 1;
+  const p = Math.pow(10, Math.floor(Math.log10(v)));
+  for (const m of [1, 2, 2.5, 5, 10]) if (m * p >= v) return m * p;
+  return 10 * p;
+}
+function fmtVal(v) {
+  if (v == null) return '—';
+  return Math.abs(v) >= 100 ? Math.round(v).toLocaleString()
+    : Math.round(v * 10) / 10;
+}
+function fmtClock(t) {
+  const d = new Date(t * 1000), pad = n => String(n).padStart(2, '0');
+  const hm = pad(d.getHours()) + ':' + pad(d.getMinutes());
+  if (STAT_MINS <= 60) return hm + ':' + pad(d.getSeconds());
+  if (STAT_MINS > 2880) return (d.getMonth() + 1) + '/' + d.getDate() + ' ' + hm;
+  return hm;
+}
+
+function renderStatsCharts() {
+  if (active !== 'stats' || !STATS_DATA) return;
+  const panels = statPanels(STATS_DATA.series || {});
+  const evs = (STATS_DATA.events || []);
+  CHARTREG = {};
+  if (!panels.length) {
+    setRows('', 'No telemetry in this window yet.  The sampler starts with the '
+      + 'server (stats_interval_s in Settings; 0 disables it) — if this box '
+      + 'predates the Stats feature, pull and restart the kb service.');
+    return;
+  }
+  const shown = evs.slice(-20);
+  const chips = evs.length ? '<div class="evchips">'
+    + (evs.length > shown.length ? `<span class="badge">+${evs.length - shown.length} earlier</span>` : '')
+    + shown.map(e => `<span class="badge" title="${esc(e.kind)}">${esc(fmtClock(e.ts))} ${esc(
+        e.kind === 'mark' ? '⚑ ' + e.label
+        : (e.kind === 'op_start' ? '▶ ' : '■ ') + e.label)}</span>`).join('')
+    + '</div>' : '';
+  setRows(chips + '<div class="charts">' + panels.map((p, i) => {
+    const legend = p.series.length > 1 ? '<div class="clegend">' + p.series.map(s =>
+      `<span><i style="border-color:${s.color}"></i>${esc(s.name)}</span>`).join('') + '</div>' : '';
+    return `<div class="chartcard"><div class="ct">${esc(p.title)} <span class="cu">${esc(p.unit)}</span></div>
+      ${legend}<svg id="cv${i}" height="150" tabindex="0" role="img" aria-label="${esc(p.title)}"></svg>
+      <details class="ctable"><summary>data table</summary><div></div></details></div>`;
+  }).join('') + '</div>');
+  panels.forEach((p, i) => fillChart(p, i, evs));
+}
+
+function fillChart(p, i, evs) {
+  const svg = $('#cv' + i);
+  if (!svg) return;
+  const W = Math.max(280, Math.round(svg.clientWidth) || 360), H = 150,
+        padl = 46, padr = 10, padt = 8, padb = 20,
+        xw = W - padl - padr, yh = H - padt - padb;
+  const now = STATS_DATA.now, span = STAT_MINS * 60, t0 = now - span;
+  let vmax = 0;
+  p.series.forEach(s => s.pts.forEach(pt => {
+    if (pt[0] >= t0 && pt[1] != null && pt[1] > vmax) vmax = pt[1]; }));
+  const ymax = p.ymax || niceMax(vmax * 1.08);
+  const X = t => padl + (t - t0) / span * xw;
+  const Y = v => padt + yh - Math.min(v, ymax) / ymax * yh;
+  let g = '';
+  [0, ymax / 2, ymax].forEach(v => {
+    const y = Y(v);
+    g += `<line x1="${padl}" y1="${y}" x2="${W - padr}" y2="${y}" style="stroke:var(--cgrid);stroke-width:1"/>`
+      + `<text x="${padl - 6}" y="${y + 3.5}" text-anchor="end" style="fill:var(--cmuted);font-size:10px">${fmtVal(v)}</text>`;
+  });
+  [[t0, 'start'], [t0 + span / 2, 'middle'], [now, 'end']].forEach(([t, anchor]) => {
+    g += `<text x="${X(t)}" y="${H - 6}" text-anchor="${anchor}" style="fill:var(--cmuted);font-size:10px">${esc(fmtClock(t))}</text>`;
+  });
+  evs.forEach(e => {
+    if (e.ts >= t0) g += `<line x1="${X(e.ts).toFixed(1)}" y1="${padt}" x2="${X(e.ts).toFixed(1)}" y2="${padt + yh}" style="stroke:var(--caxis);stroke-width:1"/>`;
+  });
+  p.series.forEach(s => {
+    let d = '', pen = false;
+    s.pts.forEach(pt => {
+      if (pt[0] < t0 || pt[1] == null) { pen = false; return; }
+      d += (pen ? 'L' : 'M') + X(pt[0]).toFixed(1) + ' ' + Y(pt[1]).toFixed(1) + ' ';
+      pen = true;
+    });
+    if (d) g += `<path d="${d.trim()}" fill="none" style="stroke:${s.color};stroke-width:2;stroke-linejoin:round;stroke-linecap:round"/>`;
+  });
+  g += `<line id="cx${i}" y1="${padt}" y2="${padt + yh}" style="stroke:var(--cmuted);stroke-width:1;display:none"/>`;
+  svg.setAttribute('viewBox', `0 0 ${W} ${H}`);
+  svg.setAttribute('width', W);
+  svg.setAttribute('height', H);
+  svg.innerHTML = g;
+  CHARTREG['cv' + i] = { p, t0, span, padl, xw, W, cursor: null, evs };
+  svg.onpointermove = chartMove;
+  svg.onpointerleave = chartLeave;
+  svg.onfocus = chartFocus;
+  svg.onblur = chartLeave;
+  svg.onkeydown = chartKey;
+  const det = svg.parentElement.querySelector('details.ctable');
+  det.ontoggle = () => { if (det.open) buildChartTable(det, p); };
+}
+
+function nearestVal(pts, t, tol) {
+  let best = null, bd = tol;
+  for (const pt of pts) {
+    const d = Math.abs(pt[0] - t);
+    if (pt[1] != null && d <= bd) { bd = d; best = pt; }
+  }
+  return best;
+}
+
+function showTip(reg, t, cx, cy) {
+  // built with textContent — mark labels are user input, never innerHTML
+  const tip = $('#cktip');
+  tip.textContent = '';
+  const head = document.createElement('div');
+  head.className = 'tt';
+  head.textContent = fmtClock(t);
+  tip.appendChild(head);
+  const tol = Math.max((STATS_DATA.bucket || 5) * 1.5, reg.span / 120);
+  let rows = 0;
+  reg.p.series.forEach(s => {
+    const pt = nearestVal(s.pts, t, tol);
+    if (!pt) return;
+    const row = document.createElement('div');
+    const key = document.createElement('i');
+    key.style.borderTopColor = s.color;
+    const v = document.createElement('span');
+    v.className = 'tv';
+    v.textContent = String(fmtVal(pt[1]));
+    const n = document.createElement('span');
+    n.className = 'tn';
+    n.textContent = s.name;
+    row.append(key, ' ', v, n);
+    tip.appendChild(row);
+    rows++;
+  });
+  reg.evs.forEach(e => {
+    if (e.ts < reg.t0 || Math.abs(e.ts - t) > tol) return;
+    const row = document.createElement('div');
+    row.className = 'tt';
+    row.textContent = (e.kind === 'mark' ? '⚑ ' : e.kind === 'op_start' ? '▶ ' : '■ ') + e.label;
+    tip.appendChild(row);
+    rows++;
+  });
+  if (!rows) { tip.style.display = 'none'; return; }
+  tip.style.display = 'block';
+  tip.style.left = Math.max(4, Math.min(cx + 14, innerWidth - tip.offsetWidth - 8)) + 'px';
+  tip.style.top = Math.max(4, Math.min(cy + 14, innerHeight - tip.offsetHeight - 8)) + 'px';
+}
+
+function drawCursor(i, reg, t) {
+  const ln = $('#cx' + i);
+  if (!ln) return;
+  const x = (reg.padl + (t - reg.t0) / reg.span * reg.xw).toFixed(1);
+  ln.setAttribute('x1', x);
+  ln.setAttribute('x2', x);
+  ln.style.display = '';
+}
+function chartMove(ev) {
+  const svg = ev.currentTarget, reg = CHARTREG[svg.id];
+  if (!reg) return;
+  const r = svg.getBoundingClientRect();
+  const vx = (ev.clientX - r.left) * (reg.W / r.width);      // client px → viewBox px
+  let t = reg.t0 + (vx - reg.padl) / reg.xw * reg.span;
+  t = Math.max(reg.t0, Math.min(reg.t0 + reg.span, t));
+  reg.cursor = t;
+  drawCursor(svg.id.slice(2), reg, t);
+  showTip(reg, t, ev.clientX, ev.clientY);
+}
+function chartLeave(ev) {
+  const ln = $('#cx' + ev.currentTarget.id.slice(2));
+  if (ln) ln.style.display = 'none';
+  $('#cktip').style.display = 'none';
+}
+function chartFocus(ev) {
+  const svg = ev.currentTarget, reg = CHARTREG[svg.id];
+  if (!reg) return;
+  const t = reg.cursor == null ? reg.t0 + reg.span : reg.cursor;
+  reg.cursor = t;
+  drawCursor(svg.id.slice(2), reg, t);
+  const r = svg.getBoundingClientRect();
+  showTip(reg, t, r.left + 60, r.top + 30);
+}
+function chartKey(ev) {
+  if (ev.key !== 'ArrowLeft' && ev.key !== 'ArrowRight') return;
+  ev.preventDefault();
+  const svg = ev.currentTarget, reg = CHARTREG[svg.id];
+  if (!reg) return;
+  const step = (STATS_DATA.bucket || 5) * (ev.key === 'ArrowLeft' ? -1 : 1);
+  let t = (reg.cursor == null ? reg.t0 + reg.span : reg.cursor) + step;
+  t = Math.max(reg.t0, Math.min(reg.t0 + reg.span, t));
+  reg.cursor = t;
+  drawCursor(svg.id.slice(2), reg, t);
+  const r = svg.getBoundingClientRect();
+  showTip(reg, t, r.left + 60, r.top + 30);
+}
+
+function buildChartTable(det, p) {
+  const tol = (STATS_DATA.bucket || 5) / 2 + 0.01;
+  let ts = [...new Set(p.series.flatMap(s =>
+    s.pts.filter(pt => pt[1] != null).map(pt => pt[0])))].sort((a, b) => a - b);
+  if (ts.length > 400) ts = ts.slice(-400);
+  const head = '<tr><th>time</th>' + p.series.map(s => `<th>${esc(s.name)}</th>`).join('') + '</tr>';
+  const body = ts.map(t => '<tr><td>' + esc(fmtClock(t)) + '</td>' + p.series.map(s => {
+    const pt = nearestVal(s.pts, t, tol);
+    return '<td>' + (pt ? fmtVal(pt[1]) : '—') + '</td>';
+  }).join('') + '</tr>').join('');
+  det.querySelector('div').innerHTML =
+    `<table>${head}${body}</table>` + (ts.length === 400 ? '<div style="opacity:.5">latest 400 rows</div>' : '');
+}
+
+addEventListener('resize', () => { if (active === 'stats' && STATS_DATA) renderStatsCharts(); });
 
 buildTabs(); refreshStats(); setInterval(refreshStats, REFRESH_MS); loadHelp(); go('ask');
 </script>

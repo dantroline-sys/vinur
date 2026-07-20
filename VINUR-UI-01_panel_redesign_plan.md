@@ -99,7 +99,7 @@ points/series) and authed `POST /metrics/mark {label}`.
 Tests: stubbed nvidia-smi on PATH, stubbed /metrics HTTP endpoint,
 downsample maths, retention, mark-route auth.
 
-### Stage 7 — Stats tab (UI)
+### Stage 7 — Stats tab (UI)  ✅
 7th top-level tab (leafless, like Operations).  Inline-SVG time-series
 panels: GPU util + temp · VRAM · power · vLLM running/waiting · KV-cache %
 · derived throughput (chunks/cards/edges per minute from count deltas).
