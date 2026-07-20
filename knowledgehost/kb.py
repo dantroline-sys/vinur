@@ -277,6 +277,20 @@ class KB:
         CREATE TABLE IF NOT EXISTS recarded_chunks(
             chunk_id TEXT PRIMARY KEY, recarded_at REAL, version INTEGER DEFAULT 1);
 
+        -- Duplicate text (dedupe.py).  A chunk id is sha1(path+section+text), so
+        -- the SAME text arriving by a different route — a re-exported research
+        -- drop, one document filed twice — is a distinct chunk that would distil
+        -- again.  chunk_texts claims a normalised-text hash for the FIRST chunk
+        -- that distils it; chunk_dupes records everything that lost the claim, so
+        -- the text is still findable and its other homes are known, but no LM
+        -- time is ever spent on it twice.  `kind`: exact | near.
+        CREATE TABLE IF NOT EXISTS chunk_texts(
+            text_hash TEXT PRIMARY KEY, chunk_id TEXT, claimed_at REAL);
+        CREATE TABLE IF NOT EXISTS chunk_dupes(
+            chunk_id TEXT PRIMARY KEY, of_chunk_id TEXT, text_hash TEXT,
+            kind TEXT DEFAULT 'exact', similarity REAL, found_at REAL);
+        CREATE INDEX IF NOT EXISTS chunk_dupes_of ON chunk_dupes(of_chunk_id);
+
         CREATE TABLE IF NOT EXISTS node_merge_candidates(
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             node_a TEXT, node_b TEXT, similarity REAL, reason TEXT,
@@ -1189,6 +1203,40 @@ class KB:
             "INSERT OR IGNORE INTO distilled_chunks(chunk_id,distilled_at) VALUES(?,?)",
             (chunk_id, time.time()))
         self._maybe_commit()
+
+    # ── duplicate text (the janitor; see dedupe.py) ──────────────────────────
+    def claim_text(self, text_hash: str, chunk_id: str) -> str:
+        """Claim a normalised-text hash for this chunk, returning the OWNER —
+        itself when the claim succeeded, or the chunk that got there first."""
+        self.db.execute(
+            "INSERT OR IGNORE INTO chunk_texts(text_hash,chunk_id,claimed_at) VALUES(?,?,?)",
+            (text_hash, chunk_id, time.time()))
+        row = self.db.execute("SELECT chunk_id FROM chunk_texts WHERE text_hash=?",
+                              (text_hash,)).fetchone()
+        self._maybe_commit()
+        return row["chunk_id"] if row else chunk_id
+
+    def record_dupe(self, chunk_id: str, of_chunk_id: str, text_hash: str = "",
+                    kind: str = "exact", similarity: float = 1.0) -> None:
+        self.db.execute(
+            "INSERT INTO chunk_dupes(chunk_id,of_chunk_id,text_hash,kind,similarity,found_at) "
+            "VALUES(?,?,?,?,?,?) ON CONFLICT(chunk_id) DO UPDATE SET "
+            "of_chunk_id=excluded.of_chunk_id, kind=excluded.kind, "
+            "similarity=excluded.similarity, found_at=excluded.found_at",
+            (chunk_id, of_chunk_id, text_hash, kind, float(similarity), time.time()))
+        self._maybe_commit()
+
+    def dupe_of(self, chunk_id: str) -> dict | None:
+        r = self.db.execute("SELECT * FROM chunk_dupes WHERE chunk_id=?",
+                            (chunk_id,)).fetchone()
+        return dict(r) if r else None
+
+    def dupe_stats(self) -> dict:
+        rows = self.db.execute(
+            "SELECT kind, COUNT(*) n FROM chunk_dupes GROUP BY kind").fetchall()
+        by = {r["kind"]: int(r["n"]) for r in rows}
+        return {"exact": by.get("exact", 0), "near": by.get("near", 0),
+                "total": sum(by.values())}
 
     def is_recarded(self, chunk_id) -> bool:
         return self.recard_version(chunk_id) >= 1

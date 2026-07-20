@@ -27,6 +27,7 @@ import time
 import urllib.error
 import urllib.request
 
+from . import dedupe
 from . import lm_lease
 from . import sanitize
 from . import verify as verify_mod
@@ -2024,9 +2025,10 @@ def _zone_skip_set(cfg) -> frozenset:
 
 
 def _pending_chunks(store, kb, counter, bundle=None, cfg=None):
-    """counter: [already-done, zone-skipped].  Stashes ch['zone'] on every
-    yielded chunk so the prompt lens can adapt (code)."""
+    """counter: [already-done, zone-skipped, duplicate].  Stashes ch['zone'] on
+    every yielded chunk so the prompt lens can adapt (code)."""
     skip = _zone_skip_set(cfg)
+    dedupe_on = (cfg or {}).get("distill_dedupe", True)
     for ch in store.iter_chunks():
         if bundle is not None and _chunk_bundle(ch) != bundle:
             continue
@@ -2037,12 +2039,25 @@ def _pending_chunks(store, kb, counter, bundle=None, cfg=None):
         if ch["zone"] in skip:
             counter[1] += 1
             continue
+        if dedupe_on:
+            # The same text by another route (a re-exported research drop, a
+            # document filed twice) is a different chunk id but the same work.
+            # Claim its normalised hash; whoever loses the claim is marked done
+            # against the winner's distillation instead of paying for its own.
+            th = dedupe.text_hash(ch.get("text") or "")
+            owner = kb.claim_text(th, ch["id"])
+            if owner != ch["id"]:
+                kb.record_dupe(ch["id"], owner, th, kind="exact", similarity=1.0)
+                kb.mark_distilled(ch["id"])
+                if len(counter) > 2:
+                    counter[2] += 1
+                continue
         yield ch
 
 
 def _distill_sequential(store, kb, lm, embedder, cfg, *, limit=None, bundle=None) -> dict:
     done = concepts = relations = cards = 0
-    skipped = [0, 0]
+    skipped = [0, 0, 0]
     every = cfg["ingest_log_every"]
     for chunk in _pending_chunks(store, kb, skipped, bundle=bundle, cfg=cfg):
         reg = regime_for_path(cfg, chunk.get("path_or_url") or chunk.get("id"))
@@ -2061,7 +2076,8 @@ def _distill_sequential(store, kb, lm, embedder, cfg, *, limit=None, bundle=None
         if limit and done >= limit:
             break
     return {"chunks": done, "concepts": concepts, "relations": relations, "cards": cards,
-            "skipped": skipped[0], "skipped_zone": skipped[1]}
+            "skipped": skipped[0], "skipped_zone": skipped[1],
+            "skipped_dupe": skipped[2]}
 
 
 def _distill_parallel(store, kb, lms, embedder, cfg, *, limit=None, bundle=None) -> dict:
@@ -2078,7 +2094,7 @@ def _distill_parallel(store, kb, lms, embedder, cfg, *, limit=None, bundle=None)
     alive = {id(lm) for lm in lms}
     writer_lm = lms[0]                                # used for reconciliation's 5-way
     done = concepts = relations = cards = 0
-    skipped = [0, 0]
+    skipped = [0, 0, 0]
     every = cfg["ingest_log_every"]
 
     def extract_job(chunk, regime):
@@ -2150,7 +2166,8 @@ def _distill_parallel(store, kb, lms, embedder, cfg, *, limit=None, bundle=None)
                 if not stop:
                     submit_next()
     return {"chunks": done, "concepts": concepts, "relations": relations, "cards": cards,
-            "skipped": skipped[0], "skipped_zone": skipped[1]}
+            "skipped": skipped[0], "skipped_zone": skipped[1],
+            "skipped_dupe": skipped[2]}
 
 
 # ── recard corpus sweep ──────────────────────────────────────────────────────────
@@ -2235,7 +2252,7 @@ def recard_corpus(store, kb, lms, embedder, cfg, *, limit=None, bundle=None) -> 
     alive = {id(lm) for lm in lms}
     done = cards = 0
     no_menu = [0]
-    skipped = [0, 0]
+    skipped = [0, 0, 0]
     every = cfg["ingest_log_every"]
 
     def families_for(ch) -> tuple:
@@ -2361,7 +2378,7 @@ def _distill_pipeline(store, kb, extractors, verifiers, embedder, cfg, *, limit=
     verify_done = threading.Event()
     lock = threading.Lock()
     st = {"done": 0, "concepts": 0, "relations": 0, "cards": 0, "skipped": 0,
-          "skipped_zone": 0, "rejected": 0, "adjusted": 0, "vfail": 0,
+          "skipped_zone": 0, "skipped_dupe": 0, "rejected": 0, "adjusted": 0, "vfail": 0,
           "extract_alive": len(extractors), "verify_alive": len(verifiers),
           "stop": False}
     every = cfg["ingest_log_every"]
@@ -2386,6 +2403,31 @@ def _distill_pipeline(store, kb, extractors, verifiers, embedder, cfg, *, limit=
                     with lock:
                         st["skipped_zone"] += 1
                     continue
+                if cfg.get("distill_dedupe", True):
+                    # Same claim as the sequential path, but through the feeder's
+                    # OWN connection — the shared kb handle belongs to the writer
+                    # thread.  The same text by another route is the same work and
+                    # must not reach an extractor twice.
+                    th = dedupe.text_hash(ch.get("text") or "")
+                    now = time.time()
+                    fcon.execute("INSERT OR IGNORE INTO chunk_texts"
+                                 "(text_hash,chunk_id,claimed_at) VALUES(?,?,?)",
+                                 (th, ch["id"], now))
+                    row = fcon.execute("SELECT chunk_id FROM chunk_texts WHERE text_hash=?",
+                                       (th,)).fetchone()
+                    owner = row[0] if row else ch["id"]
+                    if owner != ch["id"]:
+                        fcon.execute(
+                            "INSERT OR REPLACE INTO chunk_dupes(chunk_id,of_chunk_id,"
+                            "text_hash,kind,similarity,found_at) VALUES(?,?,?,'exact',1.0,?)",
+                            (ch["id"], owner, th, now))
+                        fcon.execute("INSERT OR IGNORE INTO distilled_chunks"
+                                     "(chunk_id,distilled_at) VALUES(?,?)", (ch["id"], now))
+                    fcon.commit()
+                    if owner != ch["id"]:
+                        with lock:
+                            st["skipped_dupe"] += 1
+                        continue
                 doc = ch.get("path_or_url") or ch.get("id")
                 reg = regime_for_path(cfg, doc)
                 if not reg:
@@ -2522,4 +2564,5 @@ def _distill_pipeline(store, kb, extractors, verifiers, embedder, cfg, *, limit=
         raise BackendUnavailable("all fast extractor endpoints failed")
     return {"chunks": st["done"], "concepts": st["concepts"], "relations": st["relations"],
             "cards": st["cards"], "skipped": st["skipped"], "skipped_zone": st["skipped_zone"],
+            "skipped_dupe": st["skipped_dupe"],
             "rejected": st["rejected"], "adjusted": st["adjusted"], "verify_failed": st["vfail"]}

@@ -253,6 +253,79 @@ def _run_refine(cfg, store, embedder, log, *, limit=None, force=False) -> int:
     return 0
 
 
+def _run_dedupe(cfg, store, log, *, near=False, threshold=0.9, apply=False,
+                bundle=None) -> int:
+    """The janitor: find chunks that hold text the corpus already has.
+
+    EXACT (always): identical once normalised — the same document re-exported
+    under a new name, or filed in two places.  These are marked against the
+    chunk that owns the text, so they never cost another LM call.  Nothing is
+    deleted: the row and its FTS entry stay, so search still finds it either way.
+
+    NEAR (--near): MinHash/Jaccard over word shingles, for the same answer
+    written twice in slightly different words.  Reported by default and only
+    acted on with --apply, because "almost the same" can also mean "a revision
+    of" — which you usually want to keep and distil."""
+    from . import dedupe as dd
+    kb = KB(cfg)
+    exact = near_found = 0
+    try:
+        texts = {}
+        for ch in store.iter_chunks():
+            if bundle is not None and distill_mod_bundle(ch) != bundle:
+                continue
+            texts[ch["id"]] = ch.get("text") or ""
+        log.info("dedupe: scanning %d chunks", len(texts))
+
+        owners: dict = {}
+        for cid, text in texts.items():
+            th = dd.text_hash(text)
+            owner = kb.claim_text(th, cid)
+            owners[cid] = owner
+            if owner != cid:
+                exact += 1
+                kb.record_dupe(cid, owner, th, kind="exact", similarity=1.0)
+                if not kb.is_distilled(cid):
+                    kb.mark_distilled(cid)     # the owner's distillation covers it
+        kb.db.commit()
+        log.info("dedupe: %d exact duplicate(s) — marked against the chunk that owns "
+                 "the text (never distilled again)", exact)
+
+        if near:
+            # Compare only what isn't already an exact duplicate of something.
+            live = [(cid, t) for cid, t in texts.items() if owners.get(cid) == cid]
+            pairs = list(dd.near_pairs(live, threshold=threshold))
+            near_found = len(pairs)
+            for a, b, sim in pairs[:200]:
+                log.info("  near %.3f  %s  ~  %s", sim, a, b)
+            if len(pairs) > 200:
+                log.info("  … and %d more", len(pairs) - 200)
+            if apply:
+                for a, b, sim in pairs:
+                    if kb.dupe_of(b):
+                        continue
+                    kb.record_dupe(b, a, "", kind="near", similarity=sim)
+                    if not kb.is_distilled(b):
+                        kb.mark_distilled(b)
+                kb.db.commit()
+                log.info("dedupe: %d near-duplicate(s) marked (--apply)", near_found)
+            else:
+                log.info("dedupe: %d near-duplicate(s) found at >= %.2f — nothing marked "
+                         "(re-run with --apply to act on them)", near_found, threshold)
+        log.info("dedupe totals: %s", kb.dupe_stats())
+        ops_mod.emit_result(exact > 0 or near_found > 0, exact=exact, near=near_found,
+                            applied=bool(apply and near))
+    finally:
+        kb.close()
+        store.close()
+    return 0
+
+
+def distill_mod_bundle(ch):
+    from . import distill as distill_mod
+    return distill_mod._chunk_bundle(ch)
+
+
 def _run_recard(cfg, store, embedder, log, *, limit=None, bundle=None) -> int:
     """Cards-only sweep over already-distilled chunks: harvest the conversational
     card families (branch/troubleshooting/expectation/misconception) from corpus
@@ -764,7 +837,7 @@ def main(argv=None):
     ap = argparse.ArgumentParser(prog="knowledgehost",
                                  description="Vinur — a local general-knowledge tool host.")
     ap.add_argument("command", nargs="?", default="serve",
-                    choices=["serve", "ingest", "distill", "recard", "adjudicate", "reconcile",
+                    choices=["serve", "ingest", "distill", "recard", "dedupe", "adjudicate", "reconcile",
                              "link", "refine", "import-conceptnet", "import-atomic",
                              "import-glucose", "import-causenet", "unimport", "embed-nodes", "build-ann",
                              "optimize", "stats", "reset", "bump-version", "migrate-vocab",
@@ -832,6 +905,12 @@ def main(argv=None):
                     help="source: assign the source to this bundle group | "
                          "distill/recard: only chunks from this provenance bundle (e.g. 'vinkona' — "
                          "distil Vinkona's research drops ahead of the big corpus)")
+    ap.add_argument("--near", action="store_true",
+                    help="dedupe: also find near-duplicates (same text, different wording)")
+    ap.add_argument("--threshold", type=float, default=0.9,
+                    help="dedupe --near: similarity floor (default 0.9)")
+    ap.add_argument("--apply", action="store_true",
+                    help="dedupe --near: mark them (default reports only)")
     ap.add_argument("--out", help="split: output directory for bundle files")
     ap.add_argument("--license", help="source: SPDX licence id (e.g. CC-BY-NC-4.0, proprietary)")
     ap.add_argument("--license-holder", dest="license_holder",
@@ -1000,6 +1079,12 @@ def main(argv=None):
 
     if args.command == "recard":               # raw store + KB + big LM, cards only
         return _run_recard(cfg, store, embedder, log, limit=args.limit,
+                           bundle=getattr(args, "bundle", None))
+
+    if args.command == "dedupe":               # janitor: duplicate text, no LM
+        return _run_dedupe(cfg, store, log, near=getattr(args, "near", False),
+                           threshold=getattr(args, "threshold", 0.9),
+                           apply=getattr(args, "apply", False),
                            bundle=getattr(args, "bundle", None))
 
     if args.command == "adjudicate":

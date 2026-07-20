@@ -112,6 +112,30 @@ A **manifest** (path, content_hash, mtime, version) makes every run incremental;
 chunk ids are `sha1(path+section+text)` so re-ingest is idempotent. A monthly
 Wikipedia refresh: drop in the new ZIM, `bump-version`, re-ingest.
 
+### Duplicate text
+
+That id covers the same document arriving twice by the same route, but not the
+same *text* arriving by a different one — a research drop re-exported under a
+new name, one PDF filed in two folders. Distillation therefore also claims each
+chunk's **normalised-text hash** (`distill_dedupe`, on by default): whoever
+claims it first gets distilled, and anything else holding that text is
+checkpointed against the winner instead of costing a second set of LM calls.
+Nothing is deleted — the row and its FTS entry stay, so search finds it by
+either path, and `chunk_dupes` records where else the text lives.
+
+For a store that already has duplicates in it, the janitor sweeps:
+
+```bash
+python3 -m knowledgehost dedupe                    # exact — marks them, no LM
+python3 -m knowledgehost dedupe --near             # + report near-duplicates
+python3 -m knowledgehost dedupe --near --apply     # …and act on them
+```
+
+Near-duplicate detection is MinHash/Jaccard over word shingles — for the same
+answer written twice in different words. It reports by default rather than
+marking, because "almost the same" also describes a revision, which you usually
+want to keep and distil.
+
 ## Wiring into Vinkona
 
 Already wired on the Vinkona side (see its `assistant/config.py` `knowledge`

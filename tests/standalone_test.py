@@ -912,6 +912,7 @@ def main():
             self.distilled = set(distilled)
             self.recarded = dict(recarded)              # chunk_id -> version
             self.regimes, self.cards = regimes, []
+            self.texts = {}
 
         def is_distilled(self, cid):
             return cid in self.distilled
@@ -925,6 +926,16 @@ def main():
         def get_source(self, doc_id):
             r = self.regimes.get(doc_id)
             return {"regime": r} if r else None
+
+        # dedupe claim: this fixture has no duplicate text, so each chunk wins
+        def claim_text(self, text_hash, cid):
+            return self.texts.setdefault(text_hash, cid)
+
+        def record_dupe(self, *a, **k):
+            pass
+
+        def mark_distilled(self, cid):
+            self.distilled.add(cid)
 
         def batch(self):
             return contextlib.nullcontext()
@@ -992,6 +1003,10 @@ def main():
         is_distilled=lambda cid: False,
         mark_distilled=lambda cid: seq_marks.append(("d", cid)),
         mark_recarded=lambda cid, v=1: seq_marks.append(("r", cid, v)),
+        # the dedupe claim: this fake corpus has no duplicates, so every chunk
+        # wins its own text hash
+        claim_text=lambda th, cid: cid,
+        record_dupe=lambda *a, **k: None,
         batch=lambda: contextlib.nullcontext())
     dc0 = D.distill_chunk
     D.distill_chunk = lambda *a, **k: (1, 0, 0)

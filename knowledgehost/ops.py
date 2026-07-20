@@ -32,6 +32,8 @@ COMMANDS: dict = {
     "rebuild-fts": {},                     # reindex FTS with the configured tokenizer (no re-parse)
     "distill":    {"limit": "int", "watch": "bool", "interval": "int", "bundle": "str"},
     "recard":     {"limit": "int", "bundle": "str"},   # cards-only re-pass (see HELP)
+    # janitor: chunks holding text the corpus already has (no LM involved)
+    "dedupe":     {"near": "bool", "threshold": "float", "apply": "bool", "bundle": "str"},
     # External-dataset bulk imports (KB-only; path defaults to <name>_path in config —
     # the option only overrides it).  Long-running; stream their progress to the log.
     "import-conceptnet": {"path": "path", "min_weight": "float", "all": "bool",
@@ -85,6 +87,21 @@ HELP: dict = {
                     "misconception) from corpus distilled before those families "
                     "existed — nodes are joined, never re-created; relations untouched",
                "limit": "max chunks this run",
+               "bundle": "ONLY chunks from this provenance bundle; empty = everything"},
+    "dedupe": {"_": "Janitor (no LM): find chunks holding text the corpus already "
+                    "has. A chunk id is sha1(path+section+text), so the same text "
+                    "arriving by another route — a research drop re-exported under "
+                    "a new name, one document filed twice — would distil again. "
+                    "EXACT duplicates are marked against the chunk that owns the "
+                    "text and never distilled again; nothing is deleted, so search "
+                    "still finds them either way. Distillation does this check "
+                    "inline too (distill_dedupe); this sweep is for what's already "
+                    "in the store",
+               "near": "also look for near-duplicates (MinHash/Jaccard over word "
+                       "shingles) — the same answer written twice in different words",
+               "threshold": "near-duplicate similarity floor (default 0.9)",
+               "apply": "near mode: actually mark them (default is report only — "
+                        "'almost the same' can also mean 'a revision of')",
                "bundle": "ONLY chunks from this provenance bundle; empty = everything"},
     "import-conceptnet": {"_": "Bulk-import the ConceptNet commonsense graph",
                           "path": "assertions.csv dump (default from config)",

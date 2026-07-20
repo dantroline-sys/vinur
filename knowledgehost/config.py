@@ -195,6 +195,14 @@ DEFAULTS = {
     # a zone here re-opens those chunks on the next distill pass.  "code" is a
     # valid zone but never a sensible skip — code chunks get a tailored lens.
     "distill_skip_zones": ["references", "toc", "index", "boilerplate"],
+    # Skip a chunk whose text the corpus already holds (dedupe.text_hash — same
+    # text, different path/section, so a different chunk id: a research drop
+    # re-exported under a new name, one document filed in two folders).  The
+    # duplicate is marked against the chunk that owns the text, so it is never
+    # distilled twice; nothing is deleted and search still finds it either way.
+    # The `dedupe` op does the same sweep over what's already stored, and can
+    # also hunt near-duplicates.
+    "distill_dedupe": True,
     # link_to_node identity policy (§9.4): bias toward NOT merging (under-merge is
     # recoverable, over-merge is destructive).
     "node_sim_high": 0.86,    # ≥ this + alias agreement => same node
@@ -536,7 +544,8 @@ _FLOAT_KEYS = {"min_confidence", "node_sim_high", "node_sim_low", "kb_min_sim",
                "stats_interval_s"}
 _BOOL_KEYS = {"embed_task_prefix", "ocr", "verify", "strict",
               "conceptnet_include_lexical", "ann_search", "ann_mmap", "wiki_semantic",
-              "ask_fit_gate", "use_spacy", "library_dense", "hf_transfer", "hf_xet"}
+              "ask_fit_gate", "use_spacy", "library_dense", "hf_transfer", "hf_xet",
+              "distill_dedupe"}
 _LIST_KEYS = {"sources", "extensions", "distill_urls", "extract_urls", "verify_urls",
               "encrypted_bundles", "library_sources", "stopwords_extra",
               "high_stakes_extra", "ops_regions", "ask_exclude_facets",
@@ -617,6 +626,7 @@ EDITABLE_SETTINGS = frozenset({
     "rerank_pool", "snippet_max_len",
     # read-time knowledge mode
     "mode", "strict",
+    "distill_dedupe",        # skip chunks whose text the corpus already holds
     # Hugging Face transfer backends — on/off switches, no credentials (the
     # token and the proxy URLs stay file/env-only).  Applied at next start.
     "hf_transfer", "hf_xet",
