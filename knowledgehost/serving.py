@@ -350,6 +350,78 @@ def exclusive_entry_for_url(cfg: dict, url: str) -> str | None:
     return str(e.get("name")) if e else None
 
 
+# Per-service control (Serving tab's start/stop/restart), one request file per
+# service so two buttons pressed together can't overwrite each other — unlike
+# the swap lane, where a single request file is the point (one GPU, one winner).
+SVC_REQ_DIR = ROOT / "var" / "run" / "svcreq"
+SVC_ACTIONS = ("start", "stop", "restart")
+
+
+def _safe_service(name: str) -> str:
+    """A service name is a filename here — keep it one path component."""
+    s = str(name or "").strip()
+    if not s or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]*", s):
+        raise ValueError(f"bad service name: {name!r}")
+    return s
+
+
+def request_service(service: str, action: str) -> None:
+    """Ask the supervisor to start/stop/restart ONE service.  Async like the
+    swap lane: the watchdog acts within a tick and the panel re-polls."""
+    s = _safe_service(service)
+    if action not in SVC_ACTIONS:
+        raise ValueError(f"action must be one of {'/'.join(SVC_ACTIONS)}")
+    SVC_REQ_DIR.mkdir(parents=True, exist_ok=True)
+    tmp = SVC_REQ_DIR / f".{s}.tmp"
+    tmp.write_text(json.dumps({"service": s, "action": action, "at": time.time()}))
+    os.replace(tmp, SVC_REQ_DIR / f"{s}.req")
+
+
+def take_service_requests() -> list[dict]:
+    """Supervisor side: consume every pending request (each file read then
+    unlinked, so a request survives at most one tick)."""
+    out = []
+    try:
+        files = sorted(SVC_REQ_DIR.glob("*.req"))
+    except OSError:
+        return out
+    for f in files:
+        try:
+            d = json.loads(f.read_text())
+        except (OSError, ValueError):
+            d = {}
+        try:
+            f.unlink()
+        except OSError:
+            pass
+        if d.get("service") and d.get("action") in SVC_ACTIONS:
+            out.append(d)
+    return out
+
+
+def log_tail(service: str, lines: int = 200, max_bytes: int = 262144) -> dict:
+    """The tail of one service's log, for the panel.  Reading the last N lines
+    IS the diagnosis for most serving problems (a download that stopped, a
+    gated repo, a rate limit) — the single last line the table shows is rarely
+    the one that says why."""
+    from . import supervisor as sup
+    s = _safe_service(service)
+    p = sup.LOGS / f"{s}.log"
+    try:
+        size = p.stat().st_size
+        with p.open("rb") as fh:
+            if size > max_bytes:
+                fh.seek(size - max_bytes)
+                fh.readline()                     # drop the partial first line
+            text = fh.read().decode("utf-8", "replace")
+    except OSError as e:
+        return {"service": s, "path": str(p), "exists": False, "text": "",
+                "detail": f"no log yet ({type(e).__name__})"}
+    keep = [ln for ln in text.splitlines() if ln.strip()][-max(1, int(lines)):]
+    return {"service": s, "path": str(p), "exists": True, "size": size,
+            "mtime": p.stat().st_mtime, "text": "\n".join(keep)}
+
+
 def swap_state() -> dict:
     try:
         return json.loads(SWAP_STATE.read_text())
@@ -449,6 +521,13 @@ _FAILURE_HINTS = [
      "This error is HOST-toolchain only: if you meant to run the container, "
      "the entry isn't — check the 'exec:' line at the top of this log. "
      "serving/README.md → Troubleshooting."),
+    ("errors.pydantic.dev",
+     "vLLM REJECTED ITS OWN CONFIG before loading anything — one of the "
+     "entry's keys/args isn't valid for this vLLM version (a flag that was "
+     "renamed or removed, a value out of range, a bad JSON blob in "
+     "speculative_config/override args). The pydantic 'Value error, …' line a "
+     "few lines above names the field — open the Log button here and read "
+     "upward from the URL; the last line is only the sign-off."),
     ("unresolvable CDI devices",
      "podman can't wire the GPU — the CDI spec is missing or stale. Run "
      "'sudo nvidia-ctk cdi generate --output=/etc/cdi/nvidia.yaml' "
@@ -465,6 +544,35 @@ _FAILURE_HINTS = [
     ("401 Client Error",
      "gated HF repo — accept its license on huggingface.co and set "
      "hf_token in config.toml (or export HF_TOKEN) before starting."),
+    # Download failures: the weights never arrive and the engine dies far from
+    # the real cause, so name the cause.
+    ("429 Client Error",
+     "Hugging Face rate-limited this box (HTTP 429) — anonymous downloads are "
+     "throttled first. Set hf_token in Settings (a free read token lifts the "
+     "limit), then Restart the service; the partial download resumes."),
+    ("Too Many Requests",
+     "Hugging Face rate-limited this box (HTTP 429) — anonymous downloads are "
+     "throttled first. Set hf_token in Settings (a free read token lifts the "
+     "limit), then Restart the service; the partial download resumes."),
+    ("403 Client Error",
+     "Hugging Face refused the download (HTTP 403) — the token is missing the "
+     "repo's permission, or the licence was never accepted with THIS account. "
+     "Check the repo page while signed in as the token's owner."),
+    ("RepositoryNotFoundError",
+     "no such HF repo (or it's private to another account) — check the `model` "
+     "id for a typo; a private repo also needs hf_token."),
+    ("No space left on device",
+     "the disk holding var/cache/huggingface is full — weights are tens of GB "
+     "each. Free space or move the cache (Settings › Paths shows where it is), "
+     "then Restart; the partial download resumes."),
+    ("ReadTimeoutError",
+     "the download timed out mid-transfer — usually the network, occasionally "
+     "an HF incident. Restart the service: the fetch resumes from the partial "
+     "blobs rather than starting over."),
+    ("Consistency check failed",
+     "a downloaded file didn't match its expected size/hash — a corrupted or "
+     "truncated transfer. Delete that repo's folder under "
+     "var/cache/huggingface/hub and Restart to fetch it cleanly."),
     ("GatedRepoError",
      "gated HF repo — accept its license on huggingface.co and set "
      "hf_token in config.toml (or export HF_TOKEN) before starting."),
@@ -472,6 +580,31 @@ _FAILURE_HINTS = [
      "disk full — weights live in var/cache/huggingface; prune models you "
      "dropped from the config."),
 ]
+
+
+# A dying process's LAST line is almost never the informative one — vLLM signs
+# off with a pydantic docs URL, NCCL teardown noise, or a bare traceback tail.
+# These markers pick the line that actually says what went wrong.
+_CAUSE_MARKS = ("Value error,", "validation error", "ValueError:", "TypeError:",
+                "KeyError:", "RuntimeError:", "OSError:", "AssertionError",
+                "is not a valid", "Error: ", "error: ", "Errno", "No such file",
+                "Traceback (most recent")
+_CAUSE_NOISE = ("For further information visit", "https://errors.pydantic.dev",
+                "During handling of the above", "The above exception was")
+
+
+def cause_lines(tail: str, limit: int = 3) -> list[str]:
+    """The lines from a service's log tail that name the failure, newest last.
+    Shown beside the last-log line because 'exited rc=1 — <docs URL>' tells an
+    operator nothing they can act on."""
+    hits = []
+    for ln in (tail or "").splitlines():
+        s = ln.strip()
+        if not s or any(n in s for n in _CAUSE_NOISE):
+            continue
+        if any(m in s for m in _CAUSE_MARKS):
+            hits.append(s[-400:])
+    return hits[-max(1, int(limit)):]
 
 
 def failure_hint(text: str) -> str | None:
@@ -549,6 +682,15 @@ def _snapshot_complete(s) -> bool:
     return bool(shards) and all(p.exists() for p in shards)
 
 
+def _ago(seconds: float) -> str:
+    s = int(max(0, seconds))
+    if s < 90:
+        return f"{s}s"
+    if s < 5400:
+        return f"{s // 60}m"
+    return f"{s // 3600}h {(s % 3600) // 60}m"
+
+
 def hf_cache_dir() -> Path:
     """The Hugging Face hub cache THIS box downloads weights into.  env.sh
     pins HF_HOME inside the repo (var/cache/huggingface) so nothing lands in
@@ -612,7 +754,8 @@ def weights_status(engine: str, model: str) -> dict:
                     "detail": ("downloads on first start — or pre-fetch with "
                                f"serving/.venv/bin/hf download {model}")}
         blobs = d / "blobs"
-        partial = len(list(blobs.glob("*.incomplete"))) if blobs.is_dir() else 0
+        parts = sorted(blobs.glob("*.incomplete")) if blobs.is_dir() else []
+        partial = len(parts)
         snap_ok = False
         snaps = d / "snapshots"
         if snaps.is_dir():
@@ -629,9 +772,26 @@ def weights_status(engine: str, model: str) -> dict:
                                  "cache from an earlier interrupted fetch — harmless; "
                                  "delete them to reclaim disk")
         elif partial:
-            out.update(status="incomplete",
-                       detail=f"{partial} file(s) mid-download — in progress, or an "
-                              "interrupted fetch (restarting the service resumes it)")
+            # "Downloading" and "wedged" look identical in a size figure — the
+            # question is whether the partial files are still GROWING.  The
+            # newest write's age answers it without sampling over time.
+            age = None
+            try:
+                age = time.time() - max(f.stat().st_mtime for f in parts)
+            except (OSError, ValueError):
+                pass
+            out["idle_s"] = round(age) if age is not None else None
+            if age is not None and age > 120:
+                out.update(status="stalled",
+                           detail=f"{partial} file(s) mid-download but NOTHING has been "
+                                  f"written for {_ago(age)} — the fetch is stuck or dead, "
+                                  "not slow. Check the log (Log button): rate limit (429), "
+                                  "auth (401/403), disk, or network. Restart resumes it.")
+            else:
+                out.update(status="incomplete",
+                           detail=f"{partial} file(s) mid-download, last written "
+                                  f"{_ago(age) if age is not None else 'just now'} ago "
+                                  "— downloading now")
         else:
             out.update(status="incomplete",
                        detail="cache present but no complete snapshot — fetch "
@@ -650,12 +810,17 @@ def serving_status(cfg: dict) -> dict:
     services = st.get("services") or {}
     standby = st.get("standby") or {}
     failed = st.get("failed") or {}
+    held = set(st.get("held") or [])
 
     def svc_state(svc_name: str, entry: str = "") -> dict:
         if not sup_alive:
-            return {"service": "supervisor-down"}
+            return {"service": "supervisor-down", "service_name": svc_name}
+        if svc_name in held:                      # stopped BY REQUEST, not by dying:
+            return {"service": "stopped",         # the watchdog leaves it alone
+                    "service_name": svc_name}
         if svc_name in failed:
-            return {"service": "failed", "reason": failed[svc_name]}
+            return {"service": "failed", "reason": failed[svc_name],
+                    "service_name": svc_name}
         pid = services.get(svc_name)
         d: dict = {}
         if pid and sup.alive(pid):
@@ -679,6 +844,10 @@ def serving_status(cfg: dict) -> dict:
             hint = failure_hint(d.get("reason", "") + " " + tail)
             if hint:
                 d["hint"] = hint
+            cause = cause_lines(tail)
+            if cause:
+                d["cause"] = cause
+        d["service_name"] = svc_name
         return d
 
     llms = []

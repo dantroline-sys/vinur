@@ -371,6 +371,98 @@ def main():
                 assert res.get("cache") or sv.serving_status(wcfg)["cache"]["path"] == str(hub)
                 ok("hf_cache_status: hub path, repo count and stale-partial bytes reported")
 
+                # ── a download that stopped is not a download in progress ───
+                stuck_blobs = hub / "models--org--stuck" / "blobs"
+                old = time.time() - 3600
+                os.utime(stuck_blobs / "abc.incomplete", (old, old))
+                ws = sv.weights_status("vllm", "org/stuck")
+                assert ws["status"] == "stalled" and ws["idle_s"] >= 3500, ws
+                assert "NOTHING has been written" in ws["detail"], ws
+                fresh = time.time()
+                os.utime(stuck_blobs / "abc.incomplete", (fresh, fresh))
+                assert sv.weights_status("vllm", "org/stuck")["status"] == "incomplete"
+                ok("weights_status: stalled vs downloading decided by partial-file mtime")
+
+                # ── the line that NAMES the failure, not the last one printed ─
+                vllm_tail = (
+                    "INFO 07-20 12:00:00 [api_server.py:1] vLLM API server version 0.11\n"
+                    "  Value error, speculative_config must be a JSON object\n"
+                    "For further information visit https://errors.pydantic.dev/2.13/v/value_error\n"
+                    "(APIServer pid=1) For further information visit "
+                    "https://errors.pydantic.dev/2.13/v/value_error\n")
+                cause = sv.cause_lines(vllm_tail)
+                assert cause and "speculative_config" in cause[-1], cause
+                assert not any("pydantic.dev" in c for c in cause), cause
+                assert "REJECTED ITS OWN CONFIG" in (sv.failure_hint(vllm_tail) or "")
+                ok("cause_lines: pydantic 'Value error' beats the docs-URL sign-off")
+
+                assert "rate-limited" in (sv.failure_hint("429 Client Error: Too Many") or "")
+                assert "disk" in (sv.failure_hint("No space left on device") or "")
+                ok("failure_hint covers the download failures (429, disk, timeout)")
+
+                # ── per-service control requests round-trip ─────────────────
+                req0 = sv.SVC_REQ_DIR
+                sv.SVC_REQ_DIR = Path(td) / "svcreq"
+                try:
+                    sv.request_service("llm-good", "stop")
+                    sv.request_service("embed", "restart")
+                    got = {d["service"]: d["action"] for d in sv.take_service_requests()}
+                    assert got == {"llm-good": "stop", "embed": "restart"}, got
+                    assert sv.take_service_requests() == []   # consumed, not replayed
+                    # one file per service: a second press supersedes, never
+                    # collides with another service's pending request
+                    sv.request_service("llm-good", "stop")
+                    sv.request_service("llm-good", "start")
+                    assert [d["action"] for d in sv.take_service_requests()] == ["start"]
+                    for bad in ("../etc/passwd", "", "a b"):
+                        try:
+                            sv.request_service(bad, "stop"); raise AssertionError(bad)
+                        except ValueError:
+                            pass
+                    try:
+                        sv.request_service("embed", "obliterate"); raise AssertionError("action")
+                    except ValueError:
+                        pass
+                finally:
+                    sv.SVC_REQ_DIR = req0
+                ok("request_service: per-service files, consumed once, names/actions validated")
+
+                # ── what the supervisor DOES with each request ──────────────
+                plain = {"name": "embed", "exclusive": False, "entry": ""}
+                excl_a = {"name": "llm-a", "exclusive": True, "entry": "a"}
+                excl_b = {"name": "llm-b", "exclusive": True, "entry": "b"}
+                P = sup.control_plan
+                # a stop must STICK — hold is what stops the watchdog reviving it
+                assert P("stop", plain, running=True, active_excl="a") == \
+                    ["stop", "hold", "clear"]
+                # start after a give-up verdict = "try again": clear, then spawn
+                assert P("start", plain, running=False, active_excl="a") == \
+                    ["unhold", "clear", "spawn"]
+                # already up: start un-holds and clears but must NOT double-spawn
+                assert P("start", plain, running=True, active_excl="a") == ["unhold", "clear"]
+                assert P("restart", plain, running=True, active_excl="a") == \
+                    ["stop", "unhold", "clear", "spawn"]
+                # an exclusive sibling can't be spawned beside the resident one —
+                # its VRAM is taken, so the request becomes a swap
+                assert P("start", excl_b, running=False, active_excl="a") == \
+                    ["unhold", "clear", "swap"]
+                assert P("restart", excl_a, running=True, active_excl="a") == \
+                    ["stop", "unhold", "clear", "spawn"]
+                ok("control_plan: stop holds, start clears+revives, exclusive start -> swap")
+
+                sup.STATE.write_text(json.dumps({
+                    "supervisor": os.getpid(),           # a live pid
+                    "services": {"llm-good": os.getpid(), "llm-gg": 999999},
+                    "standby": {"stuck": "llm-stuck"},
+                    "held": ["llm-nowhere"],
+                    "failed": {"llm-nowhere": "gave up after 5 restarts"}}))
+                by0 = {m["name"]: m for m in sv.serving_status(wcfg)["llms"]}
+                # held wins over failed: it was stopped on purpose, and the
+                # panel must offer Start rather than shouting about a crash
+                assert by0["nowhere"]["service"] == "stopped", by0["nowhere"]
+                assert by0["good"]["service_name"] == "llm-good"
+                ok("serving_status: a held service reads 'stopped', rows carry service_name")
+
                 sup.STATE.write_text(json.dumps({
                     "supervisor": os.getpid(),           # a live pid
                     "services": {"llm-good": os.getpid(), "llm-gg": 999999},
@@ -396,8 +488,62 @@ def main():
                 with urllib.request.urlopen(req, timeout=5) as r:
                     body = json.loads(r.read())
                 assert body["ok"] and body["hosting"] and len(body["llms"]) == 4
-                khs2.shutdown()
                 ok("GET /serving/status serves the panel payload (authed)")
+
+                # ── the Serving tab's buttons: control + log tail over HTTP ──
+                base = f"http://127.0.0.1:{khs2.server_address[1]}"
+
+                def call(p, obj=None):
+                    rq = urllib.request.Request(
+                        base + p, headers={"Authorization": "Bearer tk",
+                                           "Content-Type": "application/json"},
+                        data=json.dumps(obj).encode() if obj is not None else None)
+                    try:
+                        with urllib.request.urlopen(rq, timeout=5) as r:
+                            return r.status, json.loads(r.read())
+                    except urllib.error.HTTPError as e:
+                        return e.code, json.loads(e.read())
+
+                req0 = sv.SVC_REQ_DIR
+                sv.SVC_REQ_DIR = Path(td) / "svcreq-http"
+                try:
+                    code, b = call("/serving/control",
+                                   {"service": "llm-good", "action": "restart"})
+                    assert code == 200 and b["ok"], (code, b)
+                    pending = {d["service"]: d["action"] for d in sv.take_service_requests()}
+                    assert pending == {"llm-good": "restart"}, pending
+                    # a service the supervisor doesn't know must FAIL, not
+                    # silently queue a request nothing will ever act on
+                    code, b = call("/serving/control", {"service": "ghost", "action": "stop"})
+                    assert code == 400 and "no such service" in b["error"], (code, b)
+                    assert sv.take_service_requests() == []
+                    # standby and failed services are addressable too (that is
+                    # exactly when you need Start)
+                    for svc_name in ("llm-stuck", "llm-nowhere"):
+                        code, b = call("/serving/control",
+                                       {"service": svc_name, "action": "start"})
+                        assert code == 200 and b["ok"], (svc_name, code, b)
+                    sv.take_service_requests()
+                finally:
+                    sv.SVC_REQ_DIR = req0
+
+                (sup.LOGS).mkdir(parents=True, exist_ok=True)
+                logp = sup.LOGS / "llm-good.log"
+                keep = logp.read_bytes() if logp.exists() else None
+                logp.write_text("".join(f"line {i}\n" for i in range(500)))
+                try:
+                    code, b = call("/serving/log?name=llm-good&n=5")
+                    assert code == 200 and b["ok"], (code, b)
+                    assert b["text"].splitlines() == [f"line {i}" for i in range(495, 500)], b
+                    code, b = call("/serving/log?name=../../etc/passwd")
+                    assert code == 400 and "bad service name" in b["error"], (code, b)
+                finally:
+                    if keep is None:
+                        logp.unlink()
+                    else:
+                        logp.write_bytes(keep)
+                khs2.shutdown()
+                ok("POST /serving/control + GET /serving/log: buttons and log tail wired")
 
                 # ── known-failure hints + toolkit preflight ──────────────
                 assert "toolkit missing" in sv.failure_hint(

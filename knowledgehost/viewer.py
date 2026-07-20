@@ -992,6 +992,7 @@ function svChip(txt, c) {
 function svState(s) {
   if (s === 'up') return svChip('up', '#22aa66');
   if (s === 'standby') return svChip('standby', '#888888');
+  if (s === 'stopped') return svChip('stopped', '#7a7fd0');
   if (s === 'failed') return svChip('FAILED', '#cc4444');
   if (s === 'dead') return svChip('dead', '#cc4444');
   if (s === 'supervisor-down') return svChip('supervisor down', '#e0a800');
@@ -999,13 +1000,70 @@ function svState(s) {
 }
 function svWeights(w) {
   if (!w) return '';
-  const c = w.status === 'ready' ? '#22aa66' : w.status === 'incomplete' ? '#e0a800' : '#cc4444';
+  const c = w.status === 'ready' ? '#22aa66'
+    : w.status === 'incomplete' ? '#e0a800' : '#cc4444';   // stalled/missing both red
   const t = 'weights: ' + w.status + (w.size_gb ? ` · ${w.size_gb} GB` : '');
   const tip = (w.path || '') + (w.detail ? ' — ' + w.detail : '');
   // The on-disk path is shown, not just tipped: 'where are the weights?' is a
   // question people answer with a file manager, and a tooltip can't be copied.
   return `<span class="badge" title="${esc(tip)}" style="background:${c}33;border-color:${c}66">${esc(t)}</span>`
     + (w.path ? `<div style="font-size:11px;opacity:.55;word-break:break-all;margin-top:3px">${esc(w.path)}</div>` : '');
+}
+// Per-service control + log tail.  A model that won't come up is diagnosed by
+// reading ITS log, so the buttons and the log live in the same row.
+let SVLOG = null;                     // {name, text, path} while a log is open
+function svBtn(label, js, style) {
+  return `<button class="toolbtn" style="font-size:12px;padding:3px 9px;${style || ''}"
+    onclick="${js}">${label}</button>`;
+}
+function svActions(m, supRunning, swapping) {
+  const svc = m.service_name;
+  if (!supRunning || !svc) return '';
+  const b = [];
+  const canSwap = m.exclusive && m.service === 'standby' && !swapping;
+  if (canSwap) b.push(svBtn('Swap in', `doSwap('${esc(m.name)}')`));
+  if (m.service === 'up') {
+    b.push(svBtn('Restart', `svcAction('${esc(svc)}','restart')`));
+    b.push(svBtn('Stop', `svcAction('${esc(svc)}','stop')`));
+  } else if (!canSwap && ['stopped', 'dead', 'failed', 'off'].includes(m.service)) {
+    // 'Start' after a give-up verdict is the operator saying "try again" —
+    // the supervisor clears the verdict and the restart budget with it.
+    b.push(svBtn('Start', `svcAction('${esc(svc)}','start')`));
+  }
+  b.push(svBtn('Log', `svShowLog('${esc(svc)}')`, 'opacity:.75'));
+  return `<div style="display:flex;gap:4px;flex-wrap:wrap">${b.join('')}</div>`;
+}
+async function svcAction(svc, action) {
+  $('#banner').innerHTML = `${esc(action)} requested for <b>${esc(svc)}</b>…`;
+  const r = await postJSON('/serving/control', { service: svc, action })
+    .catch(e => ({ ok: false, error: '' + e }));
+  if (!r.ok) $('#banner').innerHTML = '✗ ' + esc(r.error || 'request failed');
+  pollServing();
+}
+async function svShowLog(svc) { SVLOG = { name: svc, text: 'loading…' }; await pollServing(); }
+function svCloseLog() { SVLOG = null; pollServing(); }
+async function svFetchLog() {
+  if (!SVLOG) return;
+  try {
+    const r = await (await authFetch('/serving/log?n=400&name='
+      + encodeURIComponent(SVLOG.name))).json();
+    SVLOG.text = r.ok ? (r.text || '(the log is empty)') : ('error: ' + (r.error || ''));
+    SVLOG.path = r.path || '';
+  } catch (e) { SVLOG.text = 'request failed: ' + e; }
+}
+function svLogPanel() {
+  if (!SVLOG) return '';
+  return `<div class="cfg-group" style="margin-top:14px">
+      <div style="display:flex;gap:8px;align-items:center;margin-bottom:6px">
+        <b>${esc(SVLOG.name)}</b>
+        <span style="opacity:.55;font-size:12px">${esc(SVLOG.path || '')}</span>
+        <span style="flex:1"></span>
+        <span style="opacity:.55;font-size:12px">follows — last 400 lines</span>
+        ${svBtn('Close', 'svCloseLog()')}
+      </div>
+      <pre id="svlogpre" style="max-height:340px;overflow:auto;font-size:12px;
+        line-height:1.45;margin:0;white-space:pre-wrap;word-break:break-word"
+        >${esc(SVLOG.text || '')}</pre></div>`;
 }
 async function doSwap(name) {
   $('#banner').innerHTML = `swapping to <b>${esc(name)}</b> — weights load; this can take minutes…`;
@@ -1036,10 +1094,11 @@ async function pollServing() {
   $('#banner').innerHTML = banner;
   const rows = (r.llms || []).map(m => {
     const role = m.exclusive ? (m.default ? 'exclusive · boots' : 'exclusive') : 'resident';
-    const canSwap = sup.running && m.exclusive && m.service === 'standby' && sw.status !== 'swapping';
-    const act = canSwap ? `<button class="toolbtn" onclick="doSwap('${esc(m.name)}')">Swap in</button>` : '';
+    const act = svActions(m, sup.running, sw.status === 'swapping');
+    // cause first: the line that names the failure beats the last line printed
     const note = (m.hint ? '💡 ' + m.hint + ' · ' : '')
-      + (m.reason || m.last_log || (m.weights && m.weights.detail) || '');
+      + ((m.cause || []).join(' · ') || m.reason || m.last_log
+         || (m.weights && m.weights.detail) || '');
     return `<tr><td><b>${esc(m.name)}</b></td>
       <td>${esc(m.model)}<br><span style="opacity:.6">${esc(m.engine)} · :${m.port} · ${role}</span></td>
       <td>${svState(m.service)}</td><td>${svWeights(m.weights)}</td>
@@ -1051,7 +1110,15 @@ async function pollServing() {
   const auxRows = aux.map(a => `<tr><td>${esc(a.name)}</td>
       <td><span style="opacity:.6">${a.port ? ':' + a.port : ''}</span></td>
       <td>${svState(a.s.service)}</td><td>${svWeights(a.s.weights)}</td>
-      <td style="font-size:12px;opacity:.8">${esc(a.s.last_log || (a.s.weights && a.s.weights.detail) || '')}</td><td></td></tr>`).join('');
+      <td style="font-size:12px;opacity:.8">${esc(a.s.last_log || (a.s.weights && a.s.weights.detail) || '')}</td>
+      <td>${svActions(Object.assign({ name: a.name, exclusive: false }, a.s),
+                      sup.running, sw.status === 'swapping')}</td></tr>`).join('');
+  await svFetchLog();
+  // the tab re-renders every 2.5s: keep the reader's place unless they were
+  // already at the bottom, where following the tail is what they want
+  const pre0 = $('#svlogpre');
+  const keep = pre0 ? pre0.scrollTop : 0;
+  const atEnd = pre0 ? (pre0.scrollHeight - pre0.scrollTop - pre0.clientHeight < 40) : true;
   $('#results').innerHTML =
     `<p style="margin:4px 0 10px">This box <b>hosts models</b> for the knowledge host`
     + (sup.running ? ` — supervisor pid ${sup.pid}.` : '.')
@@ -1060,7 +1127,9 @@ async function pollServing() {
        incomplete weights usually means the fetch died: gated repo token, disk, network).</p>
      <table><tr><th>model</th><th>what</th><th>service</th><th>weights</th><th>note</th><th></th></tr>
      ${rows}${auxRows}</table>`
-    + svCache(r.cache);
+    + svLogPanel() + svCache(r.cache);
+  const pre = $('#svlogpre');
+  if (pre) pre.scrollTop = atEnd ? pre.scrollHeight : keep;
 }
 // Downloaded weights are big and invisible — say where they went, in the tab
 // that owns them, with enough of the layout to inspect the folder by hand.

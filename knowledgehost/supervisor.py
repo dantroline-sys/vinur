@@ -6,6 +6,11 @@ kb server itself — as direct children in their own process groups:
 
     python -m knowledgehost.supervisor start|stop|restart [svc]|status|swap <llm>|logs [svc]
 
+`start`/`stop`/`restart` with a service name act on that one service (the
+panel's Serving buttons post the same requests): a stop is HELD — the watchdog
+will not revive it until a start — and a start clears a "gave up after N
+restarts" verdict.  Without a name they mean the whole box.
+
 Children log to var/log/<name>.log (truncated on start).  The watchdog
 revives a dead service with backoff and gives up after MAX_RESTARTS in
 WINDOW_S, leaving the reason visible in `status`.  State (exact pids) lives
@@ -129,6 +134,19 @@ def alive(pid: int) -> bool:
         return True
 
 
+def dying_words(name: str, max_chars: int = 300) -> str:
+    """Why a service died, in one line — the line that NAMES the failure if the
+    log tail has one, else simply the last line.  vLLM's last line is a pydantic
+    docs URL, so 'exited rc=1 — <last line>' was routinely useless."""
+    try:
+        tail = (LOGS / f"{name}.log").read_bytes()[-16384:].decode("utf-8", "replace")
+    except OSError:
+        return ""
+    from . import serving as sv
+    hits = sv.cause_lines(tail, 1)
+    return (hits[-1] if hits else last_log_line(name))[:max_chars]
+
+
 def last_log_line(name: str) -> str:
     try:
         data = (LOGS / f"{name}.log").read_bytes()[-4096:]
@@ -232,6 +250,27 @@ def _stop_one(procs: dict, svc: dict) -> None:
             pass
 
 
+def control_plan(action: str, svc: dict, *, running: bool, active_excl: str | None) -> list[str]:
+    """What start|stop|restart means for one service, as an ordered op list —
+    kept out of the loop so the semantics are testable:
+
+      stop     stop it, then HOLD (the watchdog must not undo an operator)
+      start    un-hold, clear the failure verdict and the restart budget, and
+               bring it up — an exclusive model via SWAP, since its siblings
+               hold the VRAM and a bare spawn would just OOM
+      restart  the same, with a stop first (and a spawn even though it was up)
+    """
+    if action == "stop":
+        return ["stop", "hold", "clear"]
+    ops = ["stop"] if action == "restart" else []
+    ops += ["unhold", "clear"]
+    if svc.get("exclusive") and svc.get("entry") != active_excl:
+        return ops + ["swap"]
+    if action == "restart" or not running:
+        ops.append("spawn")
+    return ops
+
+
 def _run(svcs: list[dict], cfg: dict) -> None:
     """The resident loop — runs detached, children in their own groups."""
     from . import serving as sv
@@ -258,12 +297,14 @@ def _run(svcs: list[dict], cfg: dict) -> None:
         tmp.write_text(json.dumps(d))
         os.replace(tmp, sv.SWAP_STATE)
 
+    held: set[str] = set()          # stopped BY REQUEST — the watchdog leaves these alone
+
     def sync_state() -> None:
         write_state({"supervisor": os.getpid(),
                      "services": {n: p.pid for n, p in procs.items()},
                      "hints": {s["name"]: s["hint"] for s in svcs},
                      "standby": {e: excl[e]["name"] for e in excl if e != active_excl},
-                     "failed": failed})
+                     "failed": failed, "held": sorted(held)})
 
     # A dead run (or crashed client) can leave a model container running with
     # its VRAM held — the autostart model would then fail its free-memory check.
@@ -284,6 +325,7 @@ def _run(svcs: list[dict], cfg: dict) -> None:
         sv.SWAP_REQ.unlink()                               # a stale request must not fire
     except OSError:
         pass
+    sv.take_service_requests()                             # …nor a stale stop/start
     if excl:
         write_swap("ready")
 
@@ -321,6 +363,7 @@ def _run(svcs: list[dict], cfg: dict) -> None:
             if entry_name != want and ref and _container_alive(ref):
                 print(f"swap: stopping orphaned container {ref[1]}", flush=True)
                 _stop_container(ref)
+        held.discard(svc["name"])                          # swapping in un-holds it
         if svc["name"] not in procs or procs[svc["name"]].poll() is not None:
             procs.pop(svc["name"], None)                   # a re-request after a timeout
             (LOGS / f"{svc['name']}.log").write_bytes(b"")  # keeps a live loader running
@@ -334,7 +377,9 @@ def _run(svcs: list[dict], cfg: dict) -> None:
                 procs.pop(svc["name"], None)
                 write_swap("error", request=want,
                            error=f"{svc['name']} exited rc={p.returncode} — "
-                                 f"{last_log_line(svc['name'])}")
+                                 f"{dying_words(svc['name'])} (full log: "
+                                 f"var/log/{svc['name']}.log, or the Log button "
+                                 f"on the Serving tab)")
                 sync_state()
                 return
             if sv.probe_ready(host, port):
@@ -352,8 +397,49 @@ def _run(svcs: list[dict], cfg: dict) -> None:
                              f"(still loading? re-run the swap to keep waiting)")
 
     by_name = {s["name"]: s for s in svcs}
+
+    def check_control() -> None:
+        """Panel/CLI start|stop|restart for ONE service (var/run/svcreq/*.req).
+
+        A stop must STICK — the watchdog's whole job is reviving things, so a
+        requested stop parks the name in `held` and only a start/restart takes
+        it out again.  Both also clear a `failed` verdict and the restart
+        budget: an operator saying "start" is saying "try again", and without
+        this a service that gave up needed a whole-supervisor restart."""
+        for req in sv.take_service_requests():
+            name, action = str(req["service"]), str(req["action"])
+            svc = by_name.get(name)
+            if svc is None:
+                print(f"control: no such service '{name}'", flush=True)
+                continue
+            p = procs.get(name)
+            running = p is not None and p.poll() is None
+            for op in control_plan(action, svc, running=running, active_excl=active_excl):
+                if op == "stop":
+                    _stop_one(procs, svc)          # safe when absent: also sweeps
+                                                   # a container whose client died
+                elif op == "hold":
+                    held.add(name)
+                    print(f"control: stopped {name} (held — start brings it back)",
+                          flush=True)
+                elif op == "unhold":
+                    held.discard(name)
+                elif op == "clear":
+                    failed.pop(name, None)
+                    restarts[name] = []                # an operator retry, fresh budget
+                elif op == "swap":
+                    sv.request_swap(svc["entry"])
+                    print(f"control: {action} {name} -> swap to {svc['entry']}", flush=True)
+                elif op == "spawn":
+                    procs.pop(name, None)
+                    (LOGS / f"{name}.log").write_bytes(b"")   # a fresh attempt, fresh log
+                    procs[name] = spawn(svc)
+                    print(f"control: {action}ed {name} pid={procs[name].pid}", flush=True)
+            sync_state()
+
     while not stop_requested:
         time.sleep(TICK_S)
+        check_control()
         check_swap()
         for name, p in list(procs.items()):
             if p.poll() is None or name in failed:
@@ -484,6 +570,8 @@ def cmd_status() -> int:
             print(f"  {name:<12} dead    {('— ' + line) if line else ''}")
     for entry, name in (st.get("standby") or {}).items():
         print(f"  {name:<12} standby — './vinur.sh swap {entry}' loads it")
+    for name in st.get("held") or []:
+        print(f"  {name:<12} stopped — by request; './vinur.sh start {name}' brings it back")
     from . import serving as sv
     sw = sv.swap_state()
     if sw.get("status") == "swapping":
@@ -497,16 +585,30 @@ def cmd_restart(target: str | None) -> int:
     if target is None:
         cmd_stop()
         return cmd_start()
+    return cmd_service(target, "restart")
+
+
+def cmd_service(target: str, action: str) -> int:
+    """start|stop|restart ONE service, through the same request lane the panel
+    uses — so a stop sticks (the watchdog won't revive it) and a start clears a
+    'gave up after N restarts' verdict instead of needing a full restart."""
     st = read_state()
     if not alive(st.get("supervisor", 0)):
         print("not running — './vinur.sh start'")
         return 1
-    pid = (st.get("services") or {}).get(target)
-    if not pid:
-        print(f"no such service: {target} (have: {', '.join(st.get('services') or {})})")
+    known = set(st.get("services") or {}) | set((st.get("standby") or {}).values()) \
+        | set(st.get("failed") or {}) | set(st.get("held") or [])
+    if target not in known:
+        print(f"no such service: {target} (have: {', '.join(sorted(known)) or 'none'})")
         return 1
-    _killpg(pid, signal.SIGTERM)                       # the watchdog revives it
-    print(f"sent TERM to {target} — the supervisor restarts it within ~{int(TICK_S)}s")
+    from . import serving as sv
+    try:
+        sv.request_service(target, action)
+    except ValueError as e:
+        print(str(e))
+        return 2
+    print(f"{action} requested for {target} — the supervisor acts within ~{int(TICK_S)}s "
+          f"(./vinur.sh status)")
     return 0
 
 
@@ -576,9 +678,9 @@ def main(argv: list[str] | None = None) -> int:
     args = list(sys.argv[1:] if argv is None else argv)
     cmd = args[0] if args else "status"
     if cmd == "start":
-        return cmd_start()
+        return cmd_service(args[1], "start") if len(args) > 1 else cmd_start()
     if cmd == "stop":
-        return cmd_stop()
+        return cmd_service(args[1], "stop") if len(args) > 1 else cmd_stop()
     if cmd == "status":
         return cmd_status()
     if cmd == "restart":

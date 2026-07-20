@@ -418,6 +418,57 @@ caches are plain directories — delete `var/cache/huggingface/` or files in
 
 ## Troubleshooting
 
+### Start here: read that service's log
+
+Every service logs to `var/log/<service>.log` (`llm-<name>`, `embed`,
+`reranker`, `kb`). Three ways in, all the same file:
+
+```bash
+./vinur.sh logs llm-secondary       # follow it live
+./vinur.sh status                   # one line per service + why a dead one died
+```
+
+…or the **Log** button on the panel's Serving tab, which tails it in place.
+
+**A dying process's last line is almost never the cause.** vLLM signs off with
+`For further information visit https://errors.pydantic.dev/…` — the message
+that matters (`Value error, <field> …`) is a few lines *above* it, and says
+which config key this vLLM version rejected. The panel extracts that line into
+the note column; from a shell, read upward:
+
+```bash
+grep -B8 "errors.pydantic.dev" var/log/llm-secondary.log | head -40
+```
+
+### Starting and stopping one service
+
+```bash
+./vinur.sh stop llm-secondary       # HELD: the watchdog will not revive it
+./vinur.sh start llm-secondary      # …until you say so — also clears a
+./vinur.sh restart llm-secondary    #    "gave up after 5 restarts" verdict
+```
+
+The Serving tab's Start / Stop / Restart buttons post the same requests. A
+`start` on an **exclusive** model becomes a swap, because its sibling is
+holding the VRAM.
+
+### A download that stopped
+
+The weights chip reads **stalled** when partial files exist but nothing has
+been written for over two minutes — the fetch is stuck, not slow. Common
+causes, all visible in the log:
+
+| In the log | What it is |
+|---|---|
+| `429` / `Too Many Requests` | HF rate-limited an anonymous download — set `hf_token` |
+| `401` / `GatedRepoError` | licence not accepted, or no token |
+| `403` | the token's account lacks access to that repo |
+| `No space left on device` | the cache disk is full (tens of GB per model) |
+| `ReadTimeoutError` | network died mid-transfer |
+
+Restarting the service resumes from the partial blobs in every case — nothing
+re-downloads from zero.
+
 ### `RuntimeError: Could not find nvcc and default cuda_home='/usr/local/cuda' doesn't exist`
 
 The engine crashed inside a **JIT-compiled kernel path**: FlashInfer

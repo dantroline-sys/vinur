@@ -321,6 +321,19 @@ class Handler(BaseHTTPRequestHandler):
                 return self._send_json({"ok": True, **sv.serving_status(self.cfg)})
             except Exception as e:                 # pragma: no cover - defensive
                 return self._send_json({"ok": False, "error": f"{type(e).__name__}: {e}"}, 500)
+        if path == "/serving/log":                 # Serving tab: one service's log tail
+            if not self._authed():
+                return self._send_json({"ok": False, "error": "unauthorized"}, 401)
+            from . import serving as sv
+            try:
+                n = int((q.get("n") or ["300"])[0])
+            except ValueError:
+                n = 300
+            try:
+                return self._send_json(
+                    {"ok": True, **sv.log_tail((q.get("name") or [""])[0], min(n, 2000))})
+            except ValueError as e:
+                return self._send_json({"ok": False, "error": str(e)}, 400)
         if path == "/drop":                        # exporter handshake: accepts? + inventory
             if not self._authed():
                 return self._send_json({"ok": False, "error": "unauthorized"}, 401)
@@ -429,6 +442,7 @@ class Handler(BaseHTTPRequestHandler):
         if path not in ("/call", "/ops/run", "/ops/stop", "/ops/reload", "/config",
                         "/ops/autopilot", "/library/config", "/library/root",
                         "/source", "/scenario", "/brain", "/drop", "/serving/swap",
+                        "/serving/control",
                         "/metrics/mark", "/gaps/close", "/settings/paths"):
             return self._send_json({"ok": False, "error": "not found"}, 404)
         if not self._authed():
@@ -475,6 +489,34 @@ class Handler(BaseHTTPRequestHandler):
             sv.request_swap(name)
             return self._send_json({"ok": True, "requested": name,
                                     "note": "poll GET /serving/swap until status=ready"})
+        if path == "/serving/control":                 # start/stop/restart one service
+            # Async, like the swap lane: the supervisor acts on its next tick
+            # and the panel re-polls /serving/status.  Only services the
+            # supervisor actually knows are addressable — a stop that names
+            # nothing must not look like it worked.
+            from . import serving as sv
+            from . import supervisor as sup
+            st = sup.read_state()
+            if not sup.alive(st.get("supervisor", 0)):
+                return self._send_json(
+                    {"ok": False, "error": "the supervisor is not running "
+                                           "(./vinur.sh start)"}, 409)
+            name = str(req.get("service") or "")
+            action = str(req.get("action") or "")
+            known = set(st.get("services") or {}) \
+                | set((st.get("standby") or {}).values()) \
+                | set(st.get("failed") or {}) | set(st.get("held") or [])
+            if name not in known:
+                return self._send_json(
+                    {"ok": False, "error": f"no such service: {name} "
+                     f"(have: {', '.join(sorted(known)) or 'none'})"}, 400)
+            try:
+                sv.request_service(name, action)
+            except ValueError as e:
+                return self._send_json({"ok": False, "error": str(e)}, 400)
+            return self._send_json({"ok": True, "service": name, "action": action,
+                                    "note": "the supervisor acts within a few seconds — "
+                                            "re-poll /serving/status"})
         if path == "/drop":                            # research hand-off over HTTP
             # A remote Vinkona's exporter posts solved/*.md here instead of
             # writing a shared folder; ingest mines research_solved_dir either way.
