@@ -517,16 +517,24 @@ def main():
         hcfg = {"hf_token": "hf_abc123", "hf_transfer": True}
         e = sv.hf_env(hcfg, "container")
         assert e["HF_TOKEN"] == "hf_abc123" == e["HUGGING_FACE_HUB_TOKEN"]
-        assert e["HF_HUB_ENABLE_HF_TRANSFER"] == "1"
+        assert e["HF_XET_HIGH_PERFORMANCE"] == "1", \
+            "containers get the Xet flag (the legacy env is deprecated noise)"
+        assert "HF_HUB_ENABLE_HF_TRANSFER" not in e
         with tempfile.TemporaryDirectory() as td2:
             bare = sv.hf_env(hcfg, "vllm", root=Path(td2))
-            assert "HF_HUB_ENABLE_HF_TRANSFER" not in bare, \
-                "bare metal without the package must NOT set the flag (hub refuses)"
+            assert "HF_XET_HIGH_PERFORMANCE" not in bare \
+                and "HF_HUB_ENABLE_HF_TRANSFER" not in bare, \
+                "bare metal without a transfer package must set NO flag"
             assert bare["HF_TOKEN"] == "hf_abc123"
-            (Path(td2) / "serving" / ".venv" / "lib" / "python3.12"
-             / "site-packages" / "hf_transfer").mkdir(parents=True)
+            site = (Path(td2) / "serving" / ".venv" / "lib" / "python3.12"
+                    / "site-packages")
+            (site / "hf_transfer").mkdir(parents=True)
             assert sv.hf_env(hcfg, "vllm",
                              root=Path(td2))["HF_HUB_ENABLE_HF_TRANSFER"] == "1"
+            (site / "hf_xet").mkdir()                    # Xet outranks the legacy pkg
+            e2 = sv.hf_env(hcfg, "vllm", root=Path(td2))
+            assert e2["HF_XET_HIGH_PERFORMANCE"] == "1" \
+                and "HF_HUB_ENABLE_HF_TRANSFER" not in e2
         assert sv.hf_env({"hf_token": "", "hf_transfer": False}, "container") == {}
         os.environ["HF_TOKEN"] = "hf_fromhost"          # host env passes through
         assert sv.hf_env({"hf_token": ""}, "container")["HF_TOKEN"] == "hf_fromhost"

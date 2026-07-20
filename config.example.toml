@@ -148,11 +148,12 @@ distill_parallel = 0
 # authenticates: required for gated repos, and authenticated requests are
 # also the last to be throttled.  It is a SECRET — set it here or export
 # HF_TOKEN; it is never shown in the panel and is redacted from the exec:
-# log line.  `hf_transfer` (default on) enables Hugging Face's parallel
-# Rust downloader — the actual fix for snail-pace fetches.  The official
-# vLLM image ships the package; for a bare-metal serving venv it is only
-# enabled when the package is installed there (pip install hf_transfer
-# into serving/.venv).
+# log line.  `hf_transfer` (default on) enables the high-performance
+# transfer path — the actual fix for snail-pace fetches.  Modern
+# huggingface_hub does this via Xet (HF_XET_HIGH_PERFORMANCE); the legacy
+# hf_transfer env is used only for a bare-metal serving venv that has that
+# package instead (pip install hf_xet — or hf_transfer — into
+# serving/.venv; containers need nothing).
 hf_token    = ""
 hf_transfer = true
 

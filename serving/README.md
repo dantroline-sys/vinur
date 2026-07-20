@@ -511,6 +511,14 @@ Seen in healthy logs — none of these stop the engine:
   trips its own warning.  Under podman we strip these at run
   (`--unsetenv`); docker has no unset flag, so there the four lines remain.
   Harmless either way.
+- **`` The `use_fast` parameter is deprecated ``** (transformers) — vLLM's
+  own image-processor plumbing calling a transformers API that moved.
+  Upstream noise, nothing in your config drives it.
+- **`FutureWarning: The HF_HUB_ENABLE_HF_TRANSFER environment variable is
+  deprecated`** — from checkouts before the Xet switch: modern
+  huggingface_hub transfers via Xet, so vinur now sets
+  `HF_XET_HIGH_PERFORMANCE` instead (serving.hf_env).  If you still see
+  this, either update vinur or you exported the legacy variable yourself.
 
 The line that actually matters is `ERROR ... EngineCore failed to start` —
 diagnose from the traceback directly above it.

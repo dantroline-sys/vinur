@@ -84,7 +84,9 @@ def drop_inventory(cfg: dict) -> dict:
     ddir = cfg.get("research_solved_dir")
     if not ddir:
         return {"ok": True, "accepts": False,
-                "reason": "research_solved_dir is not configured on this host"}
+                "reason": "research_solved_dir is not set on this host — set it "
+                          "in the panel under Settings › Paths (the folder is "
+                          "created on save), then drops flow on the next export"}
     drops = {}
     try:
         for fn in sorted(os.listdir(ddir)):
@@ -108,7 +110,8 @@ def write_drop(cfg: dict, name, content) -> dict:
     re-send its whole outbox safely."""
     ddir = cfg.get("research_solved_dir")
     if not ddir:
-        raise ValueError("research_solved_dir is not configured on this host")
+        raise ValueError("research_solved_dir is not set on this host — set it "
+                         "in the panel under Settings › Paths")
     if not isinstance(name, str) or not _DROP_NAME.match(name):
         raise ValueError("drop name must be '<16 hex>.md'")
     if not isinstance(content, str) or not content.strip():

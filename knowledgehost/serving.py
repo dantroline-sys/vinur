@@ -137,29 +137,33 @@ def _container_runtime(entry: dict) -> str:
         "nvidia-container-toolkit), or set runtime=/path on the entry")
 
 
-def _venv_has_hf_transfer(root: Path) -> bool:
+def _venv_has(root: Path, pkg: str) -> bool:
     import glob
     return bool(glob.glob(str(root / "serving" / ".venv" / "lib" / "python*" /
-                              "site-packages" / "hf_transfer*")))
+                              "site-packages" / (pkg + "*"))))
 
 
 def hf_env(cfg: dict, engine: str, root: Path = ROOT) -> dict:
     """Hugging Face download env for an LLM engine: the auth token (gated
     models; anonymous requests are also the first to be throttled) and the
-    hf_transfer fast path — the parallel Rust downloader that is the actual
-    fix for snail-pace weight fetches.  For bare-metal engines the transfer
-    flag is set ONLY when the package is present in the serving venv:
-    huggingface_hub refuses to download at all when the env is set but the
-    package is missing.  Container engines get it unconditionally (the
-    official vLLM image ships hf_transfer)."""
+    high-performance transfer flag — the actual fix for snail-pace weight
+    fetches.  Modern huggingface_hub transfers via Xet (HF_XET_HIGH_PERFORMANCE;
+    the old HF_HUB_ENABLE_HF_TRANSFER is deprecated and ignored, and merely
+    setting it draws a FutureWarning).  Containers get the Xet flag outright —
+    an older image without Xet simply ignores the unknown variable.  Bare-metal
+    venvs get whichever backend is actually installed: hf_xet preferred, legacy
+    hf_transfer as fallback, nothing when neither exists (the legacy env with
+    no package makes the hub refuse to download at all)."""
     out: dict = {}
     tok = str(cfg.get("hf_token") or os.environ.get("HF_TOKEN")
               or os.environ.get("HUGGING_FACE_HUB_TOKEN") or "").strip()
     if tok:
         out["HF_TOKEN"] = out["HUGGING_FACE_HUB_TOKEN"] = tok
-    if cfg.get("hf_transfer", True) and (engine == "container"
-                                         or _venv_has_hf_transfer(root)):
-        out["HF_HUB_ENABLE_HF_TRANSFER"] = "1"
+    if cfg.get("hf_transfer", True):
+        if engine == "container" or _venv_has(root, "hf_xet"):
+            out["HF_XET_HIGH_PERFORMANCE"] = "1"
+        elif _venv_has(root, "hf_transfer"):
+            out["HF_HUB_ENABLE_HF_TRANSFER"] = "1"
     return out
 
 

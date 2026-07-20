@@ -441,6 +441,18 @@ def main():
             assert code == 400 and "not a file" in _r["error"], _r
             code, _r = post_path("s3cret", {"key": "sources", "value": ""})
             assert code == 400 and "cannot be empty" in _r["error"], _r
+            inbox = Path(td) / "made-on-save" / "solved"
+            code, r = post_path("s3cret", {"key": "research_solved_dir",
+                                           "value": str(inbox)})
+            assert code == 200 and inbox.is_dir(), "the inbox is created on save"
+            assert scfg["research_solved_dir"] == str(inbox), "live-applied"
+            from knowledgehost.research import drop_inventory
+            assert drop_inventory(scfg)["accepts"] is True
+            assert "Settings" in drop_inventory({"research_solved_dir": ""})["reason"], \
+                "the refusal must say WHERE to fix it"
+            code, _r = post_path("s3cret", {"key": "research_solved_dir",
+                                            "value": str(Path(td) / "solved2")})
+            assert code == 200, "restore the original inbox for the later drop tests"
             ok("/settings/paths: authed, fail-closed, live vs restart split, in place")
 
             # ── Sources progress: the store-level join + /browse enrichment ──

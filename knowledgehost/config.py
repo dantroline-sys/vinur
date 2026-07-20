@@ -166,10 +166,9 @@ DEFAULTS = {
     # `hf_token` authenticates (gated models; anonymous requests are also the
     # first to be throttled) — a SECRET: file/env only, never surfaced over
     # HTTP, redacted from the exec: log line.  `hf_transfer` enables the
-    # parallel Rust downloader (HF_HUB_ENABLE_HF_TRANSFER=1) — the actual
-    # snail-pace fix; the official vLLM image ships the package, a bare-metal
-    # serving venv gets it checked before the env is set (a missing package
-    # would make huggingface_hub refuse to download at all).
+    # high-performance transfer path — Xet (HF_XET_HIGH_PERFORMANCE=1) on
+    # modern huggingface_hub, the legacy hf_transfer env only for a bare-metal
+    # venv that ships that package instead (serving.hf_env picks per engine).
     "hf_token": "",
     "hf_transfer": True,
     # Chunk zones the distiller SKIPS (zones.classify: document furniture where
@@ -838,9 +837,10 @@ EDITABLE_PATHS = {
                 "note": "document roots the ingest crawl walks"},
     "zim_path": {"kind": "file", "optional": True, "must_exist": True, "live": True,
                  "note": "Kiwix Wikipedia ZIM (empty = wikipedia off)"},
-    "research_solved_dir": {"kind": "dir", "optional": True, "must_exist": True,
+    "research_solved_dir": {"kind": "dir", "optional": True, "create": True,
                             "live": True,
-                            "note": "solved/ research-drop inbox (empty = HTTP /drop only)"},
+                            "note": "research-drop inbox — Vinkona's /drop lands here; "
+                                    "empty = drops REFUSED (created on save)"},
     "bundle_dir": {"kind": "dir", "optional": True, "live": True,
                    "note": "where split/eject write .kdb brains (empty = var/bundles)"},
     "bundle_work_dir": {"kind": "dir", "optional": True, "live": True,
@@ -895,7 +895,12 @@ def set_path_setting(cfg: dict, config_path: str, key: str, raw):
         s = os.path.expanduser(str(s or "").strip())
         if not os.path.isabs(s):
             raise ValueError(f"{key}: must be an absolute path on the server: {s!r}")
-        if kind == "dirlist" or (kind == "dir" and spec.get("must_exist")):
+        if spec.get("create") and kind == "dir":       # an inbox we own: make it
+            try:
+                os.makedirs(s, exist_ok=True)
+            except OSError as e:
+                raise ValueError(f"{key}: cannot create {s}: {e}")
+        elif kind == "dirlist" or (kind == "dir" and spec.get("must_exist")):
             if not os.path.isdir(s):
                 raise ValueError(f"{key}: not a directory on the server: {s}")
         elif kind == "file" and spec.get("must_exist"):
