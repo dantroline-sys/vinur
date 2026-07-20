@@ -143,6 +143,19 @@ embed_max_tokens      = 512   # clip inputs to the server's per-sequence window 
 # Also editable live in the panel's Settings tab.
 distill_parallel = 0
 
+# ── Hugging Face downloads ──────────────────────────────────────────────────
+# Weights are fetched by vLLM (or the container) at start.  `hf_token`
+# authenticates: required for gated repos, and authenticated requests are
+# also the last to be throttled.  It is a SECRET — set it here or export
+# HF_TOKEN; it is never shown in the panel and is redacted from the exec:
+# log line.  `hf_transfer` (default on) enables Hugging Face's parallel
+# Rust downloader — the actual fix for snail-pace fetches.  The official
+# vLLM image ships the package; for a bare-metal serving venv it is only
+# enabled when the package is installed there (pip install hf_transfer
+# into serving/.venv).
+hf_token    = ""
+hf_transfer = true
+
 # Chunk ZONES the distiller skips — document furniture with nothing to learn
 # (bibliographies also mint junk concepts from author names).  Zoning is
 # structural (line shapes, zones.py), computed at distill time, never stored:

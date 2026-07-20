@@ -162,6 +162,16 @@ DEFAULTS = {
     # Per-request latency grows with the batch: keep distill_timeout_s
     # comfortable (batching raises throughput, not single-request speed).
     "distill_parallel": 0,
+    # Hugging Face downloads (weights fetched by vLLM/the container at start):
+    # `hf_token` authenticates (gated models; anonymous requests are also the
+    # first to be throttled) — a SECRET: file/env only, never surfaced over
+    # HTTP, redacted from the exec: log line.  `hf_transfer` enables the
+    # parallel Rust downloader (HF_HUB_ENABLE_HF_TRANSFER=1) — the actual
+    # snail-pace fix; the official vLLM image ships the package, a bare-metal
+    # serving venv gets it checked before the env is set (a missing package
+    # would make huggingface_hub refuse to download at all).
+    "hf_token": "",
+    "hf_transfer": True,
     # Chunk zones the distiller SKIPS (zones.classify: document furniture where
     # nothing distillable lives — bibliographies also mint junk concepts).  The
     # text stays in the store and FTS (library search still finds it); removing
@@ -509,7 +519,7 @@ _FLOAT_KEYS = {"min_confidence", "node_sim_high", "node_sim_low", "kb_min_sim",
                "stats_interval_s"}
 _BOOL_KEYS = {"embed_task_prefix", "ocr", "verify", "strict",
               "conceptnet_include_lexical", "ann_search", "ann_mmap", "wiki_semantic",
-              "ask_fit_gate", "use_spacy", "library_dense"}
+              "ask_fit_gate", "use_spacy", "library_dense", "hf_transfer"}
 _LIST_KEYS = {"sources", "extensions", "distill_urls", "extract_urls", "verify_urls",
               "encrypted_bundles", "library_sources", "stopwords_extra",
               "high_stakes_extra", "ops_regions", "ask_exclude_facets",
@@ -813,6 +823,109 @@ def set_library_root(cfg: dict, config_path: str, raw) -> str:
                     "library root (set via the Library panel)")
     cfg["library_root"] = root                        # live — no restart needed
     return root
+
+
+# ── directory locations editable from the panel (Settings › Paths) ────────────
+# The THIRD deliberate config-write exception (ops importers, the Library panel,
+# now this) — every value is validated FAIL-CLOSED server-side before it touches
+# config.toml.  kind: dir | file | dirlist.  must_exist=False means the code
+# creates the target itself, so only its PARENT directory must exist.  optional
+# means "" is a valid value (feature off / built-in default location).
+# live=False keys are read once at process start — the panel labels them
+# "restart to apply" and the running cfg is left untouched.
+EDITABLE_PATHS = {
+    "sources": {"kind": "dirlist", "live": True,
+                "note": "document roots the ingest crawl walks"},
+    "zim_path": {"kind": "file", "optional": True, "must_exist": True, "live": True,
+                 "note": "Kiwix Wikipedia ZIM (empty = wikipedia off)"},
+    "research_solved_dir": {"kind": "dir", "optional": True, "must_exist": True,
+                            "live": True,
+                            "note": "solved/ research-drop inbox (empty = HTTP /drop only)"},
+    "bundle_dir": {"kind": "dir", "optional": True, "live": True,
+                   "note": "where split/eject write .kdb brains (empty = var/bundles)"},
+    "bundle_work_dir": {"kind": "dir", "optional": True, "live": True,
+                        "note": "scenario working-DB assembly area (empty = var/)"},
+    "db_path": {"kind": "file", "live": False,
+                "note": "raw chunk store (sqlite backend) — moving it does NOT move data"},
+    "lance_dir": {"kind": "dir", "live": False,
+                  "note": "raw chunk store (lance backend) — moving it does NOT move data"},
+    "kb_path": {"kind": "file", "live": False,
+                "note": "the distilled knowledge base — moving it does NOT move data"},
+    "library_db": {"kind": "file", "live": False,
+                   "note": "the search-only library's FTS index"},
+    "metrics_db": {"kind": "file", "optional": True, "live": False,
+                   "note": "Stats telemetry db (empty = var/metrics.db)"},
+    "ann_path": {"kind": "file", "optional": True, "live": False,
+                 "note": "dense ANN index stem (empty = <kb_path>.ann)"},
+    "control_dir": {"kind": "dir", "optional": True, "live": False,
+                    "note": "ops/autopilot control files (empty = var/)"},
+}
+
+
+def paths_status(cfg: dict) -> dict:
+    """The Settings › Paths payload: every editable path with its current value
+    and whether it exists on disk.  library_root/library_sources are shown
+    read-only — their edits must go through the Library panel's containment
+    validation."""
+    rows = []
+    for key, spec in EDITABLE_PATHS.items():
+        val = cfg.get(key) or ""
+        vals = val if isinstance(val, list) else ([val] if val else [])
+        rows.append({"key": key, "value": val, "kind": spec["kind"],
+                     "optional": bool(spec.get("optional")), "live": spec["live"],
+                     "note": spec["note"],
+                     "exists": all(os.path.exists(os.path.expanduser(str(v)))
+                                   for v in vals) if vals else None})
+    ro = [{"key": k, "value": cfg.get(k) or "",
+           "note": "managed by the Library panel (containment-validated there)"}
+          for k in ("library_root", "library_sources")]
+    return {"paths": rows, "readonly": ro}
+
+
+def set_path_setting(cfg: dict, config_path: str, key: str, raw):
+    """Validate + persist one panel-supplied path (Settings › Paths).  Absolute
+    server paths only (after ~-expansion); dirlist accepts a list or a
+    newline-separated string.  Returns (value, live) — live values are applied
+    to the running cfg, restart-only values are written to file untouched."""
+    spec = EDITABLE_PATHS.get(key)
+    if not spec:
+        raise ValueError(f"not a panel-editable path: {key}")
+
+    def _one(s: str, kind: str) -> str:
+        s = os.path.expanduser(str(s or "").strip())
+        if not os.path.isabs(s):
+            raise ValueError(f"{key}: must be an absolute path on the server: {s!r}")
+        if kind == "dirlist" or (kind == "dir" and spec.get("must_exist")):
+            if not os.path.isdir(s):
+                raise ValueError(f"{key}: not a directory on the server: {s}")
+        elif kind == "file" and spec.get("must_exist"):
+            if not os.path.isfile(s):
+                raise ValueError(f"{key}: not a file on the server: {s}")
+        elif not os.path.isdir(s) and not os.path.isdir(os.path.dirname(s)):
+            raise ValueError(f"{key}: parent directory does not exist: {s}")
+        return s
+
+    if spec["kind"] == "dirlist":
+        items = raw if isinstance(raw, list) else \
+            [ln for ln in str(raw or "").replace(",", "\n").splitlines() if ln.strip()]
+        value = [_one(x, "dirlist") for x in items]
+        if not value and not spec.get("optional"):
+            raise ValueError(f"{key} cannot be empty")
+        rendered = "[" + ", ".join(_toml_scalar(x) for x in value) + "]"
+    else:
+        s = str(raw or "").strip()
+        if not s:
+            if not spec.get("optional"):
+                raise ValueError(f"{key} cannot be empty")
+            value = ""
+        else:
+            value = _one(s, spec["kind"])
+        rendered = _toml_scalar(value)
+    _write_toml_top(config_path, key, rendered,
+                    f"{key} (set via the Settings panel)")
+    if spec["live"]:
+        cfg[key] = value
+    return value, spec["live"]
 
 
 def load_config(path: str | None = None) -> dict:

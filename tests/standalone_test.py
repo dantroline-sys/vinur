@@ -383,6 +383,66 @@ def main():
             httpd.kb = None
             ok("/gaps/close: authed, status-validated, defaults to dismissed")
 
+            # ── /settings/paths: the Paths tab (fail-closed, in-place TOML) ──
+            def get_paths(tok):
+                req = urllib.request.Request(
+                    f"http://127.0.0.1:{port}/settings/paths",
+                    headers={"Authorization": f"Bearer {tok}"} if tok else {})
+                try:
+                    with urllib.request.urlopen(req, timeout=5) as r:
+                        return r.status, json.loads(r.read())
+                except urllib.error.HTTPError as e:
+                    return e.code, {}
+
+            def post_path(tok, body):
+                req = urllib.request.Request(
+                    f"http://127.0.0.1:{port}/settings/paths",
+                    data=json.dumps(body).encode(),
+                    headers={"Content-Type": "application/json",
+                             **({"Authorization": f"Bearer {tok}"} if tok else {})},
+                    method="POST")
+                try:
+                    with urllib.request.urlopen(req, timeout=5) as r:
+                        return r.status, json.loads(r.read())
+                except urllib.error.HTTPError as e:
+                    return e.code, json.loads(e.read())
+
+            code, _ = get_paths("")
+            assert code == 401, code
+            code, pr = get_paths("s3cret")
+            assert code == 200 and pr["ok"] and pr["writable"], pr
+            pkeys = {p["key"] for p in pr["paths"]}
+            assert {"sources", "kb_path", "zim_path", "metrics_db"} <= pkeys
+            assert {p["key"] for p in pr["readonly"]} == {"library_root",
+                                                          "library_sources"}
+            newdocs = Path(td) / "docs-a"
+            newdocs.mkdir()
+            code, _r = post_path(None, {"key": "sources", "value": str(newdocs)})
+            assert code == 401, code
+            code, _r = post_path("s3cret", {"key": "auth_token", "value": "/x"})
+            assert code == 400, "only registry keys are reachable"
+            code, _r = post_path("s3cret", {"key": "sources", "value": "relative/x"})
+            assert code == 400 and "absolute" in _r["error"], _r
+            code, r = post_path("s3cret", {"key": "sources", "value": str(newdocs)})
+            assert code == 200 and r["live"] and r["value"] == [str(newdocs)], r
+            assert scfg["sources"] == [str(newdocs)], "live key must hit running cfg"
+            text2 = libtoml.read_text()
+            assert text2.index("sources") < text2.index("[serving]")
+            (Path(td) / "elsewhere").mkdir()
+            old_kb = scfg["kb_path"]
+            code, r = post_path("s3cret", {"key": "kb_path",
+                                           "value": str(Path(td) / "elsewhere" / "kb.db")})
+            assert code == 200 and r["live"] is False and "restart" in r["note"], r
+            assert scfg["kb_path"] == old_kb, "restart-only keys must not touch live cfg"
+            code, r = post_path("s3cret", {"key": "zim_path", "value": ""})
+            assert code == 200 and r["value"] == "", r
+            code, _r = post_path("s3cret", {"key": "zim_path",
+                                            "value": str(Path(td) / "no.zim")})
+            assert code == 400 and "not a file" in _r["error"], _r
+            code, _r = post_path("s3cret", {"key": "sources", "value": ""})
+            assert code == 400 and "cannot be empty" in _r["error"], _r
+            ok("/settings/paths: authed, fail-closed, live vs restart split, in place")
+
             # ── Sources progress: the store-level join + /browse enrichment ──
             import sqlite3
             from knowledgehost.store import SqliteStore

@@ -190,7 +190,8 @@ const GROUPS = [
   ['ops', 'Operations', []],
   ['serving', 'Serving', []],
   ['stats', 'Stats', []],
-  ['settings', 'Settings', [['settings', 'General'], ['bundles', 'Bundles'],
+  ['settings', 'Settings', [['settings', 'General'], ['paths', 'Paths'],
+                            ['bundles', 'Bundles'],
                             ['library', 'Library'], ['autopilot', 'Prioritizer']]],
 ];
 const PARENT = {};                    // leaf key -> its group key
@@ -287,6 +288,7 @@ function go(k, leaf) {
   else if (k === 'stats') { loadStatsTab(); opsTimer = setInterval(() => { if (active === 'stats') loadStatsTab(true); }, 10000); }
   else if (k === 'overview') { loadOverview(); }
   else if (k === 'settings') { loadSettings(); }
+  else if (k === 'paths') { loadPaths(); }
   else if (k === 'autopilot') { loadAutopilot(); }
   else if (k === 'bundles') { loadBundles(); }
   else if (k === 'library') { loadLibrary(); }
@@ -357,6 +359,10 @@ function renderBar(k) {
     $('#bar').innerHTML = tokInput()
       + ` <button class="toolbtn" onclick="saveSettings()">Save</button>`
       + ` <span style="opacity:.6;font-size:13px">edits config.toml — restart or Reload KB to apply</span>`;
+  } else if (k === 'paths') {
+    $('#bar').innerHTML = tokInput()
+      + ` <button class="toolbtn" onclick="loadPaths()">Refresh</button>`
+      + ` <span style="opacity:.6;font-size:13px">absolute server paths — each row saves on its own</span>`;
   } else if (k === 'library') {
     $('#bar').innerHTML = tokInput()
       + ` <button class="toolbtn" onclick="saveLibrarySelection()">Save selection</button>`
@@ -1399,6 +1405,51 @@ async function saveSettings() {
     ? '✓ saved ' + Object.keys(r.applied || {}).length + ' setting(s) — ' + esc(r.note || '')
     : '✗ ' + esc(r.error || 'failed')}</div>`;
   if (r.ok) loadSettings();
+}
+
+// ── Settings › Paths: every directory/file location, edited row by row ──────
+// Values are validated FAIL-CLOSED on the server (absolute, existing where
+// required); data-store rows only take effect on restart and say so.  The
+// library keys are shown read-only — the Library tab owns their validation.
+async function loadPaths() {
+  $('#banner').innerHTML = ''; $('#results').className = ''; $('#results').textContent = 'loading paths…';
+  let r; try { r = await (await authFetch('/settings/paths')).json(); } catch (e) { $('#results').textContent = 'request failed: ' + e; return; }
+  if (!r.ok) { $('#results').className = 'empty'; $('#results').textContent = 'enter the auth token above to edit Paths'; return; }
+  const NL = String.fromCharCode(10);
+  const rows = (r.paths || []).map(p => {
+    const multi = p.kind === 'dirlist';
+    const val = multi ? (Array.isArray(p.value) ? p.value.join(NL) : (p.value || '')) : (p.value || '');
+    const inp = multi
+      ? `<textarea data-pk="${p.key}" rows="${Math.max(2, val.split(NL).length)}" style="width:340px" placeholder="one absolute folder per line">${esc(val)}</textarea>`
+      : `<input data-pk="${p.key}" value="${esc(val)}" style="width:340px" placeholder="${p.optional ? '(empty = default/off)' : 'absolute server path'}">`;
+    const state = p.exists === null ? '' : (p.exists ? '✓' : '<span style="color:var(--warn,#b45309)">missing</span>');
+    return `<tr><td><code>${esc(p.key)}</code></td><td>${inp}</td>`
+      + `<td style="white-space:nowrap">${state}</td>`
+      + `<td style="white-space:nowrap">${p.live ? 'live' : '<b>restart</b>'}</td>`
+      + `<td style="opacity:.7">${esc(p.note)}</td>`
+      + `<td><button class="toolbtn" style="font-size:12px;padding:3px 9px" onclick="savePath('${p.key}')">Save</button></td></tr>`;
+  }).join('');
+  const ro = (r.readonly || []).map(p =>
+    `<tr style="opacity:.55"><td><code>${esc(p.key)}</code></td>`
+    + `<td>${esc(Array.isArray(p.value) ? p.value.join(', ') : p.value)}</td>`
+    + `<td></td><td></td><td>${esc(p.note)}</td><td></td></tr>`).join('');
+  $('#results').innerHTML =
+    `<div style="opacity:.6;margin-bottom:6px">${r.writable
+       ? 'writing to config.toml in place — comments and other keys are preserved'
+       : 'server started without -c — read-only'}</div>`
+    + `<table><tr><th>key</th><th>value</th><th></th><th>applies</th><th>what it is</th><th></th></tr>${rows}${ro}</table>`
+    + `<div style="opacity:.6;font-size:12px;margin-top:8px">Moving a data-store path does NOT move its data — `
+    + `move the file/folder yourself first (host stopped), then point the key at it and restart.</div>`;
+}
+async function savePath(key) {
+  const el = document.querySelector(`#results [data-pk="${key}"]`);
+  if (!el) return;
+  const r = await postJSON('/settings/paths', { key, value: el.value })
+    .catch(e => ({ ok: false, error: '' + e }));
+  $('#banner').innerHTML = `<div class="note">${r.ok
+    ? '✓ ' + esc(key) + ' saved — ' + esc(r.note || '')
+    : '✗ ' + esc(r.error || 'failed')}</div>`;
+  if (r.ok) loadPaths();
 }
 
 // ── Stats tab: banked telemetry → small-multiple SVG time-series ────────────

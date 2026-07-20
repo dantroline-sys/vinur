@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import sys
 import time
 import urllib.error
@@ -134,6 +135,42 @@ def _container_runtime(entry: dict) -> str:
     raise FileNotFoundError(
         "no container runtime found — install podman (dnf install podman "
         "nvidia-container-toolkit), or set runtime=/path on the entry")
+
+
+def _venv_has_hf_transfer(root: Path) -> bool:
+    import glob
+    return bool(glob.glob(str(root / "serving" / ".venv" / "lib" / "python*" /
+                              "site-packages" / "hf_transfer*")))
+
+
+def hf_env(cfg: dict, engine: str, root: Path = ROOT) -> dict:
+    """Hugging Face download env for an LLM engine: the auth token (gated
+    models; anonymous requests are also the first to be throttled) and the
+    hf_transfer fast path — the parallel Rust downloader that is the actual
+    fix for snail-pace weight fetches.  For bare-metal engines the transfer
+    flag is set ONLY when the package is present in the serving venv:
+    huggingface_hub refuses to download at all when the env is set but the
+    package is missing.  Container engines get it unconditionally (the
+    official vLLM image ships hf_transfer)."""
+    out: dict = {}
+    tok = str(cfg.get("hf_token") or os.environ.get("HF_TOKEN")
+              or os.environ.get("HUGGING_FACE_HUB_TOKEN") or "").strip()
+    if tok:
+        out["HF_TOKEN"] = out["HUGGING_FACE_HUB_TOKEN"] = tok
+    if cfg.get("hf_transfer", True) and (engine == "container"
+                                         or _venv_has_hf_transfer(root)):
+        out["HF_HUB_ENABLE_HF_TRANSFER"] = "1"
+    return out
+
+
+# Secrets must never reach a log file: the exec: line prints the full argv,
+# and a container's env rides IN the argv as `-e KEY=value` pairs.
+_SECRET_ENV = re.compile(
+    r"^([A-Za-z0-9_]*(?:TOKEN|SECRET|PASSWORD|API_KEY)[A-Za-z0-9_]*)=(.+)$")
+
+
+def redact_argv(cmd: list) -> list:
+    return [_SECRET_ENV.sub(r"\1=***", str(a)) for a in cmd]
 
 
 def container_name(entry_name: str) -> str:
@@ -422,11 +459,11 @@ _FAILURE_HINTS = [
      "kv_cache_dtype=\"fp8\", and check what else is resident (exclusive "
      "swap mode exists for this). serving/README.md has a worked example."),
     ("401 Client Error",
-     "gated HF repo — accept its license on huggingface.co and export "
-     "HF_TOKEN before starting."),
+     "gated HF repo — accept its license on huggingface.co and set "
+     "hf_token in config.toml (or export HF_TOKEN) before starting."),
     ("GatedRepoError",
-     "gated HF repo — accept its license on huggingface.co and export "
-     "HF_TOKEN before starting."),
+     "gated HF repo — accept its license on huggingface.co and set "
+     "hf_token in config.toml (or export HF_TOKEN) before starting."),
     ("No space left on device",
      "disk full — weights live in var/cache/huggingface; prune models you "
      "dropped from the config."),
@@ -671,6 +708,11 @@ def main(argv: list[str] | None = None) -> None:
             sys.exit(f"no serving.llms entry named '{ns.name}' "
                      f"(have: {', '.join(entries) or 'none'})")
         entry = entries[ns.name]
+        hf = hf_env(cfg, str(entry.get("engine") or ""))
+        if entry.get("engine") == "container":
+            # HF auth/transfer env must ride INTO the container as -e flags
+            # (host env doesn't cross); an explicit entry env still wins.
+            entry = {**entry, "env": {**hf, **dict(entry.get("env") or {})}}
         cmd = llm_argv(entry)
         if entry.get("engine") == "container":
             # env went into the argv as -e flags; just guarantee the mounted
@@ -680,6 +722,8 @@ def main(argv: list[str] | None = None) -> None:
             # Per-model environment (env = { NVCC_APPEND_FLAGS = "...", ... }):
             # applied here, at exec time, so the supervisor path and a manual
             # `python -m knowledgehost.serving <name>` behave identically.
+            # HF env first — an explicit entry env overrides it.
+            os.environ.update(hf)
             env = entry.get("env")
             if isinstance(env, dict):
                 os.environ.update({str(k): str(v) for k, v in env.items()})
@@ -689,7 +733,7 @@ def main(argv: list[str] | None = None) -> None:
                 os.environ["CUDA_HOME"] = home
                 os.environ["PATH"] = f"{home}/bin:" + os.environ.get("PATH", "")
                 print(f"CUDA_HOME not set — using the toolkit at {home}", flush=True)
-    print("exec:", " ".join(cmd), flush=True)
+    print("exec:", " ".join(redact_argv(cmd)), flush=True)
     os.execvp(cmd[0], cmd)
 
 

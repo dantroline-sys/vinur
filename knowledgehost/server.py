@@ -393,7 +393,7 @@ class Handler(BaseHTTPRequestHandler):
                                     "commands": OPS_COMMANDS, "help": OPS_HELP,
                                     "bundles": bnames,
                                     "serving_models": excl, "auto_models": auto})
-        if path in ("/ops/status", "/ops/log", "/config"):
+        if path in ("/ops/status", "/ops/log", "/config", "/settings/paths"):
             if not self._authed():
                 return self._send_json({"ok": False, "error": "unauthorized"}, 401)
             if path == "/ops/status":
@@ -412,6 +412,11 @@ class Handler(BaseHTTPRequestHandler):
                     "ok": True, "schema": schema,
                     "values": {k: self.cfg.get(k) for k in schema},
                     "config_path": self.cfg.get("_config_path")})
+            if path == "/settings/paths":
+                from .config import paths_status
+                return self._send_json({
+                    "ok": True, **paths_status(self.cfg),
+                    "writable": bool(self.cfg.get("_config_path"))})
         if path == "/library/config":               # Library panel: trusted root + subfolder toggles
             if not self._authed():
                 return self._send_json({"ok": False, "error": "unauthorized"}, 401)
@@ -424,7 +429,7 @@ class Handler(BaseHTTPRequestHandler):
         if path not in ("/call", "/ops/run", "/ops/stop", "/ops/reload", "/config",
                         "/ops/autopilot", "/library/config", "/library/root",
                         "/source", "/scenario", "/brain", "/drop", "/serving/swap",
-                        "/metrics/mark", "/gaps/close"):
+                        "/metrics/mark", "/gaps/close", "/settings/paths"):
             return self._send_json({"ok": False, "error": "not found"}, 404)
         if not self._authed():
             return self._send_json({"ok": False, "error": "unauthorized"}, 401)
@@ -519,6 +524,21 @@ class Handler(BaseHTTPRequestHandler):
                 return self._send_json({"ok": False, "error": str(e)}, 400)
             return self._send_json({"ok": True, "applied": applied, "note":
                 "saved — restart to apply, or 'Reload KB' for read-path keys"})
+        if path == "/settings/paths":                  # one validated path key
+            from .config import paths_status, set_path_setting
+            cp = self.cfg.get("_config_path")
+            if not cp:
+                return self._send_json(
+                    {"ok": False, "error": "server started without -c; no config file to write"}, 400)
+            try:
+                value, live = set_path_setting(self.cfg, cp, str(req.get("key") or ""),
+                                               req.get("value"))
+            except (ValueError, OSError) as e:
+                return self._send_json({"ok": False, "error": str(e)}, 400)
+            return self._send_json({
+                "ok": True, "value": value, "live": live, **paths_status(self.cfg),
+                "note": "applied live" if live else
+                        "saved — restart the host (or supervisor) to apply"})
         if path == "/library/root":                    # set the trusted root itself
             from .config import library_status, set_library_root
             cp = self.cfg.get("_config_path")

@@ -510,6 +510,41 @@ def main():
         assert p.poll() is not None and not procs2 and time.time() - t0 < sup.GRACE_S
         ok("_stop_one: container svc -> runtime stop even with no client; bare -> killpg")
 
+    # ── HF downloads: token + guarded hf_transfer env; secrets never logged ──
+    envkeys = ("HF_TOKEN", "HUGGING_FACE_HUB_TOKEN")
+    saved_env = {k: os.environ.pop(k, None) for k in envkeys}
+    try:
+        hcfg = {"hf_token": "hf_abc123", "hf_transfer": True}
+        e = sv.hf_env(hcfg, "container")
+        assert e["HF_TOKEN"] == "hf_abc123" == e["HUGGING_FACE_HUB_TOKEN"]
+        assert e["HF_HUB_ENABLE_HF_TRANSFER"] == "1"
+        with tempfile.TemporaryDirectory() as td2:
+            bare = sv.hf_env(hcfg, "vllm", root=Path(td2))
+            assert "HF_HUB_ENABLE_HF_TRANSFER" not in bare, \
+                "bare metal without the package must NOT set the flag (hub refuses)"
+            assert bare["HF_TOKEN"] == "hf_abc123"
+            (Path(td2) / "serving" / ".venv" / "lib" / "python3.12"
+             / "site-packages" / "hf_transfer").mkdir(parents=True)
+            assert sv.hf_env(hcfg, "vllm",
+                             root=Path(td2))["HF_HUB_ENABLE_HF_TRANSFER"] == "1"
+        assert sv.hf_env({"hf_token": "", "hf_transfer": False}, "container") == {}
+        os.environ["HF_TOKEN"] = "hf_fromhost"          # host env passes through
+        assert sv.hf_env({"hf_token": ""}, "container")["HF_TOKEN"] == "hf_fromhost"
+        assert sv.hf_env(hcfg, "container")["HF_TOKEN"] == "hf_abc123", \
+            "config token outranks inherited env"
+    finally:
+        for k, v in saved_env.items():
+            os.environ.pop(k, None)
+            if v is not None:
+                os.environ[k] = v
+    red = sv.redact_argv(["podman", "run", "-e", "HF_TOKEN=hf_abc123",
+                          "-e", "MY_API_KEY=zz", "-e", "FOO=1", "image"])
+    assert red[3] == "HF_TOKEN=***" and red[5] == "MY_API_KEY=***" and red[7] == "FOO=1"
+    assert "hf_abc123" not in " ".join(red) and "zz" not in red[5]
+    from knowledgehost.config import load_config as _lc, settings_schema as _ss
+    assert "hf_token" not in _ss(), "a secret must never surface in the panel schema"
+    ok("hf_env: cfg token wins, transfer flag guarded by venv; argv redacted")
+
     print(f"swap_test: {PASS} checks OK")
 
 
