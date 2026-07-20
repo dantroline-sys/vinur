@@ -156,6 +156,13 @@ distill_parallel = 0
 # serving/.venv; containers need nothing).
 hf_token    = ""
 hf_transfer = true
+# Xet is the hub's chunked transfer backend (fast, default on modern hubs).
+# Set false to disable it (HF_HUB_DISABLE_XET) and fall back to plain HTTPS
+# through requests.  Reach for this when a download STALLS with no error:
+# Xet uses its own CAS hosts over long-lived connections, so a firewall, a
+# TLS-inspecting proxy or a flaky link can hang it while huggingface.co
+# itself is perfectly reachable.  Applies at the next service start.
+hf_xet      = true
 
 # ── Outbound proxy (only if this box reaches the internet through one) ───────
 # NOTHING in the serving stack reads OS or desktop proxy settings.  vLLM does

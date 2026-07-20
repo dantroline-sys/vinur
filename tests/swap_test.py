@@ -708,6 +708,19 @@ def main():
     assert "hf_token" not in _ss(), "a secret must never surface in the panel schema"
     ok("hf_env: cfg token wins, transfer flag guarded by venv; argv redacted")
 
+    # ── hf_xet = false: the escape hatch for a transfer that HANGS ──────────
+    xoff = sv.hf_env({"hf_xet": False, "hf_token": "hf_k"}, "container")
+    assert xoff["HF_HUB_DISABLE_XET"] == "1" and xoff["HF_TOKEN"] == "hf_k", xoff
+    # off means off — no accelerator flag left fighting the plain-HTTPS fallback
+    assert "HF_XET_HIGH_PERFORMANCE" not in xoff, xoff
+    assert "HF_HUB_ENABLE_HF_TRANSFER" not in xoff, xoff
+    assert "HF_HUB_DISABLE_XET" not in sv.hf_env({}, "container")
+    from knowledgehost.config import settings_schema
+    assert settings_schema().get("hf_xet", {}).get("type") == "bool"
+    # a proxy URL can carry credentials: file/env only, never over HTTP
+    assert "http_proxy" not in settings_schema()
+    ok("hf_xet=false disables Xet (panel-editable); proxy keys stay off the panel")
+
     # ── proxy: nothing in the stack reads OS proxy settings, so we pass it ───
     pcfg = {"serving": {"llms": [{"name": "a", "host": "10.0.0.5"}]},
             "http_proxy": "http://proxy.corp:3128"}

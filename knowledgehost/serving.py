@@ -153,12 +153,22 @@ def hf_env(cfg: dict, engine: str, root: Path = ROOT) -> dict:
     an older image without Xet simply ignores the unknown variable.  Bare-metal
     venvs get whichever backend is actually installed: hf_xet preferred, legacy
     hf_transfer as fallback, nothing when neither exists (the legacy env with
-    no package makes the hub refuse to download at all)."""
+    no package makes the hub refuse to download at all).
+
+    `hf_xet = false` turns Xet OFF (HF_HUB_DISABLE_XET) and falls back to plain
+    HTTPS through requests.  Xet talks to its own CAS hosts on connections it
+    keeps open for a long time, so a firewall, a TLS-inspecting proxy or a
+    flaky link can leave a Xet transfer hanging while huggingface.co itself is
+    perfectly reachable — a stall with no error is its signature failure."""
     out: dict = {}
     tok = str(cfg.get("hf_token") or os.environ.get("HF_TOKEN")
               or os.environ.get("HUGGING_FACE_HUB_TOKEN") or "").strip()
     if tok:
         out["HF_TOKEN"] = out["HUGGING_FACE_HUB_TOKEN"] = tok
+    if not cfg.get("hf_xet", True):
+        # Off means off: the accelerator flags would only fight the fallback.
+        out["HF_HUB_DISABLE_XET"] = "1"
+        return out
     if cfg.get("hf_transfer", True):
         if engine == "container" or _venv_has(root, "hf_xet"):
             out["HF_XET_HIGH_PERFORMANCE"] = "1"
@@ -858,7 +868,10 @@ def weights_status(engine: str, model: str) -> dict:
                            detail=f"{partial} file(s) mid-download but NOTHING has been "
                                   f"written for {_ago(age)} — the fetch is stuck or dead, "
                                   "not slow. Check the log (Log button): rate limit (429), "
-                                  "auth (401/403), disk, or network. Restart resumes it.")
+                                  "auth (401/403), disk, or network. A stall with NO error "
+                                  "in the log is usually the Xet transfer backend — set "
+                                  "hf_xet = false in Settings and Restart. Either way the "
+                                  "partial files are reused, nothing restarts from zero.")
             else:
                 out.update(status="incomplete",
                            detail=f"{partial} file(s) mid-download, last written "

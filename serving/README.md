@@ -342,9 +342,8 @@ like every model on the box going down at once. `./vinur.sh start` warns if
 your shell has a proxy set without that exemption. Credentials embedded in a
 proxy URL are redacted from the `exec:` log line.
 
-If a download fails only under Xet, set `HF_HUB_DISABLE_XET=1` to fall back to
-plain HTTPS through `requests` — a proxy that inspects TLS sometimes upsets the
-Xet client's connection reuse.
+If a download fails or hangs only under Xet, set `hf_xet = false` (below) — a
+proxy that inspects TLS often upsets the Xet client's connection reuse.
 
 **Gated repos** (Llama, some Mistral originals): accept the license on
 huggingface.co once, create a read token there, and export it before
@@ -500,6 +499,21 @@ causes, all visible in the log:
 
 Restarting the service resumes from the partial blobs in every case — nothing
 re-downloads from zero.
+
+**A stall with no error at all** is usually Xet, the hub's chunked transfer
+backend. It uses its own CAS hosts over long-lived connections, so a firewall,
+a TLS-inspecting proxy, or an unreliable link can leave it hanging while
+`huggingface.co` itself answers fine. Turn it off in `config.toml` (or the
+panel's Settings tab — it's a plain on/off):
+
+```toml
+hf_xet = false        # HF_HUB_DISABLE_XET — plain HTTPS through requests
+```
+
+Then Restart that service from the Serving tab. Transfers are slower but
+ordinary, and the partial blobs already on disk are reused. If it now completes,
+the network is interfering with Xet specifically; if it still stalls at the same
+point, suspect the link or the disk instead.
 
 ### `RuntimeError: Could not find nvcc and default cuda_home='/usr/local/cuda' doesn't exist`
 

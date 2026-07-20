@@ -171,6 +171,13 @@ DEFAULTS = {
     # venv that ships that package instead (serving.hf_env picks per engine).
     "hf_token": "",
     "hf_transfer": True,
+    # Xet is huggingface_hub's chunked transfer backend (fast, and the default
+    # on modern hubs).  Set false to disable it (HF_HUB_DISABLE_XET) and fall
+    # back to plain HTTPS through requests: Xet uses its own CAS hosts and
+    # long-lived connections, so a firewall, a TLS-inspecting proxy or a flaky
+    # link can leave a transfer HANGING — a download that stalls with no error
+    # is the signature.  Panel-editable (Settings), applies at next start.
+    "hf_xet": True,
     # Outbound proxy, for a box that reaches the internet through one.  NOTHING
     # in the stack reads OS/desktop proxy settings — vLLM proxies nothing
     # itself, huggingface_hub (requests) and the Xet backend (reqwest) read
@@ -529,7 +536,7 @@ _FLOAT_KEYS = {"min_confidence", "node_sim_high", "node_sim_low", "kb_min_sim",
                "stats_interval_s"}
 _BOOL_KEYS = {"embed_task_prefix", "ocr", "verify", "strict",
               "conceptnet_include_lexical", "ann_search", "ann_mmap", "wiki_semantic",
-              "ask_fit_gate", "use_spacy", "library_dense", "hf_transfer"}
+              "ask_fit_gate", "use_spacy", "library_dense", "hf_transfer", "hf_xet"}
 _LIST_KEYS = {"sources", "extensions", "distill_urls", "extract_urls", "verify_urls",
               "encrypted_bundles", "library_sources", "stopwords_extra",
               "high_stakes_extra", "ops_regions", "ask_exclude_facets",
@@ -610,6 +617,9 @@ EDITABLE_SETTINGS = frozenset({
     "rerank_pool", "snippet_max_len",
     # read-time knowledge mode
     "mode", "strict",
+    # Hugging Face transfer backends — on/off switches, no credentials (the
+    # token and the proxy URLs stay file/env-only).  Applied at next start.
+    "hf_transfer", "hf_xet",
     # runtime brain toggle (comma-separated bundle names; the /brain endpoint
     # and Bundles panel write it — it's state, but scalar round-tripping through
     # the same writer keeps one persistence path)
@@ -621,7 +631,7 @@ EDITABLE_SETTINGS = frozenset({
 # not substring — so it catches `auth_token`/`embed_url`/`db_key_file` but NOT the
 # many legitimate `*_max_tokens` / `*_source_tokens` tuning knobs.
 _SENSITIVE_SUFFIX = ("_url", "_urls", "_path", "_dir", "_file", "_key", "_token",
-                     "_secret", "_password", "_passwd")
+                     "_secret", "_password", "_passwd", "_proxy")
 _SENSITIVE_EXACT = frozenset({"host", "port", "auth_token", "backend", "password"})
 
 
