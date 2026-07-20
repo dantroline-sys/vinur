@@ -2,7 +2,9 @@
 
 Six tabs (two-level nav — see VINUR-UI-01_panel_redesign_plan.md) let you
 *peruse* (not just search) everything the pipeline produces, so you can debug it:
-  * **Ask**        — Answer (kb_ask) · Passages (kb_search with scores).
+  * **Ask**        — ONE query box, three modes: Answer (kb_ask) · Passages
+                     (kb_search with scores) · Library (document FTS); the
+                     query text survives mode switches.
   * **Distilled**  — the pipeline's layers in order: Sources (registry: trust +
                      epistemic regime per doc) → Raw (ingested chunks; spot
                      OCR/boilerplate problems) → Concepts (distilled nodes) →
@@ -169,7 +171,7 @@ const badge = t => `<span class="badge">${esc(t)}</span>`;
 // Distilled runs in pipeline order: provenance → raw text → concepts →
 // relations → cards (each layer is distilled from the one before it).
 const GROUPS = [
-  ['ask', 'Ask', [['ask', 'Answer'], ['search', 'Passages']]],
+  ['ask', 'Ask', []],            // one query box; the MODE select replaces sub-tabs
   ['distilled', 'Distilled', [['sources', 'Sources'], ['raw', 'Raw'], ['nodes', 'Concepts'],
                               ['edges', 'Relations'], ['cards', 'Cards']]],
   ['curation', 'Curation', [['adjudication', 'Adjudication'], ['gaps', 'Gaps']]],
@@ -246,6 +248,11 @@ function go(k, leaf) {
   // you just were.  The redirect assigns once and falls through.
   const grp = leaf ? null : GROUPS.find(g => g[0] === k);
   if (grp && grp[2].length) k = lastLeaf[k] || grp[2][0][0];
+  // legacy leaf keys from the flat-tab era map onto Ask's modes
+  if (k === 'search' || k === 'libsearch') {
+    ASK_MODE = k === 'search' ? 'passages' : 'library';
+    k = 'ask';
+  }
   active = k;
   lastLeaf[PARENT[k]] = k;
   if (opsTimer) { clearInterval(opsTimer); opsTimer = null; }   // stop polling when leaving Ops
@@ -254,8 +261,7 @@ function go(k, leaf) {
   renderSubtabs(k);
   renderBar(k);
   renderHelp(k);
-  if (k === 'ask') { $('#results').className = 'empty'; $('#results').textContent = 'Ask the structured KB a what / how / why question.'; $('#aq') && $('#aq').focus(); }
-  else if (k === 'search') { $('#results').className = 'empty'; $('#results').textContent = 'Type a query above.'; $('#q') && $('#q').focus(); }
+  if (k === 'ask') { askEmptyState(); if ($('#aq')) $('#aq').focus(); }
   else if (k === 'ops') { loadOps(); opsTimer = setInterval(() => { if (active === 'ops') pollOps(); }, 2500); }
   else if (k === 'serving') { loadServing(); opsTimer = setInterval(() => { if (active === 'serving') pollServing(); }, 2500); }
   else if (k === 'stats') { loadStatsTab(); opsTimer = setInterval(() => { if (active === 'stats') loadStatsTab(true); }, 10000); }
@@ -270,17 +276,15 @@ function renderBar(k) {
   $('#banner').innerHTML = '';
   if (k === 'ask') {
     $('#bar').innerHTML =
-      `<input id="aq" type="search" placeholder="Ask a what / how / why question…" autofocus
-              onkeydown="if(event.key==='Enter')doAsk()">
-       <select id="rigor" title="rigor"><option value="">auto rigor</option>
-         <option value="low">low</option><option value="high">high (stakes)</option></select>
-       <button class="toolbtn" onclick="doAsk()">Ask</button>`;
-  } else if (k === 'search') {
-    $('#bar').innerHTML =
-      `<input id="q" type="search" placeholder="Search the knowledge base…" autofocus
-              onkeydown="if(event.key==='Enter')doSearch()">
-       <input id="k" type="number" value="8" min="1" max="50" style="width:70px" title="passages">
-       <button class="toolbtn" onclick="doSearch()">Search</button>`;
+      `<select id="amode" onchange="askSetMode(this.value)" title="what to query">
+         <option value="answer"${ASK_MODE === 'answer' ? ' selected' : ''}>Answer — structured KB</option>
+         <option value="passages"${ASK_MODE === 'passages' ? ' selected' : ''}>Passages — kb search</option>
+         <option value="library"${ASK_MODE === 'library' ? ' selected' : ''}>Library — documents</option>
+       </select>
+       <input id="aq" type="search" placeholder="Ask a what / how / why question…" autofocus
+              value="${esc(ASK_Q)}" onkeydown="if(event.key==='Enter')doAskGo()">
+       <span id="askx">${askExtras()}</span>
+       <button class="toolbtn" onclick="doAskGo()">Go</button>`;
   } else if (k === 'raw') {
     $('#bar').innerHTML =
       `<select id="srcfilter" title="source"></select>
@@ -581,8 +585,8 @@ async function doAsk() {
 }
 
 async function doSearch() {
-  const q = $('#q').value.trim(); if (!q) return;
-  const k = $('#k').value || 8;
+  const q = $('#aq').value.trim(); if (!q) return;
+  const k = ($('#ak') && $('#ak').value) || 8;
   $('#banner').innerHTML = ''; $('#results').className = 'empty'; $('#results').textContent = 'searching…';
   try {
     const res = await (await fetch(`search?q=${encodeURIComponent(q)}&k=${k}`)).json();
@@ -593,6 +597,73 @@ async function doSearch() {
       + (res.low_confidence ? ' · <b>low confidence</b>' : '') + '</div>';
     renderPassages(res.passages, true);
   } catch (e) { $('#results').textContent = 'request failed: ' + e; }
+}
+
+// ── the unified Ask surface: one query box, three modes ─────────────────────
+let ASK_MODE = 'answer', ASK_Q = '';
+
+function askExtras() {
+  if (ASK_MODE === 'passages') {
+    return `<input id="ak" type="number" value="8" min="1" max="50" style="width:64px" title="passages">`;
+  }
+  if (ASK_MODE === 'library') {
+    const opts = ((typeof LIBCFG !== 'undefined' && LIBCFG && LIBCFG.subdirs) || [])
+      .map(s => `<option value="${esc(s.name)}">`).join('');
+    return `<input id="acoll" list="acolls" placeholder="collection (all)" style="width:150px"
+              title="restrict to a library collection"><datalist id="acolls">${opts}</datalist>
+            <input id="ak" type="number" value="8" min="1" max="50" style="width:64px" title="results">`;
+  }
+  return `<select id="rigor" title="rigor"><option value="">auto rigor</option>
+     <option value="low">low</option><option value="high">high (stakes)</option></select>`;
+}
+
+function askEmptyState() {
+  $('#results').className = 'empty';
+  $('#results').textContent =
+    ASK_MODE === 'passages' ? 'Ranked passages from the ingested corpus (dense + sparse + rerank, with scores).'
+    : ASK_MODE === 'library' ? 'Lexical search over the indexed document library (configure it under Settings → Library).'
+    : 'Ask the structured KB a what / how / why question.';
+}
+
+function askSetMode(m) {
+  if ($('#aq')) ASK_Q = $('#aq').value;   // the query survives a mode switch
+  ASK_MODE = m;
+  renderBar('ask');
+  askEmptyState();
+  $('#banner').innerHTML = '';
+  if ($('#aq')) $('#aq').focus();
+}
+
+function doAskGo() {
+  ASK_Q = $('#aq').value;
+  if (ASK_MODE === 'passages') return doSearch();
+  if (ASK_MODE === 'library') return doLibraryAsk();
+  return doAsk();
+}
+
+async function doLibraryAsk() {
+  const q = $('#aq').value.trim(); if (!q) return;
+  const k = ($('#ak') && $('#ak').value) || 8;
+  const coll = ($('#acoll') && $('#acoll').value.trim()) || '';
+  $('#banner').innerHTML = ''; $('#results').className = 'empty'; $('#results').textContent = 'searching the library…';
+  let url = `library?q=${encodeURIComponent(q)}&k=${k}`;
+  if (coll) url += `&collection=${encodeURIComponent(coll)}`;
+  const t0 = performance.now();
+  let res;
+  try { res = await (await fetch(url)).json(); }
+  catch (e) { $('#results').textContent = 'request failed: ' + e; return; }
+  const ms = Math.round(performance.now() - t0);
+  if (!res.ok) {
+    $('#results').textContent = 'error: ' + (res.error || 'library not configured — Settings → Library');
+    return;
+  }
+  const ps = res.passages || [];
+  $('#banner').innerHTML =
+    `<div class="note" style="background:${res.low_confidence ? '#f5a62322' : '#22aa6622'};border-color:${res.low_confidence ? '#f5a62366' : '#22aa6666'}">`
+    + `confidence ${Number(res.confidence).toFixed(3)} · ${ps.length} passage(s) · ${ms} ms`
+    + (res.low_confidence ? ' · <b>no match</b>' : '') + '</div>';
+  // the collection rides the source_type badge slot — same card, no new renderer
+  renderPassages(ps.map(p => Object.assign({}, p, { source_type: p.collection || 'library' })), true);
 }
 
 // ── control panel: Operations + Settings (auth-gated) ────────────────────────
@@ -795,48 +866,15 @@ async function loadLibrary() {
     `<tr><td><label style="cursor:pointer"><input type="checkbox" class="libchk" value="${esc(s.name)}" ${s.active ? 'checked' : ''}> <code>${esc(s.name)}</code></label></td>`
     + `<td style="opacity:.55">${s.active ? 'indexed' : ''}</td></tr>`).join('')
     || '<tr><td colspan=2 style="opacity:.5">no subfolders under the root</td></tr>';
-  const collOpts = ['<option value="">all collections</option>']
-    .concat((r.subdirs || []).map(s => `<option value="${esc(s.name)}">${esc(s.name)}</option>`)).join('');
   $('#results').innerHTML =
     `<div style="margin:6px 0 10px;font-size:13px">Trusted root <code>${esc(r.root)}</code> `
     + `<a style="cursor:pointer;text-decoration:underline;font-size:12px" `
     + `onclick="this.parentNode.insertAdjacentHTML('afterend', rootChangeForm()); this.remove()">change…</a> `
     + `<span style="opacity:.6">— tick the subfolders (each becomes a search <b>collection</b>), then <b>Save + index now</b>.</span></div>`
     + `<table><tr><th>subfolder / collection</th><th></th></tr>${rows}</table>`
-    + `<hr style="margin:16px 0;border:none;border-top:1px solid #8884">`
-    + `<div style="font-size:13px;margin-bottom:6px"><b>Test search</b> — the exact ranked path Vinkona's research loop calls (BM25${r && r.dense ? ' + dense' : ''} → rerank).</div>`
-    + `<div style="display:flex;gap:6px;flex-wrap:wrap;margin-bottom:8px">`
-    + `<input id="libq" type="search" placeholder="query the indexed library…" style="flex:1;min-width:220px" onkeydown="if(event.key==='Enter')doLibrarySearch()">`
-    + `<select id="libcoll" title="restrict to a collection">${collOpts}</select>`
-    + `<input id="libk" type="number" value="8" min="1" max="50" style="width:64px" title="results">`
-    + `<button class="toolbtn" onclick="doLibrarySearch()">Search</button></div>`
-    + `<div id="libbanner"></div><div id="libresults" style="opacity:.6;font-size:13px">Index a selection, then search it here to eyeball ranking + latency.</div>`;
-}
-async function doLibrarySearch() {
-  const q = ($('#libq').value || '').trim(); if (!q) return;
-  const coll = $('#libcoll').value || '', k = $('#libk').value || 8;
-  $('#libbanner').innerHTML = ''; $('#libresults').style.opacity = 1; $('#libresults').textContent = 'searching…';
-  let url = `library?q=${encodeURIComponent(q)}&k=${k}`;
-  if (coll) url += `&collection=${encodeURIComponent(coll)}`;
-  const t0 = performance.now();
-  let res; try { res = await (await fetch(url)).json(); }
-  catch (e) { $('#libresults').textContent = 'request failed: ' + e; return; }
-  const ms = Math.round(performance.now() - t0);
-  if (!res.ok) { $('#libresults').textContent = 'error: ' + (res.error || 'unknown'); return; }
-  const ps = res.passages || [];
-  $('#libbanner').innerHTML =
-    `<div class="note" style="background:${res.low_confidence ? '#f5a62322' : '#22aa6622'};border-color:${res.low_confidence ? '#f5a62366' : '#22aa6666'}">`
-    + `confidence ${Number(res.confidence).toFixed(3)} · ${ps.length} passage(s) · dense ${res.dense_used ? 'on' : 'off'} · ${ms} ms`
-    + (res.low_confidence ? ' · <b>no match</b>' : '') + '</div>';
-  $('#libresults').innerHTML = ps.length ? ps.map(p => `
-    <div class="p">
-      <div class="meta"><span class="title">${esc(p.title) || '(untitled)'}</span>
-        ${p.section ? '<span>› ' + esc(p.section) + '</span>' : ''}
-        ${badge(p.collection || '?')}
-        ${p.score != null ? '<span class="score">score ' + Number(p.score).toFixed(3) + '</span>' : ''}</div>
-      <div class="text">${esc(p.text)}</div>
-      ${p.path_or_url ? '<div class="src">' + esc(p.path_or_url) + '</div>' : ''}
-    </div>`).join('') : '<div class="empty" style="padding:10px">No match in the local library.</div>';
+    + `<div class="hint" style="margin-top:14px;font-size:13px;opacity:.7">Search the indexed library from `
+    + `<a style="cursor:pointer;text-decoration:underline" onclick="go('libsearch')">Ask → Library</a> `
+    + `— the exact ranked path Vinkona's research loop calls (BM25${r && r.dense ? ' + dense' : ''} → rerank), with latency in the banner.</div>`;
 }
 function rootChangeForm() {
   return `<div style="display:flex;gap:6px;flex-wrap:wrap;margin:6px 0 10px;max-width:560px">

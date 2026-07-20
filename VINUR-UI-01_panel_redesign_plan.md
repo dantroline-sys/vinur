@@ -41,7 +41,7 @@ to its remembered (or first) leaf, then dispatches exactly as before — zero
 loader changes.  Group and leaf can share a key (`ask`, `settings`): the
 group match redirects once, no recursion.
 
-### Stage 2 — Ask unification
+### Stage 2 — Ask unification  ✅
 One query input kept across modes; mode toggle Answer / Passages / Library
 with per-mode extras (rigor · k · collection).  Library *search* moves here
 from the Library panel (the panel under Settings keeps root/selection
