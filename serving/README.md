@@ -504,6 +504,13 @@ Seen in healthy logs — none of these stop the engine:
   no-op warning.
 - **`Directly load ... from the cache`** lines — the torch.compile /
   AOT caches under `var/cache/vllm` doing their job across restarts.
+- **`Unknown vLLM environment variable detected: VLLM_BUILD_URL` /
+  `VLLM_IMAGE_TAG` / `VLLM_BUILD_PIPELINE` / `VLLM_BUILD_COMMIT`** — the
+  official image bakes its build provenance in as ENV, and vLLM's scanner
+  warns on any `VLLM_`-prefixed variable it doesn't recognise, so the image
+  trips its own warning.  Under podman we strip these at run
+  (`--unsetenv`); docker has no unset flag, so there the four lines remain.
+  Harmless either way.
 
 The line that actually matters is `ERROR ... EngineCore failed to start` —
 diagnose from the traceback directly above it.

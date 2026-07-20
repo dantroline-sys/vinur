@@ -471,6 +471,18 @@ def main():
             "llm_argv must name the container with container_name()"
         ok("container_name/container_ref: shared handle; bare/unknown -> None")
 
+        # image provenance ENV (VLLM_BUILD_*) trips vLLM's own unknown-var
+        # warning — podman strips it at run; docker has no unset flag
+        pod = Path(td) / "podman"
+        pod.write_text(rt.read_text())
+        pod.chmod(0o755)
+        pargv = sv.llm_argv({**ccfg["serving"]["llms"][0], "runtime": str(pod)})
+        assert pargv.count("--unsetenv") == len(sv._IMAGE_NOISE_ENV)
+        for k in sv._IMAGE_NOISE_ENV:
+            assert pargv[pargv.index(k) - 1] == "--unsetenv", k
+        assert "--unsetenv" not in argv, "docker path has no unset flag"
+        ok("podman argv --unsetenv's the image's VLLM_BUILD_* provenance noise")
+
         svcs2 = services_for(ccfg)
         big = next(s for s in svcs2 if s["name"] == "llm-big")
         bare = next(s for s in svcs2 if s["name"] == "llm-bare")

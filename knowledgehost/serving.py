@@ -111,6 +111,14 @@ def _mapped_flags(entry: dict, table: list) -> list[str]:
 # care about; :latest is only the out-of-box default.
 DEFAULT_VLLM_IMAGE = "docker.io/vllm/vllm-openai:latest"
 
+# Build-provenance ENV the official image bakes in (Buildkite metadata).
+# vLLM's env scanner warns on ANY unrecognised VLLM_-prefixed variable, so the
+# image trips its own "Unknown vLLM environment variable detected" at every
+# boot.  Podman strips them at run (--unsetenv); docker has no unset flag —
+# there the warnings remain (documented benign noise in serving/README.md).
+_IMAGE_NOISE_ENV = ("VLLM_BUILD_URL", "VLLM_IMAGE_TAG",
+                    "VLLM_BUILD_PIPELINE", "VLLM_BUILD_COMMIT")
+
 
 def _container_runtime(entry: dict) -> str:
     """podman first (daemonless — the supervisor's signal/process ownership
@@ -173,6 +181,8 @@ def llm_argv(entry: dict, root: Path = ROOT) -> list[str]:
             # --replace clears a stale same-name container after an unclean
             # stop; CDI is the toolkit's GPU wiring (nvidia-ctk cdi generate).
             argv += ["--replace", "--device", "nvidia.com/gpu=all"]
+            for k in _IMAGE_NOISE_ENV:      # an explicit entry env -e still wins
+                argv += ["--unsetenv", k]
         else:
             argv += ["--gpus", "all"]
         # :z — SELinux shared label; without it a Fedora host denies the
