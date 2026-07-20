@@ -17,7 +17,9 @@ from __future__ import annotations
 import hmac
 import json
 import logging
+import os
 import signal
+import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse, parse_qs
 
@@ -231,6 +233,26 @@ class Handler(BaseHTTPRequestHandler):
                 "gaps": lambda: kb.list_gaps(n),
             }.get(kind)
             rows = fn() if (kb and fn) else []
+            if kind == "sources" and rows and hasattr(store, "source_progress"):
+                # progress-through-the-corpus + the source FILE's own date
+                # (registry rows have no timestamp; URLs/ZIM entries show none)
+                try:
+                    prog = store.source_progress(self.server.master_kb_path(),
+                                                 [r["doc_id"] for r in rows])
+                except Exception:                  # pragma: no cover - defensive
+                    prog = {}
+                for r in rows:
+                    p = prog.get(r["doc_id"]) or {}
+                    r["chunks"] = p.get("chunks", 0)
+                    r["distilled"] = p.get("distilled", 0)
+                    r["pct"] = (round(r["distilled"] / r["chunks"] * 100)
+                                if r["chunks"] else None)
+                    try:
+                        mt = os.path.getmtime(r["doc_id"])
+                        r["file_time"] = time.strftime("%Y-%m-%d %H:%M",
+                                                       time.localtime(mt))
+                    except (OSError, ValueError):
+                        r["file_time"] = ""
             return self._send_json({"ok": True, "kind": kind, "rows": rows})
         if path == "/search":                      # viewer: run kb_search (no auth, read-only)
             query = (q.get("q") or [""])[0]

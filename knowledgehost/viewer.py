@@ -104,6 +104,10 @@ INDEX_HTML = """<!doctype html>
   .tile .tl { font-size: 12px; opacity: .65; }
   .tile .tvv { font-size: 26px; font-weight: 600; margin: 2px 0; }
   .tile .ts { font-size: 11px; opacity: .55; }
+  /* per-source distillation progress (Sources view) */
+  .pbar { display: inline-block; width: 64px; height: 7px; border-radius: 4px;
+          background: #8883; vertical-align: middle; margin-right: 4px; overflow: hidden; }
+  .pbar i { display: block; height: 100%; background: var(--s1); border-radius: 4px; }
   .bar { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; margin-bottom: 14px; }
   input, select, button { font: inherit; padding: 7px 10px; border: 1px solid #8886;
            border-radius: 6px; background: Canvas; color: CanvasText; }
@@ -630,14 +634,36 @@ async function load(kind) {
     if (kind === 'nodes') return renderNodes(rows);
     if (kind === 'edges') return renderEdges(rows);
     if (kind === 'cards') return renderCards(rows);
-    if (kind === 'sources') return renderTable(rows,
-      [['doc_id', 'doc'], ['title', 'title'], ['source_type', 'type'],
-       ['trust_weight', 'trust'], ['regime', 'regime'], ['status', 'status']], 'No sources registered yet.');
+    if (kind === 'sources') return renderSources(rows);
     if (kind === 'adjudication') return renderTable(rows,
       [['node_a', 'node A'], ['node_b', 'node B'], ['similarity', 'sim'],
        ['reason', 'reason'], ['status', 'status']], 'Adjudication queue empty.');
     if (kind === 'gaps') return renderGaps(rows);
   } catch (e) { $('#results').textContent = 'request failed: ' + e; }
+}
+
+// sources get distillation-progress + the source file's own date
+function renderSources(rows) {
+  if (!rows || !rows.length) return setRows('', 'No sources registered yet.');
+  let tot = 0, dist = 0;
+  rows.forEach(r => { tot += r.chunks || 0; dist += r.distilled || 0; });
+  const summary = tot
+    ? `<div style="font-size:13px;opacity:.7;margin-bottom:8px">listed ${rows.length} source(s) ·
+       ${fmtCompact(dist)} of ${fmtCompact(tot)} chunks distilled
+       (${Math.round(dist / tot * 100)}%)</div>` : '';
+  const head = '<tr><th>doc</th><th>title</th><th>type</th><th>trust</th><th>regime</th>'
+    + '<th>status</th><th>chunks</th><th>distilled</th><th>file date</th></tr>';
+  const body = rows.map(r => {
+    const pcell = r.pct == null ? '—'
+      : `<span class="pbar" title="${esc(r.distilled)} / ${esc(r.chunks)} chunks">`
+        + `<i style="width:${r.pct}%"></i></span> ${r.pct}%`;
+    return `<tr><td>${esc(r.doc_id)}</td><td>${esc(r.title)}</td><td>${esc(r.source_type)}</td>
+      <td>${esc(r.trust_weight)}</td><td>${esc(r.regime)}</td><td>${esc(r.status)}</td>
+      <td>${r.chunks != null ? fmtCompact(r.chunks) : '—'}</td>
+      <td style="white-space:nowrap">${pcell}</td>
+      <td style="white-space:nowrap;opacity:.75">${esc(r.file_time || '—')}</td></tr>`;
+  }).join('');
+  setRows(summary + '<table>' + head + body + '</table>');
 }
 
 // gaps get a per-row dismiss; rows are index-keyed (query text is untrusted —

@@ -337,6 +337,32 @@ class SqliteStore:
             "SELECT source_type, COUNT(*) c FROM chunks GROUP BY source_type")
         return {(r["source_type"] or "?"): r["c"] for r in rows}
 
+    def source_progress(self, kb_path: str, docs: list) -> dict:
+        """{doc: {chunks, distilled}} for the LISTED docs — how far distillation
+        has churned through each source.  Chunk ids are shared between the two
+        DBs, so one grouped query with kb.db ATTACHed answers it; a throwaway
+        connection keeps the ATTACH away from the shared handler-thread conn."""
+        if not docs:
+            return {}
+        con = sqlite3.connect(self.cfg["db_path"], timeout=10)
+        try:
+            con.execute("PRAGMA busy_timeout=10000")
+            con.execute("ATTACH ? AS kbdb", (str(kb_path),))
+            marks = ",".join("?" * len(docs))
+            out = {}
+            for doc, tot, dist in con.execute(
+                    f"SELECT path_or_url, COUNT(*), "
+                    f"SUM(EXISTS(SELECT 1 FROM kbdb.distilled_chunks d "
+                    f"           WHERE d.chunk_id = chunks.id)) "
+                    f"FROM chunks WHERE path_or_url IN ({marks}) "
+                    f"GROUP BY path_or_url", list(docs)):
+                out[doc] = {"chunks": tot, "distilled": dist or 0}
+            return out
+        except sqlite3.Error:          # kb.db missing/locked → progress unknown
+            return {}
+        finally:
+            con.close()
+
     def sample(self, n: int, source_type: str | None = None) -> list:
         """A random spread of stored chunks — for eyeballing ingestion quality."""
         sql, params = "SELECT * FROM chunks", []

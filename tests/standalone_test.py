@@ -383,6 +383,62 @@ def main():
             httpd.kb = None
             ok("/gaps/close: authed, status-validated, defaults to dismissed")
 
+            # ── Sources progress: the store-level join + /browse enrichment ──
+            import sqlite3
+            from knowledgehost.store import SqliteStore
+            spcfg = json.loads(json.dumps(
+                {k: v for k, v in scfg.items() if isinstance(v, (str, int, float, bool, list, dict))}))
+            spcfg["db_path"] = str(Path(td) / "prog.sqlite3")
+            pstore = SqliteStore(spcfg)
+            docfile = Path(td) / "book.pdf"
+            docfile.write_bytes(b"x")
+            for i in range(4):
+                pstore.db.execute(
+                    "INSERT INTO chunks(id,source_type,title,section,path_or_url,"
+                    "text,tokens,version,ingested_at) VALUES (?,?,?,?,?,?,?,?,0)",
+                    (f"c{i}", "pdf", "Book", "", str(docfile), "t", 3, 1))
+            pstore.db.execute(
+                "INSERT INTO chunks(id,source_type,title,section,path_or_url,"
+                "text,tokens,version,ingested_at) VALUES ('w0','wikipedia','W','',"
+                "'zim://Foo','t',3,1,0)")
+            pstore.db.commit()
+            kbfile = Path(td) / "prog-kb.db"
+            kcon = sqlite3.connect(kbfile)
+            kcon.execute("CREATE TABLE distilled_chunks(chunk_id TEXT PRIMARY KEY)")
+            kcon.executemany("INSERT INTO distilled_chunks VALUES (?)",
+                             [("c0",), ("c1",), ("c3",)])
+            kcon.commit()
+            kcon.close()
+            prog = pstore.source_progress(str(kbfile), [str(docfile), "zim://Foo", "ghost"])
+            assert prog[str(docfile)] == {"chunks": 4, "distilled": 3}, prog
+            assert prog["zim://Foo"] == {"chunks": 1, "distilled": 0}
+            assert "ghost" not in prog
+            assert pstore.source_progress(str(Path(td) / "no-such-kb.db"),
+                                          [str(docfile)]) == {}, "bad kb -> {}"
+            srows = [{"doc_id": str(docfile), "title": "Book", "source_type": "pdf",
+                      "trust_weight": 1.0, "regime": "empirical", "status": "active",
+                      "bundle": "base", "license": "", "license_holder": "",
+                      "license_url": ""},
+                     {"doc_id": "zim://Foo", "title": "W", "source_type": "wikipedia",
+                      "trust_weight": 0.6, "regime": "empirical", "status": "active",
+                      "bundle": "base", "license": "", "license_holder": "",
+                      "license_url": ""}]
+            httpd.kb = SimpleNamespace(list_sources=lambda n=200: srows)
+            store0, httpd.store = httpd.store, pstore
+            scfg["_master_kb_path"] = str(kbfile)
+            try:
+                with urllib.request.urlopen(
+                        f"http://127.0.0.1:{port}/browse?kind=sources", timeout=5) as r:
+                    rows = json.loads(r.read())["rows"]
+            finally:
+                httpd.kb, httpd.store = None, store0
+                scfg.pop("_master_kb_path", None)
+            by = {r0["doc_id"]: r0 for r0 in rows}
+            assert by[str(docfile)]["pct"] == 75 and by[str(docfile)]["chunks"] == 4
+            assert by[str(docfile)]["file_time"], "a real file gets its mtime"
+            assert by["zim://Foo"]["pct"] == 0 and by["zim://Foo"]["file_time"] == ""
+            ok("sources progress: per-doc distilled % + file date over /browse")
+
             # the vinkona exporter's client speaks the same lane
             sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent
                                    / "vinkona" / "assistant"))
