@@ -62,7 +62,7 @@ drive attention (merge-queue > N → adjudicate; gaps > N → research/export).
 Curation tab gets the same treatment for its queue (close-gap action,
 schedule-adjudicate) — new server routes only where an action has none.
 
-### Stage 5 — polish
+### Stage 5 — polish  ✅
 help.json regrouped (group-level intros; the leaf fallback already works),
 README panel section, docstring, dead-code sweep, memory notes.
 
@@ -123,6 +123,12 @@ A/B questions are already queued (the distill fan-out just landed;
 FlashInfer-vs-Triton is pending).  Then 7 → 8, then back to 2–5.  The two
 tracks touch different code (metrics.py + server routes vs viewer panels),
 so nothing blocks on this choice.
+
+## Status
+
+ALL EIGHT STAGES SHIPPED 2026-07-20 (one commit each, in the executed order
+1 → 6 → 7 → 8 → 2 → 3 → 4 → 5).  What remains is field feedback: Dan's
+click-through on a live box, and the first real A/B run on the Stats tab.
 
 ## Rollback
 Each stage is a single commit touching viewer.py (+ help.json/server.py only

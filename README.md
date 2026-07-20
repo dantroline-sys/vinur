@@ -186,6 +186,7 @@ knowledgehost/
   ingest.py     incremental crawl + Wikipedia ZIM; sanitize -> chunk -> embed -> upsert
   tools.py      the kb_search tool (embed+FTS -> fuse -> rerank -> cited passages + confidence)
   server.py     stdlib HTTP: /health /tools /call (+ /drop, control panel)
+  metrics.py    always-on telemetry sampler (GPU/vLLM-queue/KB history) for the Stats tab
   supervisor.py ./vinur.sh's engine — the kb + [serving] services, watched
   serving.py    exec one declared LM/embed service (vllm | llama.cpp)
   sources/      pdf, epub, html, text, wikipedia extractors (heavy deps lazy)
