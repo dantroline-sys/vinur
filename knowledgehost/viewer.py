@@ -94,6 +94,7 @@ INDEX_HTML = """<!doctype html>
              border-radius: 1px; vertical-align: middle; margin-right: 5px; }
   .evchips { display: flex; gap: 6px; flex-wrap: wrap; margin: 0 0 10px; font-size: 12px; }
   .evchips .badge { margin: 0; }
+  .abdelta td { font-weight: 600; border-top: 2px solid #8886; }
   .bar { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; margin-bottom: 14px; }
   input, select, button { font: inherit; padding: 7px 10px; border: 1px solid #8886;
            border-radius: 6px; background: Canvas; color: CanvasText; }
@@ -289,12 +290,13 @@ function renderBar(k) {
     $('#bar').innerHTML = tokInput()
       + ` <button class="toolbtn" onclick="pollServing()">Refresh</button>`;
   } else if (k === 'stats') {
-    $('#bar').innerHTML =
-      `<select id="strange" onchange="loadStatsTab()" title="time range">`
+    $('#bar').innerHTML = tokInput()
+      + ` <select id="strange" onchange="loadStatsTab()" title="time range">`
       + STAT_RANGES.map(([l, m]) =>
           `<option value="${m}"${m === STAT_MINS ? ' selected' : ''}>last ${l}</option>`).join('')
       + `</select>
        <button class="toolbtn" onclick="loadStatsTab()">Refresh</button>
+       <button class="toolbtn" onclick="dropMark()" title="label an A/B boundary: what did you just change?">⚑ Drop mark</button>
        <span style="opacity:.6;font-size:13px">auto-refreshes every 10 s while open</span>`;
   } else if (k === 'ops') {
     $('#bar').innerHTML = tokInput()
@@ -1274,7 +1276,8 @@ function renderStatsCharts() {
     return `<div class="chartcard"><div class="ct">${esc(p.title)} <span class="cu">${esc(p.unit)}</span></div>
       ${legend}<svg id="cv${i}" height="150" tabindex="0" role="img" aria-label="${esc(p.title)}"></svg>
       <details class="ctable"><summary>data table</summary><div></div></details></div>`;
-  }).join('') + '</div>');
+  }).join('') + '</div>'
+  + renderCompare(STATS_DATA.series || {}, evs, STATS_DATA.now - STAT_MINS * 60, STATS_DATA.now));
   panels.forEach((p, i) => fillChart(p, i, evs));
 }
 
@@ -1435,6 +1438,135 @@ function buildChartTable(det, p) {
   }).join('') + '</tr>').join('');
   det.querySelector('div').innerHTML =
     `<table>${head}${body}</table>` + (ts.length === 400 ? '<div style="opacity:.5">latest 400 rows</div>' : '');
+}
+
+// ── A/B compare: the window partitioned at every mark / job event ───────────
+// Workflow: ⚑ mark "A: <what you changed>" → run → ⚑ mark "B: <the change>" →
+// run → tick the two intervals and read the Δ row.  Aggregates are computed
+// client-side from the same history the charts draw, so the table and the
+// charts can never disagree.
+let AB_SEL = new Set();            // interval identity = rounded start ts
+
+async function dropMark() {
+  const label = prompt('Mark label — what did you just change?  (e.g. distill_parallel=8)');
+  if (!label || !label.trim()) return;
+  const r = await postJSON('/metrics/mark', { label: label.trim() })
+    .catch(e => ({ ok: false, error: '' + e }));
+  $('#banner').innerHTML = `<div class="note">${r.ok ? '⚑ marked: ' + esc(r.label)
+    : '✗ ' + esc(r.error || 'failed — auth token?')}</div>`;
+  if (r.ok) loadStatsTab(true);
+}
+
+function abIntervals(evs, t0, now) {
+  const inWin = evs.filter(e => e.ts > t0 && e.ts < now);
+  const bounds = [t0, ...inWin.map(e => e.ts), now];
+  const evAt = {};
+  inWin.forEach(e => { evAt[e.ts] = e; });
+  const out = [];
+  for (let i = 0; i < bounds.length - 1; i++) {
+    const a = bounds[i], b = bounds[i + 1], ev = evAt[a];
+    if (b - a < 20) continue;                     // slivers carry no signal
+    const label = !ev ? 'window start'
+      : ev.kind === 'mark' ? '⚑ ' + ev.label
+      : ev.kind === 'op_start' ? '▶ ' + ev.label
+      : 'after ' + ev.label;
+    out.push({ a, b, label });
+  }
+  return out.slice(-12);
+}
+
+function valsIn(pts, a, b) {
+  return (pts || []).filter(p => p[0] >= a && p[0] < b && p[1] != null).map(p => p[1]);
+}
+function meanIn(pts, a, b) {
+  const v = valsIn(pts, a, b);
+  return v.length ? v.reduce((x, y) => x + y, 0) / v.length : null;
+}
+function counterRate(pts, a, b, perMin) {
+  const w = (pts || []).filter(p => p[0] >= a && p[0] < b && p[1] != null);
+  if (w.length < 2) return null;
+  const d = w[w.length - 1][1] - w[0][1], dt = w[w.length - 1][0] - w[0][0];
+  return (dt <= 0 || d < 0) ? null : d / dt * (perMin ? 60 : 1);
+}
+function sumSeries(S, re, f) {                     // per-entry values, summed
+  let tot = null;
+  Object.keys(S).filter(k => re.test(k)).forEach(k => {
+    const v = f(S[k]);
+    if (v != null) tot = (tot || 0) + v;
+  });
+  return tot;
+}
+function meanAcross(S, re, a, b) {                 // mean of per-GPU means
+  const ms = Object.keys(S).filter(k => re.test(k))
+    .map(k => meanIn(S[k], a, b)).filter(v => v != null);
+  return ms.length ? ms.reduce((x, y) => x + y, 0) / ms.length : null;
+}
+
+const AB_COLS = [
+  ['GPU % avg', (S, a, b) => meanAcross(S, /^gpu[0-9]+[.]util$/, a, b)],
+  ['GPU % max', (S, a, b) => {
+    const v = Object.keys(S).filter(k => /^gpu[0-9]+[.]util$/.test(k))
+      .flatMap(k => valsIn(S[k], a, b));
+    return v.length ? Math.max(...v) : null;
+  }],
+  ['VRAM GB', (S, a, b) => {
+    const m = meanAcross(S, /^gpu[0-9]+[.]vram_mb$/, a, b);
+    return m == null ? null : m / 1024;
+  }],
+  ['run', (S, a, b) => sumSeries(S, /^vllm[.].+[.]running$/, pts => meanIn(pts, a, b))],
+  ['wait', (S, a, b) => sumSeries(S, /^vllm[.].+[.]waiting$/, pts => meanIn(pts, a, b))],
+  ['tok/s', (S, a, b) => sumSeries(S, /^vllm[.].+[.]gen_toks$/, pts => counterRate(pts, a, b))],
+  ['dist/min', (S, a, b) => counterRate(S['kb.distilled'], a, b, true)],
+  ['cards/min', (S, a, b) => counterRate(S['kb.cards'], a, b, true)],
+];
+
+function abKey(iv) { return Math.round(iv.a); }
+function fmtDur(s) {
+  return s >= 5940 ? Math.round(s / 360) / 10 + ' h'
+    : s >= 99 ? Math.round(s / 60) + ' m' : Math.round(s) + ' s';
+}
+
+function renderCompare(S, evs, t0, now) {
+  const ivs = abIntervals(evs, t0, now);
+  if (ivs.length < 2) return '';
+  const live = new Set(ivs.map(abKey));
+  [...AB_SEL].forEach(k => { if (!live.has(k)) AB_SEL.delete(k); });
+  const cells = ivs.map(iv => AB_COLS.map(c => c[1](S, iv.a, iv.b)));
+  const rows = ivs.map((iv, i) => {
+    const k = abKey(iv);
+    return `<tr><td><input type="checkbox"${AB_SEL.has(k) ? ' checked' : ''}
+        onchange="abToggle(${k})" style="width:auto" title="tick two rows to diff"></td>
+      <td>${esc(iv.label)}</td><td>${esc(fmtClock(iv.a))}</td><td>${fmtDur(iv.b - iv.a)}</td>`
+      + cells[i].map(v => `<td>${fmtVal(v)}</td>`).join('') + '</tr>';
+  }).join('');
+  let delta = '';
+  if (AB_SEL.size === 2) {
+    const [ka, kb] = [...AB_SEL].sort((x, y) => x - y);   // A = earlier interval
+    const ia = ivs.findIndex(iv => abKey(iv) === ka);
+    const ib = ivs.findIndex(iv => abKey(iv) === kb);
+    delta = '<tr class="abdelta"><td></td><td>Δ B − A</td><td></td><td></td>'
+      + AB_COLS.map((c, ci) => {
+        const va = cells[ia][ci], vb = cells[ib][ci];
+        if (va == null || vb == null) return '<td>—</td>';
+        const d = vb - va;
+        const pct = va > 0 ? ` (${d >= 0 ? '+' : ''}${Math.round(d / va * 100)}%)` : '';
+        return `<td>${d >= 0 ? '+' : ''}${fmtVal(d)}${esc(pct)}</td>`;
+      }).join('') + '</tr>';
+  }
+  return `<div class="chartcard" style="margin-top:14px">
+    <div class="ct">A/B compare <span class="cu">the window, split at every ⚑ mark and job event — tick two rows to diff</span></div>
+    <div style="overflow-x:auto"><table><tr><th></th><th>interval</th><th>start</th><th>dur</th>`
+    + AB_COLS.map(c => `<th>${esc(c[0])}</th>`).join('')
+    + `</tr>${rows}${delta}</table></div></div>`;
+}
+
+function abToggle(k) {
+  if (AB_SEL.has(k)) AB_SEL.delete(k);
+  else {
+    if (AB_SEL.size >= 2) AB_SEL.delete([...AB_SEL][0]);
+    AB_SEL.add(k);
+  }
+  renderStatsCharts();
 }
 
 addEventListener('resize', () => { if (active === 'stats' && STATS_DATA) renderStatsCharts(); });

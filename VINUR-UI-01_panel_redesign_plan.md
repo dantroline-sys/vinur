@@ -107,7 +107,7 @@ Range picker (15m/1h/6h/24h/7d), auto-refresh while the tab is active
 (same pattern as Ops polling), event marks drawn as labelled vertical
 lines on every chart.
 
-### Stage 8 — A/B compare
+### Stage 8 — A/B compare  ✅
 "Drop mark" button (label = what you just changed, e.g.
 `distill_parallel=8`).  A compare table lists the intervals bounded by
 marks/op events with per-interval aggregates — duration, avg/max GPU
