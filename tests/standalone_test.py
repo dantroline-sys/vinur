@@ -794,6 +794,129 @@ def main():
     D._stage_reset()
     ok("_distil_extras: branch + misconception stored, junk gated, counters wired")
 
+    # ── recard: cards-only schema, prompt menus, fiction short-circuit ──────
+    import contextlib
+
+    assert set(D.RECARD_SCHEMA["properties"]) == set(D.EXTRA_CARD_KEYS)
+    assert "concepts" not in D.RECARD_SCHEMA["properties"]
+    rsE = D._recard_system({"source_type": "pdf"}, "empirical")
+    assert "ALREADY mined" in rsE and "`branches` entry" in rsE
+    rsH = D._recard_system({}, "historical")
+    assert "`misconceptions` entry" in rsH and "`branches` entry" not in rsH
+    assert D._recard_system({}, "fictional") is None
+
+    seen_schema = []
+    dl2 = D.DistillLM({"distill_url": "http://x", "distill_model": "m",
+                       "distill_timeout_s": 5})
+    dl2._content = lambda system, user, schema, mtok: (
+        seen_schema.append(schema)
+        or json.dumps({"misconceptions": [{"claim": "c", "truth": "t"}]}))
+    ex2 = dl2.extract_extras({"text": "x"}, "empirical")
+    assert ex2["misconceptions"] and ex2["branches"] == []
+    assert seen_schema[0] is D.RECARD_SCHEMA
+    assert dl2.extract_extras({"text": "x"}, "fictional") is None \
+        and len(seen_schema) == 1, "fiction must not spend an LM call"
+    dl2._content = lambda *a, **k: "not json"
+    assert dl2.extract_extras({"text": "x"}, "empirical") == {}
+    ok("recard: cards-only schema + regime menus + fiction short-circuit")
+
+    # ── recard_corpus: sweeps distilled-not-recarded only; resumable ────────
+    class RecStore:
+        def __init__(self, chunks):
+            self.chunks = chunks
+
+        def iter_chunks(self):
+            return iter(self.chunks)
+
+    class RecKB:
+        def __init__(self, distilled, recarded, regimes):
+            self.distilled, self.recarded = set(distilled), set(recarded)
+            self.regimes, self.cards = regimes, []
+
+        def is_distilled(self, cid):
+            return cid in self.distilled
+
+        def is_recarded(self, cid):
+            return cid in self.recarded
+
+        def mark_recarded(self, cid):
+            self.recarded.add(cid)
+
+        def get_source(self, doc_id):
+            r = self.regimes.get(doc_id)
+            return {"regime": r} if r else None
+
+        def batch(self):
+            return contextlib.nullcontext()
+
+        def link_to_node(self, lab, kind, v, **k):
+            return ("n:" + lab.lower(), True)
+
+        def add_card(self, node_id, **k):
+            self.cards.append((node_id, k["card_type"]))
+            return ("c%d" % len(self.cards), True)
+
+        def add_surface_question(self, *a, **k):
+            pass
+
+    class RecLM:
+        url = "http://fake:1"
+        max_tokens = 256
+        calls = []
+
+        def extract_extras(self, chunk, regime=None):
+            RecLM.calls.append((chunk["id"], regime))
+            return {"misconceptions": [{"claim": "x causes y", "truth": "it does not",
+                                        "concept": "X-Y link"}]}
+
+    rc_chunks = [
+        {"id": "c1", "path_or_url": "doc://a", "title": "A", "text": "t"},  # eligible
+        {"id": "c2", "path_or_url": "doc://b", "title": "B", "text": "t"},  # not distilled yet
+        {"id": "c3", "path_or_url": "doc://c", "title": "C", "text": "t"},  # already recarded
+        {"id": "c4", "path_or_url": "doc://f", "title": "F", "text": "t"},  # fiction: no LM call
+    ]
+    rkb = RecKB(distilled={"c1", "c3", "c4"}, recarded={"c3"},
+                regimes={"doc://f": "fictional"})
+    rcfg = {"distill_parallel": 1, "ingest_log_every": 0}
+    rstats = D.recard_corpus(RecStore(rc_chunks), rkb, [RecLM()], StubEmb(), rcfg)
+    assert rstats["chunks"] == 1 and rstats["cards"] == 1, rstats
+    assert rstats["fiction"] == 1 and rstats["skipped"] == 2, rstats
+    assert rstats["extra_offered"] == 1 and rstats["extra_kept"] == 1
+    assert RecLM.calls == [("c1", None)]
+    assert "c1" in rkb.recarded and "c4" in rkb.recarded and "c2" not in rkb.recarded
+    assert rkb.cards == [("n:x-y link", "misconception")]
+    rstats2 = D.recard_corpus(RecStore(rc_chunks), rkb, [RecLM()], StubEmb(), rcfg)
+    assert rstats2["chunks"] == 0 and rstats2["skipped"] == 4, rstats2
+    assert len(RecLM.calls) == 1, "second sweep must not re-spend LM calls"
+    ok("recard_corpus: distilled-not-recarded only, fiction marked free, resumable")
+
+    # ── full distill stamps the recard checkpoint (swept corpus stays swept) ─
+    seq_marks = []
+    kb_seq = SimpleNamespace(
+        is_distilled=lambda cid: False,
+        mark_distilled=lambda cid: seq_marks.append(("d", cid)),
+        mark_recarded=lambda cid: seq_marks.append(("r", cid)),
+        batch=lambda: contextlib.nullcontext())
+    dc0 = D.distill_chunk
+    D.distill_chunk = lambda *a, **k: (1, 0, 0)
+    try:
+        D._distill_sequential(RecStore([{"id": "z1"}]), kb_seq, RecLM(), StubEmb(),
+                              {"ingest_log_every": 0})
+    finally:
+        D.distill_chunk = dc0
+    assert ("d", "z1") in seq_marks and ("r", "z1") in seq_marks, seq_marks
+    ok("full distill stamps recarded too — recard never re-charges fresh corpus")
+
+    # ── recard registered end-to-end: ops verb, autopilot step + big-LM lane ─
+    from knowledgehost import autopilot as AP_
+    from knowledgehost import ops as OPS_
+    assert OPS_.COMMANDS["recard"] == {"limit": "int", "bundle": "str"}
+    assert OPS_.HELP["recard"]["_"] and "bundle" in OPS_.HELP["recard"]
+    assert any(s["command"] == "recard" and not s["enabled"]
+               for s in AP_.DEFAULT_PLAN["steps"])
+    assert AP_.auto_model({"distill_urls": []}, "recard") is None  # distill lane, no urls
+    ok("recard registered: ops command/help, autopilot step (off), distill lane")
+
     print(f"standalone_test: {PASS} checks OK")
 
 

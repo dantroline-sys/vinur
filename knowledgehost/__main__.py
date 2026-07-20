@@ -253,6 +253,41 @@ def _run_refine(cfg, store, embedder, log, *, limit=None, force=False) -> int:
     return 0
 
 
+def _run_recard(cfg, store, embedder, log, *, limit=None, bundle=None) -> int:
+    """Cards-only sweep over already-distilled chunks: harvest the conversational
+    card families (branch/troubleshooting/expectation/misconception) from corpus
+    distilled before those families existed.  Joins existing concept nodes and
+    never re-emits nodes or relations, so the adjudication queue stays quiet.
+    Resumable (the recarded set is the checkpoint); big-LM work, fanned out like
+    distill."""
+    from . import distill as distill_mod
+    if not embedder.embed_one("warmup", "document"):
+        log.error("embed endpoint unreachable — recard needs vectors for the new cards.")
+        return 1
+    big = distill_mod.verify_endpoints(cfg)
+    if not big:
+        log.error("no big-LM endpoint up (%s) — start one first.",
+                  ", ".join(cfg.get("verify_urls") or cfg.get("distill_urls") or []))
+        return 1
+    kb = KB(cfg)
+    try:
+        stats = distill_mod.recard_corpus(store, kb, big, embedder, cfg,
+                                          limit=limit, bundle=bundle)
+        log.info("recard: %s", stats)
+        log.info("kb: %s", kb.counts())
+        ops_mod.emit_result(stats.get("chunks", 0) > 0 or stats.get("fiction", 0) > 0,
+                            **stats)
+    except BackendUnavailable as e:
+        log.error("aborted (resumable): %s", e)
+        return 1
+    except KeyboardInterrupt:
+        log.info("recard stopped (resumable)")
+    finally:
+        kb.close()
+        store.close()
+    return 0
+
+
 def _run_adjudicate(cfg, log, *, limit=None, batch=8, watch=False, interval=30,
                     auto=True, auto_only=False, fast=False) -> int:
     """Drain the node-merge queue.  A deterministic pre-pass (auto_resolve) first clears
@@ -729,7 +764,7 @@ def main(argv=None):
     ap = argparse.ArgumentParser(prog="knowledgehost",
                                  description="Vinur — a local general-knowledge tool host.")
     ap.add_argument("command", nargs="?", default="serve",
-                    choices=["serve", "ingest", "distill", "adjudicate", "reconcile",
+                    choices=["serve", "ingest", "distill", "recard", "adjudicate", "reconcile",
                              "link", "refine", "import-conceptnet", "import-atomic",
                              "import-glucose", "import-causenet", "unimport", "embed-nodes", "build-ann",
                              "optimize", "stats", "reset", "bump-version", "migrate-vocab",
@@ -753,7 +788,7 @@ def main(argv=None):
     ap.add_argument("--interval", type=int, default=30,
                     help="distill --watch: seconds to wait between passes (default 30)")
     ap.add_argument("--limit", type=int,
-                    help="ingest/distill/adjudicate: cap items processed (testing)")
+                    help="ingest/distill/recard/adjudicate: cap items processed (testing)")
     ap.add_argument("--batch", type=int, default=8,
                     help="adjudicate: merge-candidate pairs per big-LM call (default 8)")
     ap.add_argument("--no-auto", action="store_true",
@@ -795,7 +830,7 @@ def main(argv=None):
     ap.add_argument("--title", help="source: new display title for the source (rename)")
     ap.add_argument("--bundle",
                     help="source: assign the source to this bundle group | "
-                         "distill: only chunks from this provenance bundle (e.g. 'vinkona' — "
+                         "distill/recard: only chunks from this provenance bundle (e.g. 'vinkona' — "
                          "distil Vinkona's research drops ahead of the big corpus)")
     ap.add_argument("--out", help="split: output directory for bundle files")
     ap.add_argument("--license", help="source: SPDX licence id (e.g. CC-BY-NC-4.0, proprietary)")
@@ -962,6 +997,10 @@ def main(argv=None):
 
     if args.command == "refine":               # raw store (source) + KB + big LM
         return _run_refine(cfg, store, embedder, log, limit=args.limit, force=args.force)
+
+    if args.command == "recard":               # raw store + KB + big LM, cards only
+        return _run_recard(cfg, store, embedder, log, limit=args.limit,
+                           bundle=getattr(args, "bundle", None))
 
     if args.command == "adjudicate":
         store.close()

@@ -269,6 +269,12 @@ class KB:
         CREATE TABLE IF NOT EXISTS distilled_chunks(
             chunk_id TEXT PRIMARY KEY, distilled_at REAL);
 
+        -- recard checkpoint: the cards-only re-pass (conversational card families)
+        -- has covered this chunk — stamped by BOTH the full distill (which extracts
+        -- the families inline) and the recard sweep, so a swept corpus stays swept.
+        CREATE TABLE IF NOT EXISTS recarded_chunks(
+            chunk_id TEXT PRIMARY KEY, recarded_at REAL);
+
         CREATE TABLE IF NOT EXISTS node_merge_candidates(
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             node_a TEXT, node_b TEXT, similarity REAL, reason TEXT,
@@ -1166,6 +1172,16 @@ class KB:
             (chunk_id, time.time()))
         self._maybe_commit()
 
+    def is_recarded(self, chunk_id) -> bool:
+        return self.db.execute("SELECT 1 FROM recarded_chunks WHERE chunk_id=?",
+                              (chunk_id,)).fetchone() is not None
+
+    def mark_recarded(self, chunk_id):
+        self.db.execute(
+            "INSERT OR IGNORE INTO recarded_chunks(chunk_id,recarded_at) VALUES(?,?)",
+            (chunk_id, time.time()))
+        self._maybe_commit()
+
     # ── viewer/eval support ──────────────────────────────────────────────────
     def sample_nodes(self, n: int = 20):
         """A spread of distilled nodes (the 'learnings') with provenance, for the viewer."""
@@ -1812,6 +1828,7 @@ class KB:
             "merge_candidates": c("SELECT COUNT(*) FROM node_merge_candidates WHERE status='open'").fetchone()[0],
             "gaps": c("SELECT COUNT(*) FROM knowledge_gaps WHERE status='open'").fetchone()[0],
             "distilled_chunks": c("SELECT COUNT(*) FROM distilled_chunks").fetchone()[0],
+            "recarded_chunks": c("SELECT COUNT(*) FROM recarded_chunks").fetchone()[0],
         }
         self._counts_cache = (res, now)
         return res

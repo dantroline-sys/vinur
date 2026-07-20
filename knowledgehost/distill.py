@@ -501,18 +501,58 @@ _EXTRA_MENU = {
 }
 
 
+def _format_regime(chunk: dict, regime: str | None = None) -> str:
+    """The chunk's effective text type: an explicit regime wins; else the
+    format-derived default (source_type → TYPE_REGIME)."""
+    if regime:
+        return regime
+    from .kb import TYPE_REGIME
+    stype = (chunk.get("source_type") or "unknown").strip().lower()
+    return TYPE_REGIME.get(stype, "empirical")
+
+
 def _system_for(chunk: dict, regime: str | None = None) -> str:
     """Assemble the extraction prompt adapted to the source's text type.  `regime`
     is the source's EFFECTIVE regime (honours a registry re-tag) when known; else we
     fall back to the format-derived default."""
-    if not regime:
-        from .kb import TYPE_REGIME
-        stype = (chunk.get("source_type") or "unknown").strip().lower()
-        regime = TYPE_REGIME.get(stype, "empirical")
+    regime = _format_regime(chunk, regime)
     lens = _LENS.get(regime, _LENS["empirical"])
     menu = _EXTRA_MENU.get(regime, EXTRA_CARD_KEYS)
     extra = "".join(_EXTRA_CARD_PROMPTS[k] for k in menu)
     return _CORE + extra + lens + _SECURITY
+
+
+# ── recard: the cards-only re-pass ───────────────────────────────────────────────
+# Chunks distilled BEFORE the conversational families existed never saw their
+# prompts (the distilled set is the checkpoint, so distill won't revisit them).
+# `recard` sweeps exactly those chunks with a schema holding ONLY the family
+# arrays: no concepts/relations/procedures are re-emitted, so nodes are joined
+# (never duplicated) and the adjudication queue stays quiet — and the response
+# is a fraction of a full extraction, so the sweep runs far faster than the
+# original distill did.
+RECARD_SCHEMA = {
+    "type": "object",
+    "properties": {k: DISTILL_SCHEMA["properties"][k] for k in EXTRA_CARD_KEYS},
+}
+
+_RECARD_CORE = (
+    "You are re-reading a passage that was ALREADY mined for concepts, relations, "
+    "procedures and criteria on an earlier pass — do NOT restate any of those.  "
+    "This pass harvests ONLY the conversational card shapes below.  Emit an entry "
+    "only when the passage genuinely has that shape; empty arrays are the normal "
+    "result for most passages.\n"
+)
+
+
+def _recard_system(chunk: dict, regime: str | None = None) -> str | None:
+    """The cards-only prompt for this text type, or None when the regime's menu is
+    empty (fiction — the §8 narrative pass owns that lane) so the caller can mark
+    the chunk swept without spending an LM call."""
+    regime = _format_regime(chunk, regime)
+    menu = _EXTRA_MENU.get(regime, EXTRA_CARD_KEYS)
+    if not menu:
+        return None
+    return _RECARD_CORE + "".join(_EXTRA_CARD_PROMPTS[k] for k in menu) + _SECURITY
 
 
 def _user_prompt(chunk: dict) -> str:
@@ -731,6 +771,22 @@ class DistillLM:
                 return salvaged, [], [], [], {}
             log.warning("unparseable distillation output — skipping chunk")
             return None, [], [], [], {}
+
+    def extract_extras(self, chunk: dict, regime: str | None = None):
+        """Cards-only re-pass (recard): {family: [items]} for the conversational
+        families, {} when the passage offers none (or the output didn't parse —
+        the caller still marks progress), or None WITHOUT an LM call when this
+        regime has no menu (fiction).  Raises BackendUnavailable if the endpoint
+        is unreachable."""
+        system = _recard_system(chunk, regime)
+        if system is None:
+            return None
+        obj = self.chat_json(system, _user_prompt(chunk), RECARD_SCHEMA,
+                             self.max_tokens)
+        if obj is None:
+            log.warning("unparseable recard output — chunk yields nothing this pass")
+            return {}
+        return {k: (obj.get(k) or []) for k in EXTRA_CARD_KEYS}
 
     def extract_typed(self, chunk: dict, card_type: str) -> dict:
         """One hinted typed card (requirements/decision/playbook/case) from a research
@@ -1877,6 +1933,7 @@ def _distill_sequential(store, kb, lm, embedder, cfg, *, limit=None, bundle=None
             nc, nr, ncard = distill_chunk(kb, lm, embedder, chunk,
                                           source_regime=reg)  # raises BackendUnavailable
             kb.mark_distilled(chunk["id"])            # parse-fail counts as done (0) → progress
+            kb.mark_recarded(chunk["id"])             # full pass extracts the families inline
         done += 1
         concepts += nc
         relations += nr
@@ -1962,6 +2019,7 @@ def _distill_parallel(store, kb, lms, embedder, cfg, *, limit=None, bundle=None)
                         nc, nr, ncard = distill_chunk(kb, writer_lm, embedder, chunk,
                                                       gen, source_regime=regime, narrative=narr)
                         kb.mark_distilled(chunk["id"])
+                        kb.mark_recarded(chunk["id"])  # families extracted inline
                     done += 1
                     concepts += nc
                     relations += nr
@@ -1976,6 +2034,147 @@ def _distill_parallel(store, kb, lms, embedder, cfg, *, limit=None, bundle=None)
                     submit_next()
     return {"chunks": done, "concepts": concepts, "relations": relations, "cards": cards,
             "skipped": skipped[0]}
+
+
+# ── recard corpus sweep ──────────────────────────────────────────────────────────
+def _pending_recard_chunks(store, kb, counter, bundle=None):
+    """Chunks the generic pass already distilled but the conversational-families
+    pass hasn't seen.  Not-yet-distilled chunks are NOT offered: the full distill
+    extracts the families inline (and stamps the recard checkpoint), so recard
+    never double-charges fresh corpus."""
+    for ch in store.iter_chunks():
+        if bundle is not None and _chunk_bundle(ch) != bundle:
+            continue
+        if not kb.is_distilled(ch["id"]) or kb.is_recarded(ch["id"]):
+            counter[0] += 1
+            continue
+        yield ch
+
+
+def _recard_regime(kb, cfg, chunk):
+    """Same resolution as the distill paths: a folder mapping wins; else the
+    source's effective (possibly re-tagged) regime; else None => format fallback."""
+    doc_id = chunk.get("path_or_url") or chunk.get("id")
+    folder = regime_for_path(cfg, doc_id)
+    if folder:
+        return folder
+    src = kb.get_source(doc_id)
+    return src.get("regime") if src else None
+
+
+def _recard_store(kb, embedder, chunk, extras) -> int:
+    """Store one recard extraction.  Mirrors distill_chunk's claim plumbing but
+    touches ONLY cards: concepts are joined by label via link_to_node (they exist
+    from the first pass), and no relations/support/register_source run."""
+    doc_id = chunk.get("path_or_url") or chunk.get("id")
+    src = kb.get_source(doc_id) or {}
+    src_regime = src.get("regime") or "empirical"
+    world = chunk.get("title") or doc_id
+
+    def claim_regime(item):
+        r = (item.get("regime") or "").strip()
+        return r if r in _VALID_REGIMES else src_regime
+
+    def claim_scope(regime):
+        return {"world": world} if regime == "fictional" else {}
+
+    _stage_add(extra_offered=sum(len(v or []) for v in (extras or {}).values()))
+    n = _distil_extras(kb, embedder, extras, {}, doc_id, claim_regime, claim_scope)
+    _stage_add(extra_kept=n)
+    return n
+
+
+def recard_corpus(store, kb, lms, embedder, cfg, *, limit=None, bundle=None) -> dict:
+    """Cards-only sweep: run the conversational-families extraction over chunks
+    distilled BEFORE those families existed.  Nothing else is re-emitted — nodes
+    are joined, never re-created, and relations are untouched, so the adjudication
+    queue stays quiet.  Resumable (recarded_chunks is the checkpoint); fanned out
+    like distill, and the shared preamble makes vLLM prefix caching very effective.
+    Raises BackendUnavailable when every endpoint is gone (resumable abort)."""
+    import queue
+    import threading
+    from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
+
+    if not lms:
+        raise BackendUnavailable("no recard endpoints available")
+    _stage_reset()
+    lms = _fan_out(cfg, lms)
+    log.info("recard: cards-only re-pass, %d request slot(s): %s",
+             len(lms), ", ".join(sorted({lm.url for lm in lms})))
+    kb_lock = threading.Lock()
+    pool = queue.Queue()                              # available request slots
+    for lm in lms:
+        pool.put(lm)
+    alive = {id(lm) for lm in lms}
+    done = cards = 0
+    fiction = [0]
+    skipped = [0]
+    every = cfg["ingest_log_every"]
+
+    def job(chunk, regime):
+        lm = pool.get()
+        try:
+            return chunk, lm.extract_extras(chunk, regime), lm
+        except BackendUnavailable:
+            return chunk, None, lm                    # endpoint died — caller drops it
+
+    chunks = _pending_recard_chunks(store, kb, skipped, bundle=bundle)
+    stop = False
+    with ThreadPoolExecutor(max_workers=len(lms)) as ex:
+        futures = set()
+
+        def submit_next():
+            if stop:
+                return False
+            for ch in chunks:
+                reg = _recard_regime(kb, cfg, ch)
+                if _recard_system(ch, reg) is None:   # fiction: no menu, no LM call
+                    with kb_lock:
+                        kb.mark_recarded(ch["id"])
+                    fiction[0] += 1
+                    continue
+                futures.add(ex.submit(job, ch, reg))
+                return True
+            return False
+
+        for _ in range(len(lms) * 2):                 # bounded in-flight window
+            if not submit_next():
+                break
+        while futures:
+            finished, _ = wait(futures, return_when=FIRST_COMPLETED)
+            for f in finished:
+                futures.discard(f)
+                chunk, extras, lm = f.result()
+                if extras is None:                    # the endpoint failed mid-run
+                    log.warning("recard endpoint failed, dropping it: %s", lm.url)
+                    alive.discard(id(lm))
+                    if not alive:
+                        raise BackendUnavailable("all recard endpoints failed")
+                else:
+                    pool.put(lm)                      # healthy — back into rotation
+                    with kb_lock, kb.batch():
+                        cards += _recard_store(kb, embedder, chunk, extras)
+                        kb.mark_recarded(chunk["id"])  # parse-fail marks too → progress
+                    done += 1
+                    if every and done % every == 0:
+                        log.info("… recarded %d chunks / %d cards (%d ineligible) %s",
+                                 done, cards, skipped[0], _stage_line())
+                    if limit and done >= limit:
+                        stop = True
+                if not stop:
+                    submit_next()
+    res = {"chunks": done, "cards": cards, "fiction": fiction[0], "skipped": skipped[0]}
+    res.update(stage_stats())
+    if done and not cards:                            # say WHY zero, not just that it was
+        if res["extra_offered"]:
+            log.warning("recard: 0 cards stored but the LM offered %d conversational "
+                        "card(s) — validation dropped them all (missing title/options/"
+                        "causes/timeline).  Format drift after a serving-model change "
+                        "is the usual cause.", res["extra_offered"])
+        else:
+            log.info("recard: the LM offered no conversational cards across %d "
+                     "chunk(s) — normal for encyclopedic text.", done)
+    return res
 
 
 def _put(q, item, keep_going, timeout=0.3) -> bool:
@@ -2150,6 +2349,7 @@ def _distill_pipeline(store, kb, extractors, verifiers, embedder, cfg, *, limit=
                 nc, nr, ncard = distill_chunk(kb, rlm, emb, ch, gen,
                                               source_regime=reg, narrative=narr)
                 kb.mark_distilled(ch["id"])
+                kb.mark_recarded(ch["id"])            # families extracted inline
             with lock:
                 st["done"] += 1
                 st["concepts"] += nc

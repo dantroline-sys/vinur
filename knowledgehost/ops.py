@@ -31,6 +31,7 @@ COMMANDS: dict = {
     "ingest-library": {"force": "bool"},   # index the search-only document library (library_sources)
     "rebuild-fts": {},                     # reindex FTS with the configured tokenizer (no re-parse)
     "distill":    {"limit": "int", "watch": "bool", "interval": "int", "bundle": "str"},
+    "recard":     {"limit": "int", "bundle": "str"},   # cards-only re-pass (see HELP)
     # External-dataset bulk imports (KB-only; path defaults to <name>_path in config —
     # the option only overrides it).  Long-running; stream their progress to the log.
     "import-conceptnet": {"path": "path", "min_weight": "float", "all": "bool",
@@ -79,6 +80,12 @@ HELP: dict = {
                          "steps preempt between runs",
                 "watch": "keep running as a concurrent ingest adds chunks",
                 "interval": "watch mode: seconds between passes"},
+    "recard": {"_": "Cards-only re-pass over already-distilled chunks: harvest the "
+                    "conversational card families (branch/troubleshooting/expectation/"
+                    "misconception) from corpus distilled before those families "
+                    "existed — nodes are joined, never re-created; relations untouched",
+               "limit": "max chunks this run",
+               "bundle": "ONLY chunks from this provenance bundle; empty = everything"},
     "import-conceptnet": {"_": "Bulk-import the ConceptNet commonsense graph",
                           "path": "assertions.csv dump (default from config)",
                           "min_weight": "drop assertions weaker than this",

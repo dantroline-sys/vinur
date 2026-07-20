@@ -70,6 +70,11 @@ DEFAULT_PLAN = {
          "min_interval_s": 3600,  "label": "Merge duplicate nodes"},
         {"command": "refine",     "args": {"limit": 50},         "enabled": False,
          "min_interval_s": 86400, "label": "Refine cards against their sources"},
+        # one-shot backfill after the conversational-families upgrade: sweeps
+        # chunks distilled before those card types existed, then goes quiet
+        # (the full distill stamps the same checkpoint for fresh corpus)
+        {"command": "recard",     "args": {"limit": 200},        "enabled": False,
+         "min_interval_s": 3600,  "label": "Cards-only sweep of pre-upgrade chunks"},
     ],
 }
 
@@ -157,7 +162,7 @@ def due_step(steps: list, last_run: dict, now: float, hold_until: dict | None = 
     return None, None
 
 
-# Automatic model routing: distill/refine always want the big distiller;
+# Automatic model routing: distill/refine/recard always want the big distiller;
 # link/adjudicate follow their `fast` flag to the extract tier; ingest only
 # touches an LM when it distils inline.  Verbs not mapped below (imports,
 # embeds, stats, …) use no chat LM — no swap needed.
@@ -169,7 +174,7 @@ def auto_model(cfg: dict, command: str, args: dict | None = None):
     hosts, and boxes with no [serving] models — so on a classic deployment
     this changes nothing.  An explicit step "model" always overrides."""
     args = args or {}
-    if command in ("distill", "refine"):
+    if command in ("distill", "refine", "recard"):
         lane = "distill"
     elif command in ("link", "adjudicate"):
         lane = "extract" if args.get("fast") else "distill"

@@ -474,6 +474,8 @@ async function loadOverview() {
 // ── Upkeep: the tidy-up verbs, with WHEN and WHY — run now or queue a step ──
 function renderUpkeep(kb, relPerNode) {
   const merge = kb.merge_candidates || 0;
+  const sweep = (kb.distilled_chunks != null && kb.recarded_chunks != null)
+    ? Math.max(0, kb.distilled_chunks - kb.recarded_chunks) : null;
   const acts = [
     ['link',
      'Finds typed relations between EXISTING concepts. Run after a big ingest/distill '
@@ -483,6 +485,12 @@ function renderUpkeep(kb, relPerNode) {
      'Clears the node-merge queue (pairs too similar to keep apart, too different to '
      + 'auto-merge). Duplicates dilute retrieval — run when the queue climbs.',
      merge ? merge + ' queued' + (merge > 50 ? ' — worth clearing' : '') : 'queue empty'],
+    ['recard',
+     'Cards-only re-pass over chunks distilled BEFORE the conversational card families '
+     + '(branch/troubleshooting/expectation/misconception) existed. Joins existing '
+     + 'concepts; never re-emits nodes or edges, so adjudication stays quiet. Big-LM '
+     + 'work at batch speed; a one-shot backfill that then goes quiet.',
+     sweep == null ? '' : (sweep ? sweep + ' chunks to sweep' : 'swept')],
     ['refine',
      'Source-grounded, in-place rewrite of weak or stale cards. Run occasionally — '
      + 'after corrections land or when new sources touch old topics. Big-LM work.',
