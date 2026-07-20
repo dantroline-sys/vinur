@@ -47,7 +47,7 @@ with per-mode extras (rigor · k · collection).  Library *search* moves here
 from the Library panel (the panel under Settings keeps root/selection
 config).  Renderers unchanged.
 
-### Stage 3 — Distilled overview + statistics
+### Stage 3 — Distilled overview + statistics  ✅
 New default sub-view "Overview": count tiles (sources, chunks, % distilled,
 concepts, relations, cards) + the ratios that say something (relations per
 concept, cards per 100 distilled chunks, merge-queue depth, open gaps) from

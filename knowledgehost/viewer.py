@@ -97,6 +97,13 @@ INDEX_HTML = """<!doctype html>
   .evchips { display: flex; gap: 6px; flex-wrap: wrap; margin: 0 0 10px; font-size: 12px; }
   .evchips .badge { margin: 0; }
   .abdelta td { font-weight: 600; border-top: 2px solid #8886; }
+  /* Distilled → Overview: stat tiles (proportional figures, per the contract) */
+  .tiles { display: grid; grid-template-columns: repeat(auto-fill, minmax(150px, 1fr));
+           gap: 10px; margin-bottom: 14px; }
+  .tile { border: 1px solid #8883; border-radius: 8px; padding: 10px 12px; }
+  .tile .tl { font-size: 12px; opacity: .65; }
+  .tile .tvv { font-size: 26px; font-weight: 600; margin: 2px 0; }
+  .tile .ts { font-size: 11px; opacity: .55; }
   .bar { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; margin-bottom: 14px; }
   input, select, button { font: inherit; padding: 7px 10px; border: 1px solid #8886;
            border-radius: 6px; background: Canvas; color: CanvasText; }
@@ -172,7 +179,8 @@ const badge = t => `<span class="badge">${esc(t)}</span>`;
 // relations → cards (each layer is distilled from the one before it).
 const GROUPS = [
   ['ask', 'Ask', []],            // one query box; the MODE select replaces sub-tabs
-  ['distilled', 'Distilled', [['sources', 'Sources'], ['raw', 'Raw'], ['nodes', 'Concepts'],
+  ['distilled', 'Distilled', [['overview', 'Overview'],
+                              ['sources', 'Sources'], ['raw', 'Raw'], ['nodes', 'Concepts'],
                               ['edges', 'Relations'], ['cards', 'Cards']]],
   ['curation', 'Curation', [['adjudication', 'Adjudication'], ['gaps', 'Gaps']]],
   ['ops', 'Operations', []],
@@ -191,11 +199,19 @@ function buildTabs() {
     `<button data-k="${k}" onclick="go('${k}')">${lbl}</button>`).join('');
 }
 
+// pills carry the live class counts (from the same poll the header uses)
+const SUBCOUNT = { sources: 'sources', raw: 'chunks', nodes: 'nodes', edges: 'edges',
+                   cards: 'cards', adjudication: 'adjudicate', gaps: 'gaps' };
+let LASTCOUNTS = {};
+
 function renderSubtabs(leaf) {
   const grp = GROUPS.find(g => g[0] === PARENT[leaf]);
   const kids = grp ? grp[2] : [];
-  $('#subtabs').innerHTML = kids.length < 2 ? '' : kids.map(([k, lbl]) =>
-    `<button data-k="${k}" class="${k === leaf ? 'active' : ''}" onclick="go('${k}',1)">${lbl}</button>`).join('');
+  $('#subtabs').innerHTML = kids.length < 2 ? '' : kids.map(([k, lbl]) => {
+    const n = LASTCOUNTS[SUBCOUNT[k]];
+    const cnt = n != null ? ` <span style="opacity:.55">${fmtCompact(n)}</span>` : '';
+    return `<button data-k="${k}" class="${k === leaf ? 'active' : ''}" onclick="go('${k}',1)">${lbl}${cnt}</button>`;
+  }).join('');
 }
 // ── Help: tab intros from help.json + live import-format probes (/help) ─────
 let HELP = { help: {}, formats: [] };
@@ -265,6 +281,7 @@ function go(k, leaf) {
   else if (k === 'ops') { loadOps(); opsTimer = setInterval(() => { if (active === 'ops') pollOps(); }, 2500); }
   else if (k === 'serving') { loadServing(); opsTimer = setInterval(() => { if (active === 'serving') pollServing(); }, 2500); }
   else if (k === 'stats') { loadStatsTab(); opsTimer = setInterval(() => { if (active === 'stats') loadStatsTab(true); }, 10000); }
+  else if (k === 'overview') { loadOverview(); }
   else if (k === 'settings') { loadSettings(); }
   else if (k === 'autopilot') { loadAutopilot(); }
   else if (k === 'bundles') { loadBundles(); }
@@ -285,6 +302,8 @@ function renderBar(k) {
               value="${esc(ASK_Q)}" onkeydown="if(event.key==='Enter')doAskGo()">
        <span id="askx">${askExtras()}</span>
        <button class="toolbtn" onclick="doAskGo()">Go</button>`;
+  } else if (k === 'overview') {
+    $('#bar').innerHTML = `<button class="toolbtn" onclick="loadOverview()">Reload</button>`;
   } else if (k === 'raw') {
     $('#bar').innerHTML =
       `<select id="srcfilter" title="source"></select>
@@ -366,6 +385,7 @@ async function refreshStats() {
     chunks: s.chunks || 0, nodes: kb.nodes || 0, edges: kb.edges || 0, cards: kb.cards || 0,
     distilled: kb.distilled_chunks || 0, adjudicate: kb.merge_candidates || 0, gaps: kb.gaps || 0,
   };
+  LASTCOUNTS = Object.assign({ sources: kb.sources }, counts);
   const { dt, rates } = computeRates(counts);
   const by = Object.entries(s.by_source || {}).map(([k, v]) => badge(`${k}: ${fmt(v)}`)).join('');
   $('#stats').innerHTML = badge('backend: ' + (s.backend || '?'))
@@ -383,6 +403,56 @@ async function fillSources() {
     if (sel) sel.innerHTML = '<option value="">all sources</option>' +
       Object.keys(s.by_source || {}).map(k => `<option value="${esc(k)}">${esc(k)}</option>`).join('');
   } catch (e) {}
+}
+
+// ── Distilled → Overview: what the pipeline has produced, at a glance ───────
+function fmtCompact(v) {
+  if (v == null) return '—';
+  if (v >= 1e6) return (Math.round(v / 1e5) / 10) + 'M';
+  if (v >= 1e4) return (Math.round(v / 100) / 10) + 'K';
+  return Math.round(v).toLocaleString();
+}
+
+async function loadOverview() {
+  $('#banner').innerHTML = '';
+  $('#results').className = 'empty';
+  $('#results').textContent = 'loading…';
+  let s = {}, kb = {};
+  try { s = await (await fetch('stats')).json(); } catch (e) {}
+  try { kb = (await (await fetch('kb')).json()).counts || {}; } catch (e) {}
+  const chunks = s.chunks || 0, dist = kb.distilled_chunks || 0;
+  const tiles = [
+    ['sources', kb.sources, 'registered documents'],
+    ['chunks', chunks, 'ingested passages'],
+    ['distilled', dist, chunks ? Math.round(dist / chunks * 100) + '% of chunks' : ''],
+    ['concepts', kb.nodes, 'distilled nodes'],
+    ['relations', kb.edges, 'typed edges'],
+    ['cards', kb.cards, 'procedures & criteria'],
+  ];
+  const r1 = kb.nodes ? kb.edges / kb.nodes : null;
+  const r2 = dist ? kb.cards / dist * 100 : null;
+  const ratios = [
+    ['relations per concept', r1 == null ? null : Math.round(r1 * 100) / 100,
+     'graph connectivity — grows with the link pass'],
+    ['cards per 100 distilled chunks', r2 == null ? null : Math.round(r2 * 10) / 10,
+     'how card-rich the corpus is (how-to / criteria density)'],
+    ['open merge candidates', kb.merge_candidates, 'ambiguous node pairs → Curation › Adjudication'],
+    ['open knowledge gaps', kb.gaps, 'unanswered queries → Curation › Gaps'],
+  ];
+  const bysrc = Object.entries(s.by_source || {})
+    .map(([k2, v]) => badge(`${k2}: ${fmtCompact(v)}`)).join(' ');
+  setRows(
+    `<div style="font-size:13px;opacity:.7;margin-bottom:10px">The pipeline's layers, in order:
+       <b>Sources → Raw → Concepts → Relations → Cards</b> — each distilled from the one before.
+       Click a pill above to browse a layer.</div>`
+    + '<div class="tiles">' + tiles.map(([l, v, sub]) =>
+        `<div class="tile"><div class="tl">${esc(l)}</div><div class="tvv">${fmtCompact(v)}</div>
+         <div class="ts">${esc(sub)}</div></div>`).join('') + '</div>'
+    + '<table><tr><th>ratio / queue</th><th>value</th><th>what it tells you</th></tr>'
+    + ratios.map(([l, v, note]) =>
+        `<tr><td>${esc(l)}</td><td>${v == null ? '—' : esc(String(v.toLocaleString ? v.toLocaleString() : v))}</td>
+         <td style="opacity:.7">${esc(note)}</td></tr>`).join('') + '</table>'
+    + (bysrc ? `<div style="margin-top:12px;font-size:13px"><span style="opacity:.6">chunks by source type:</span> ${bysrc}</div>` : ''));
 }
 
 // ── renderers ────────────────────────────────────────────────────────────────
