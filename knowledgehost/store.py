@@ -363,6 +363,37 @@ class SqliteStore:
         finally:
             con.close()
 
+    def pending_sources(self, kb_path: str, limit: int = 100) -> dict:
+        """The distillation QUEUE: ingested docs the distiller has not touched
+        yet.  A doc only enters kb.db's source_registry on its FIRST distilled
+        chunk (distill.register_source), so 100 freshly ingested documents are
+        invisible to the Sources view until this anti-join surfaces them.
+        Returns {rows, pending_docs, total_docs}; {} when kb.db is unusable."""
+        con = sqlite3.connect(self.cfg["db_path"], timeout=10)
+        try:
+            con.execute("PRAGMA busy_timeout=10000")
+            con.execute("ATTACH ? AS kbdb", (str(kb_path),))
+            total = con.execute(
+                "SELECT COUNT(DISTINCT path_or_url) FROM chunks").fetchone()[0]
+            pending = con.execute(
+                "SELECT COUNT(DISTINCT path_or_url) FROM chunks "
+                "WHERE path_or_url NOT IN (SELECT doc_id FROM kbdb.source_registry)"
+            ).fetchone()[0]
+            rows = [{"doc_id": d, "title": t or d, "source_type": st or "?",
+                     "chunks": c, "ingested_at": ia}
+                    for d, t, st, c, ia in con.execute(
+                        "SELECT path_or_url, MAX(title), MAX(source_type), "
+                        "COUNT(*), MAX(ingested_at) FROM chunks "
+                        "WHERE path_or_url NOT IN "
+                        "(SELECT doc_id FROM kbdb.source_registry) "
+                        "GROUP BY path_or_url ORDER BY MAX(ingested_at) DESC "
+                        "LIMIT ?", (int(limit),))]
+            return {"rows": rows, "pending_docs": pending, "total_docs": total}
+        except sqlite3.Error:
+            return {}
+        finally:
+            con.close()
+
     def sample(self, n: int, source_type: str | None = None) -> list:
         """A random spread of stored chunks — for eyeballing ingestion quality."""
         sql, params = "SELECT * FROM chunks", []

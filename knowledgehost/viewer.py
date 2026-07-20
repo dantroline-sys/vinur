@@ -634,7 +634,7 @@ async function load(kind) {
     if (kind === 'nodes') return renderNodes(rows);
     if (kind === 'edges') return renderEdges(rows);
     if (kind === 'cards') return renderCards(rows);
-    if (kind === 'sources') return renderSources(rows);
+    if (kind === 'sources') return renderSources(rows, res.pending || [], res.totals || {});
     if (kind === 'adjudication') return renderTable(rows,
       [['node_a', 'node A'], ['node_b', 'node B'], ['similarity', 'sim'],
        ['reason', 'reason'], ['status', 'status']], 'Adjudication queue empty.');
@@ -642,27 +642,49 @@ async function load(kind) {
   } catch (e) { $('#results').textContent = 'request failed: ' + e; }
 }
 
-// sources get distillation-progress + the source file's own date
-function renderSources(rows) {
-  if (!rows || !rows.length) return setRows('', 'No sources registered yet.');
+// sources get distillation-progress, the file's own date, AND the queue —
+// ingested docs the distiller hasn't reached (invisible to the registry)
+function renderSources(rows, pending, totals) {
+  rows = rows || []; pending = pending || []; totals = totals || {};
+  if (!rows.length && !pending.length) {
+    return setRows('', 'No sources yet — ingest something (Operations → ingest).');
+  }
   let tot = 0, dist = 0;
   rows.forEach(r => { tot += r.chunks || 0; dist += r.distilled || 0; });
-  const summary = tot
-    ? `<div style="font-size:13px;opacity:.7;margin-bottom:8px">listed ${rows.length} source(s) ·
-       ${fmtCompact(dist)} of ${fmtCompact(tot)} chunks distilled
-       (${Math.round(dist / tot * 100)}%)</div>` : '';
+  let summary = '';
+  if (totals.docs != null) {
+    summary += `<b>${fmtCompact(totals.docs)}</b> ingested doc(s) · `
+      + `<b>${fmtCompact(totals.docs - totals.queued)}</b> reached by the distiller · `
+      + `<b>${fmtCompact(totals.queued)}</b> queued (ingested, not yet distilled)`;
+  }
+  if (tot) {
+    summary += (summary ? ' — ' : '')
+      + `${fmtCompact(dist)} of ${fmtCompact(tot)} listed chunks distilled `
+      + `(${Math.round(dist / tot * 100)}%)`;
+  }
+  if (summary) summary = `<div style="font-size:13px;opacity:.75;margin-bottom:8px">${summary}</div>`;
   const head = '<tr><th>doc</th><th>title</th><th>type</th><th>trust</th><th>regime</th>'
     + '<th>status</th><th>chunks</th><th>distilled</th><th>file date</th></tr>';
-  const body = rows.map(r => {
+  const row = (r, queued) => {
     const pcell = r.pct == null ? '—'
       : `<span class="pbar" title="${esc(r.distilled)} / ${esc(r.chunks)} chunks">`
         + `<i style="width:${r.pct}%"></i></span> ${r.pct}%`;
-    return `<tr><td>${esc(r.doc_id)}</td><td>${esc(r.title)}</td><td>${esc(r.source_type)}</td>
-      <td>${esc(r.trust_weight)}</td><td>${esc(r.regime)}</td><td>${esc(r.status)}</td>
+    return `<tr${queued ? ' style="opacity:.65"' : ''}><td>${esc(r.doc_id)}</td>
+      <td>${esc(r.title)}</td><td>${esc(r.source_type)}</td>
+      <td>${r.trust_weight != null ? esc(r.trust_weight) : '—'}</td>
+      <td>${r.regime ? esc(r.regime) : '—'}</td><td>${esc(r.status)}</td>
       <td>${r.chunks != null ? fmtCompact(r.chunks) : '—'}</td>
       <td style="white-space:nowrap">${pcell}</td>
       <td style="white-space:nowrap;opacity:.75">${esc(r.file_time || '—')}</td></tr>`;
-  }).join('');
+  };
+  let body = rows.map(r => row(r, false)).join('');
+  if (pending.length) {
+    body += `<tr><td colspan="9" style="padding-top:14px;opacity:.7">⏳ <b>Queued</b> —
+      ingested, awaiting distillation`
+      + (totals.queued > pending.length ? ` (newest ${pending.length} of ${fmtCompact(totals.queued)})` : '')
+      + `. They enter the registry (trust/regime editable) once their first chunk distils.</td></tr>`;
+    body += pending.map(r => row(r, true)).join('');
+  }
   setRows(summary + '<table>' + head + body + '</table>');
 }
 

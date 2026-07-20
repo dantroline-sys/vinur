@@ -402,11 +402,20 @@ def main():
                 "text,tokens,version,ingested_at) VALUES ('w0','wikipedia','W','',"
                 "'zim://Foo','t',3,1,0)")
             pstore.db.commit()
+            for i in range(2):                     # ingested but NEVER distilled
+                pstore.db.execute(
+                    "INSERT INTO chunks(id,source_type,title,section,path_or_url,"
+                    "text,tokens,version,ingested_at) VALUES (?,?,?,?,?,?,?,?,9)",
+                    (f"q{i}", "pdf", "Fresh", "", "new-book.pdf", "t", 3, 1))
+            pstore.db.commit()
             kbfile = Path(td) / "prog-kb.db"
             kcon = sqlite3.connect(kbfile)
             kcon.execute("CREATE TABLE distilled_chunks(chunk_id TEXT PRIMARY KEY)")
             kcon.executemany("INSERT INTO distilled_chunks VALUES (?)",
                              [("c0",), ("c1",), ("c3",)])
+            kcon.execute("CREATE TABLE source_registry(doc_id TEXT PRIMARY KEY)")
+            kcon.executemany("INSERT INTO source_registry VALUES (?)",
+                             [(str(docfile),), ("zim://Foo",)])
             kcon.commit()
             kcon.close()
             prog = pstore.source_progress(str(kbfile), [str(docfile), "zim://Foo", "ghost"])
@@ -438,6 +447,29 @@ def main():
             assert by[str(docfile)]["file_time"], "a real file gets its mtime"
             assert by["zim://Foo"]["pct"] == 0 and by["zim://Foo"]["file_time"] == ""
             ok("sources progress: per-doc distilled % + file date over /browse")
+
+            # the QUEUE: ingested-but-never-distilled docs surface + are counted
+            pq = pstore.pending_sources(str(kbfile), 50)
+            assert pq["total_docs"] == 3 and pq["pending_docs"] == 1, pq
+            assert [r0["doc_id"] for r0 in pq["rows"]] == ["new-book.pdf"]
+            assert pq["rows"][0]["chunks"] == 2 and pq["rows"][0]["title"] == "Fresh"
+            assert pstore.pending_sources(str(Path(td) / "no-such.db"), 5) == {}
+            httpd.kb = SimpleNamespace(list_sources=lambda n=200: srows)
+            store0, httpd.store = httpd.store, pstore
+            scfg["_master_kb_path"] = str(kbfile)
+            try:
+                with urllib.request.urlopen(
+                        f"http://127.0.0.1:{port}/browse?kind=sources", timeout=5) as r:
+                    res = json.loads(r.read())
+            finally:
+                httpd.kb, httpd.store = None, store0
+                scfg.pop("_master_kb_path", None)
+            assert res["totals"] == {"docs": 3, "queued": 1}, res["totals"]
+            assert len(res["pending"]) == 1
+            p0 = res["pending"][0]
+            assert p0["doc_id"] == "new-book.pdf" and p0["status"] == "queued"
+            assert p0["pct"] == 0 and p0["distilled"] == 0 and p0["file_time"] == ""
+            ok("queued sources: counted in totals + listed with status=queued")
 
             # the vinkona exporter's client speaks the same lane
             sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent

@@ -233,9 +233,21 @@ class Handler(BaseHTTPRequestHandler):
                 "gaps": lambda: kb.list_gaps(n),
             }.get(kind)
             rows = fn() if (kb and fn) else []
-            if kind == "sources" and rows and hasattr(store, "source_progress"):
-                # progress-through-the-corpus + the source FILE's own date
-                # (registry rows have no timestamp; URLs/ZIM entries show none)
+            if kind != "sources":
+                return self._send_json({"ok": True, "kind": kind, "rows": rows})
+
+            # Sources get three enrichments: distillation progress per doc,
+            # the source FILE's own date (registry rows have no timestamp;
+            # URLs/ZIM entries show none), and the QUEUE — ingested docs the
+            # distiller hasn't touched, which the registry can't see at all.
+            def stamp(r):
+                try:
+                    r["file_time"] = time.strftime(
+                        "%Y-%m-%d %H:%M", time.localtime(os.path.getmtime(r["doc_id"])))
+                except (OSError, ValueError):
+                    r["file_time"] = ""
+
+            if rows and hasattr(store, "source_progress"):
                 try:
                     prog = store.source_progress(self.server.master_kb_path(),
                                                  [r["doc_id"] for r in rows])
@@ -247,13 +259,21 @@ class Handler(BaseHTTPRequestHandler):
                     r["distilled"] = p.get("distilled", 0)
                     r["pct"] = (round(r["distilled"] / r["chunks"] * 100)
                                 if r["chunks"] else None)
-                    try:
-                        mt = os.path.getmtime(r["doc_id"])
-                        r["file_time"] = time.strftime("%Y-%m-%d %H:%M",
-                                                       time.localtime(mt))
-                    except (OSError, ValueError):
-                        r["file_time"] = ""
-            return self._send_json({"ok": True, "kind": kind, "rows": rows})
+                    stamp(r)
+            pend, totals = [], {}
+            if hasattr(store, "pending_sources"):
+                try:
+                    pq = store.pending_sources(self.server.master_kb_path(), n) or {}
+                except Exception:                  # pragma: no cover - defensive
+                    pq = {}
+                for r in pq.get("rows") or []:
+                    r.update(status="queued", distilled=0, pct=0)
+                    stamp(r)
+                    pend.append(r)
+                if "total_docs" in pq:
+                    totals = {"docs": pq["total_docs"], "queued": pq["pending_docs"]}
+            return self._send_json({"ok": True, "kind": kind, "rows": rows,
+                                    "pending": pend, "totals": totals})
         if path == "/search":                      # viewer: run kb_search (no auth, read-only)
             query = (q.get("q") or [""])[0]
             k = int((q.get("k") or ["8"])[0] or 8)
