@@ -294,6 +294,26 @@ Three ways to get them, all equivalent to vLLM:
    Use this when weights live on another volume — or symlink the cache:
    `ln -s /big/disk/hf var/cache/huggingface`.
 
+### Where the downloaded weights actually are
+
+`var/cache/huggingface/hub/` — the panel's **Serving** tab prints this path in
+its footer (with repo count, total GB, and any reclaimable partials), and each
+model's row shows its own folder. Inside it:
+
+```
+hub/models--Qwen--Qwen3-32B-FP8/
+├── blobs/                     the real files, named by content hash
+│   └── *.incomplete           partial downloads (litter after a failed fetch)
+├── snapshots/<revision>/      readable tree — symlinks into blobs/
+└── refs/main                  which revision that is
+```
+
+Inspect a model as it appears to vLLM with `ls -lL
+var/cache/huggingface/hub/models--*/snapshots/*/` (`-L` follows the symlinks,
+so you see the real sizes). Deleting a whole `models--…` folder un-downloads
+that model and nothing else; deleting stray `*.incomplete` blobs is always
+safe — a resumed fetch writes under a fresh name.
+
 **Gated repos** (Llama, some Mistral originals): accept the license on
 huggingface.co once, create a read token there, and export it before
 starting: `export HF_TOKEN=hf_...`. The recommended pair above is not gated.

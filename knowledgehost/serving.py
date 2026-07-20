@@ -549,6 +549,42 @@ def _snapshot_complete(s) -> bool:
     return bool(shards) and all(p.exists() for p in shards)
 
 
+def hf_cache_dir() -> Path:
+    """The Hugging Face hub cache THIS box downloads weights into.  env.sh
+    pins HF_HOME inside the repo (var/cache/huggingface) so nothing lands in
+    ~/.cache and the container mount is the same tree; a caller who overrides
+    HF_HOME wins.  Layout below it: hub/models--Org--Name/{blobs,snapshots,refs}
+    — snapshots/<rev>/ is the readable tree of symlinks into the flat blobs."""
+    return Path(os.environ.get("HF_HOME")
+                or (ROOT / "var" / "cache" / "huggingface")) / "hub"
+
+
+def hf_cache_status() -> dict:
+    """Where downloaded weights live, for anyone asking 'where did the 200 GB
+    go?' — the path to open, what's in it, and the stale-partial litter that a
+    completed retry leaves behind (safe to delete, so it's worth naming)."""
+    hub = hf_cache_dir()
+    out = {"path": str(hub), "exists": hub.is_dir(), "repos": 0,
+           "size_gb": 0.0, "incomplete_gb": 0.0,
+           "env": "HF_HOME" if os.environ.get("HF_HOME") else "default (var/cache/huggingface)"}
+    if not out["exists"]:
+        return out
+    repos = [d for d in hub.iterdir() if d.is_dir() and d.name.startswith("models--")]
+    out["repos"] = len(repos)
+    out["size_gb"] = round(_tree_size(hub) / 2**30, 1)
+    partial = 0
+    for d in repos:
+        blobs = d / "blobs"
+        if blobs.is_dir():
+            for f in blobs.glob("*.incomplete"):
+                try:
+                    partial += f.stat().st_size
+                except OSError:
+                    pass
+    out["incomplete_gb"] = round(partial / 2**30, 1)
+    return out
+
+
 def weights_status(engine: str, model: str) -> dict:
     """Where the weights for one declared model stand ON DISK:
     ready | incomplete (mid-download or an interrupted/failed fetch) | missing.
@@ -570,9 +606,7 @@ def weights_status(engine: str, model: str) -> dict:
                         "size_gb": round(_tree_size(mp) / 2**30, 1)}
             return {"status": "incomplete", "path": str(mp),
                     "detail": "local dir has no *.safetensors"}
-        hub = Path(os.environ.get("HF_HOME")
-                   or (ROOT / "var" / "cache" / "huggingface")) / "hub"
-        d = hub / ("models--" + model.replace("/", "--"))
+        d = hf_cache_dir() / ("models--" + model.replace("/", "--"))
         if not d.is_dir():
             return {"status": "missing", "path": str(d),
                     "detail": ("downloads on first start — or pre-fetch with "
@@ -683,7 +717,8 @@ def serving_status(cfg: dict) -> dict:
     return {"hosting": bool(llms or embed["enabled"] or reranker["enabled"]),
             "supervisor": {"running": sup_alive,
                            "pid": st.get("supervisor") if sup_alive else None},
-            "swap": swap_state(), "llms": llms, "embed": embed, "reranker": reranker}
+            "swap": swap_state(), "llms": llms, "embed": embed, "reranker": reranker,
+            "cache": hf_cache_status()}
 
 
 def main(argv: list[str] | None = None) -> None:

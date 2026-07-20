@@ -413,8 +413,12 @@ def main():
             assert code == 200 and pr["ok"] and pr["writable"], pr
             pkeys = {p["key"] for p in pr["paths"]}
             assert {"sources", "kb_path", "zim_path", "metrics_db"} <= pkeys
-            assert {p["key"] for p in pr["readonly"]} == {"library_root",
-                                                          "library_sources"}
+            rokeys = {p["key"] for p in pr["readonly"]}
+            assert {"library_root", "library_sources"} <= rokeys, rokeys
+            # the model-weights cache is reported here too — it is not a config
+            # key (env.sh pins HF_HOME) but it is the biggest folder on the box
+            hf = [p for p in pr["readonly"] if p["key"].startswith("HF_HOME")]
+            assert hf and hf[0]["value"].endswith("hub"), pr["readonly"]
             newdocs = Path(td) / "docs-a"
             newdocs.mkdir()
             code, _r = post_path(None, {"key": "sources", "value": str(newdocs)})

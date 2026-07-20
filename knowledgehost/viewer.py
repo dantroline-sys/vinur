@@ -1002,7 +1002,10 @@ function svWeights(w) {
   const c = w.status === 'ready' ? '#22aa66' : w.status === 'incomplete' ? '#e0a800' : '#cc4444';
   const t = 'weights: ' + w.status + (w.size_gb ? ` · ${w.size_gb} GB` : '');
   const tip = (w.path || '') + (w.detail ? ' — ' + w.detail : '');
-  return `<span class="badge" title="${esc(tip)}" style="background:${c}33;border-color:${c}66">${esc(t)}</span>`;
+  // The on-disk path is shown, not just tipped: 'where are the weights?' is a
+  // question people answer with a file manager, and a tooltip can't be copied.
+  return `<span class="badge" title="${esc(tip)}" style="background:${c}33;border-color:${c}66">${esc(t)}</span>`
+    + (w.path ? `<div style="font-size:11px;opacity:.55;word-break:break-all;margin-top:3px">${esc(w.path)}</div>` : '');
 }
 async function doSwap(name) {
   $('#banner').innerHTML = `swapping to <b>${esc(name)}</b> — weights load; this can take minutes…`;
@@ -1056,7 +1059,26 @@ async function pollServing() {
        failed one (the note column carries the service's last log line — a crash there plus
        incomplete weights usually means the fetch died: gated repo token, disk, network).</p>
      <table><tr><th>model</th><th>what</th><th>service</th><th>weights</th><th>note</th><th></th></tr>
-     ${rows}${auxRows}</table>`;
+     ${rows}${auxRows}</table>`
+    + svCache(r.cache);
+}
+// Downloaded weights are big and invisible — say where they went, in the tab
+// that owns them, with enough of the layout to inspect the folder by hand.
+function svCache(c) {
+  if (!c) return '';
+  const stale = c.incomplete_gb > 0
+    ? ` · <span style="color:var(--warn,#b45309)">${c.incomplete_gb} GB in stale
+        <code>*.incomplete</code> blobs</span> (leftovers from interrupted fetches — safe to delete)`
+    : '';
+  return `<p style="margin-top:14px;font-size:12px;opacity:.75;line-height:1.7">
+    <b>Downloaded weights live here:</b> <code>${esc(c.path)}</code>
+    ${c.exists ? `— ${c.repos} repo(s), ${c.size_gb} GB${stale}` : '— not created yet (nothing downloaded)'}<br>
+    One folder per repo, <code>models--Org--Name/</code>: <code>blobs/</code> holds the actual
+    (content-addressed) files, <code>snapshots/&lt;revision&gt;/</code> is the readable tree of
+    symlinks into them, <code>refs/</code> pins the revision. Set by
+    <code>HF_HOME</code> — currently ${esc(c.env)} — so nothing lands in <code>~/.cache</code>,
+    and the container engine mounts this same folder. A model given as a local directory path
+    instead of a repo id is read from there and never enters this cache.</p>`;
 }
 async function loadServing() {
   $('#banner').innerHTML = ''; $('#results').className = ''; $('#results').textContent = 'loading serving state…';

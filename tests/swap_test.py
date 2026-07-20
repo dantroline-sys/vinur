@@ -362,6 +362,15 @@ def main():
                 assert sv.weights_status("vllm", "org/good")["status"] == "ready"
                 ok("weights_status: ready beats stale .incomplete; index shards all checked")
 
+                # ── the cache location is REPORTED, not folklore ────────────
+                # ("where did the 200 GB go?" is answered in the panel)
+                cache = sv.hf_cache_status()
+                assert cache["path"] == str(hub) and cache["exists"] is True, cache
+                assert cache["repos"] == 2, cache          # good + stuck
+                assert cache["incomplete_gb"] >= 0 and cache["env"] == "HF_HOME", cache
+                assert res.get("cache") or sv.serving_status(wcfg)["cache"]["path"] == str(hub)
+                ok("hf_cache_status: hub path, repo count and stale-partial bytes reported")
+
                 sup.STATE.write_text(json.dumps({
                     "supervisor": os.getpid(),           # a live pid
                     "services": {"llm-good": os.getpid(), "llm-gg": 999999},

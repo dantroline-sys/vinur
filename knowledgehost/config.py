@@ -879,6 +879,14 @@ def paths_status(cfg: dict) -> dict:
     ro = [{"key": k, "value": cfg.get(k) or "",
            "note": "managed by the Library panel (containment-validated there)"}
           for k in ("library_root", "library_sources")]
+    # Downloaded model weights: not a config key (env.sh pins HF_HOME), but this
+    # is the tab people come to when they want to know where the disk went.
+    try:
+        from .serving import hf_cache_dir
+        ro.append({"key": "HF_HOME (model weights)", "value": str(hf_cache_dir()),
+                   "note": "Hugging Face cache — set by env.sh, see Serving for its contents"})
+    except Exception:
+        pass
     return {"paths": rows, "readonly": ro}
 
 
