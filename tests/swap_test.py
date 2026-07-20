@@ -439,6 +439,65 @@ def main():
         finally:
             sv.SWAP_REQ, sv.SWAP_STATE = req0, st0
 
+    # ── container stop is authoritative: runtime stop by NAME, never killpg ──
+    # (killing the attached podman/docker client orphans the workload: conmon/
+    # containerd owns it, so the model keeps its VRAM and the next exclusive
+    # load fails its free-memory check — the swap-doesn't-unload bug.)
+    import subprocess
+
+    with tempfile.TemporaryDirectory() as td:
+        calls = Path(td) / "calls.log"
+        rt = Path(td) / "fakert"
+        rt.write_text("#!/bin/sh\n"
+                      f"echo \"$@\" >> {calls}\n"
+                      "if [ \"$1\" = ps ]; then echo running; fi\n")
+        rt.chmod(0o755)
+        rt_quiet = Path(td) / "fakert-quiet"
+        rt_quiet.write_text("#!/bin/sh\nexit 0\n")
+        rt_quiet.chmod(0o755)
+
+        ccfg = load_config()
+        ccfg["serving"] = {**ccfg["serving"], "llms": [
+            {"name": "big", "engine": "container", "model": "org/m", "port": 1,
+             "exclusive": True, "runtime": str(rt)},
+            {"name": "bare", "engine": "vllm", "model": "org/m2", "port": 2}]}
+        assert sv.container_name("big") == "vinur-llm-big"
+        ref = sv.container_ref(ccfg, "big")
+        assert ref == (str(rt), "vinur-llm-big")
+        assert sv.container_ref(ccfg, "bare") is None
+        assert sv.container_ref(ccfg, "nope") is None
+        argv = sv.llm_argv(ccfg["serving"]["llms"][0])
+        assert argv[0] == str(rt) and "vinur-llm-big" in argv, \
+            "llm_argv must name the container with container_name()"
+        ok("container_name/container_ref: shared handle; bare/unknown -> None")
+
+        svcs2 = services_for(ccfg)
+        big = next(s for s in svcs2 if s["name"] == "llm-big")
+        bare = next(s for s in svcs2 if s["name"] == "llm-bare")
+        assert big["container"] == ref and bare["container"] is None
+        ok("services_for carries the (runtime, container-name) stop handle")
+
+        sup._stop_container(ref)
+        got = [ln.split() for ln in calls.read_text().splitlines()]
+        assert got[0] == ["stop", "-t", str(sup.CONTAINER_STOP_S), "vinur-llm-big"]
+        assert got[1] == ["rm", "-f", "vinur-llm-big"]
+        ok("_stop_container: <runtime> stop -t then rm -f, by name")
+
+        assert sup._container_alive(ref) is True
+        assert sup._container_alive((str(rt_quiet), "vinur-llm-big")) is False
+        ok("_container_alive: runtime ps output decides; quiet/missing -> False")
+
+        calls.write_text("")
+        sup._stop_one({}, {"name": "llm-big", "container": ref})
+        assert any(ln.startswith("stop -t") for ln in calls.read_text().splitlines()), \
+            "an untracked (zombie-client) container service must still be stopped"
+        p = subprocess.Popen(["sleep", "30"], start_new_session=True)
+        procs2 = {"llm-bare": p}
+        t0 = time.time()
+        sup._stop_one(procs2, {"name": "llm-bare", "container": None})
+        assert p.poll() is not None and not procs2 and time.time() - t0 < sup.GRACE_S
+        ok("_stop_one: container svc -> runtime stop even with no client; bare -> killpg")
+
     print(f"swap_test: {PASS} checks OK")
 
 

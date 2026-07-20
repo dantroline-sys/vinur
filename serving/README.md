@@ -131,6 +131,15 @@ max_model_len          = 16384
 gpu_memory_utilization = 0.90
 ```
 
+For `engine = "container"` entries the supervisor stops the **container**
+(`podman/docker stop vinur-llm-<name>`, TERM→KILL inside the container),
+never just the attached client — killing the client would orphan the model
+with its VRAM still held, and the incoming entry would then die with
+`Free memory on device … is less than desired GPU memory utilization`.
+start/swap/stop also sweep orphaned `vinur-llm-*` containers left behind by
+a crashed client or a dead supervisor run, so a restart self-heals that
+state.
+
 Three ways to trigger a swap:
 
 ```bash

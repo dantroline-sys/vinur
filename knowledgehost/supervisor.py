@@ -18,6 +18,13 @@ loads another in its place — stop, spawn, then wait for /health before
 reporting ready (see serving.py's swap protocol; the autopilot's per-step
 "model" key drives it for batched distill-vs-verify phases).
 
+engine = "container" entries are stopped through the runtime (`podman/docker
+stop` by the deterministic vinur-llm-<name>), never by signalling the attached
+client: conmon/containerd owns the workload, so killing the client would
+orphan the model with its VRAM held and the next exclusive load would fail
+its free-memory check.  start/swap/stop also sweep orphaned vinur-llm-*
+containers left by a dead run.
+
 Runs on the .venv interpreter (vinur.sh picks it): config parsing needs
 tomllib, so the floor is the package's own (>= 3.11).  Stdlib only.
 """
@@ -37,6 +44,9 @@ LOGS = ROOT / "var" / "log"
 STATE = ROOT / "var" / "run" / "supervisor.json"
 
 GRACE_S = 8            # TERM -> KILL budget at shutdown
+CONTAINER_STOP_S = 60  # in-container TERM -> KILL budget (`<runtime> stop -t`):
+                       # a big vLLM engine takes well over GRACE_S to exit, and
+                       # the runtime's own KILL still frees VRAM either way
 TICK_S = 2.0           # watchdog cadence
 MAX_RESTARTS = 5       # per service, within WINDOW_S, then give up
 WINDOW_S = 600.0
@@ -63,6 +73,7 @@ def services_for(cfg: dict) -> list[dict]:
     exclusives = [e for e in cfg["serving"]["llms"] if e.get("exclusive")]
     default = next((e for e in exclusives if e.get("default")),
                    exclusives[0] if exclusives else None)
+    from . import serving as sv
     for e in cfg["serving"]["llms"]:
         name = str(e.get("name") or "")
         if not name:
@@ -71,7 +82,10 @@ def services_for(cfg: dict) -> list[dict]:
                      "env": {}, "hint": f":{e.get('port', '?')}", "entry": name,
                      "exclusive": bool(e.get("exclusive")),
                      "autostart": (not e.get("exclusive")) or e is default,
-                     "probe": (str(e.get("host") or "127.0.0.1"), int(e.get("port") or 0))})
+                     "probe": (str(e.get("host") or "127.0.0.1"), int(e.get("port") or 0)),
+                     # (runtime, container-name) for engine="container" — the
+                     # authoritative stop handle; None for bare-metal engines
+                     "container": sv.container_ref(cfg, name)})
     if cfg["serving"]["embed"].get("enabled"):
         svcs.append({"name": "embed", "cmd": [py, "-m", "knowledgehost.serving", "embed"],
                      "env": {}, "hint": f":{cfg['serving']['embed'].get('port', 11437)}",
@@ -141,8 +155,44 @@ def _killpg(pid: int, sig: int) -> None:
         pass
 
 
-def _shutdown(procs: dict) -> None:
+def _container_alive(ref) -> bool:
+    """Is the named container running?  Used to log/skip sweeps — the stop path
+    itself never depends on this answer (stop/rm are idempotent)."""
+    rt, cname = ref
+    try:
+        r = subprocess.run([rt, "ps", "-q", "--filter", f"name=^{cname}$"],
+                           capture_output=True, text=True, timeout=10)
+        return bool(r.stdout.strip())
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+
+
+def _stop_container(ref) -> None:
+    """Authoritative stop for an engine="container" workload.  The attached
+    client is only a window onto the container (conmon/containerd owns the real
+    process tree), so killing the client's process group ORPHANS the model —
+    it keeps serving and keeps its VRAM, and the next exclusive load then fails
+    with 'free memory less than desired utilization'.  `<runtime> stop` signals
+    the workload itself and BLOCKS until it is dead (VRAM is released with the
+    process); `rm -f` is the idempotent belt for a runtime that lost --rm
+    cleanup after an unclean exit."""
+    rt, cname = ref
+    for cmdline in ([rt, "stop", "-t", str(CONTAINER_STOP_S), cname],
+                    [rt, "rm", "-f", cname]):
+        try:
+            subprocess.run(cmdline, stdout=subprocess.DEVNULL,
+                           stderr=subprocess.DEVNULL, stdin=subprocess.DEVNULL,
+                           timeout=CONTAINER_STOP_S + 30, check=False)
+        except (OSError, subprocess.TimeoutExpired):
+            pass
+
+
+def _shutdown(procs: dict, by_name: dict | None = None) -> None:
     from . import serving as sv
+    for name in list(procs):
+        ref = (by_name or {}).get(name, {}).get("container")
+        if ref:
+            _stop_container(ref)                       # blocks until VRAM is free
     for p in procs.values():
         _killpg(p.pid, signal.SIGTERM)
     deadline = time.time() + GRACE_S
@@ -158,10 +208,19 @@ def _shutdown(procs: dict) -> None:
             pass
 
 
-def _stop_one(procs: dict, name: str) -> None:
-    p = procs.pop(name, None)
+def _stop_one(procs: dict, svc: dict) -> None:
+    p = procs.pop(svc["name"], None)
+    ref = svc.get("container")
+    if ref:
+        _stop_container(ref)          # the workload first — clients only follow
     if p is None:
         return
+    if ref:
+        try:
+            p.wait(10)                # the attached client exits with its container
+            return
+        except subprocess.TimeoutExpired:
+            pass                      # wedged client — fall through to the killpg
     _killpg(p.pid, signal.SIGTERM)
     try:
         p.wait(GRACE_S)
@@ -206,6 +265,14 @@ def _run(svcs: list[dict], cfg: dict) -> None:
                      "standby": {e: excl[e]["name"] for e in excl if e != active_excl},
                      "failed": failed})
 
+    # A dead run (or crashed client) can leave a model container running with
+    # its VRAM held — the autostart model would then fail its free-memory check.
+    # Sweep our named containers before spawning anything.
+    for svc in svcs:
+        ref = svc.get("container")
+        if ref and _container_alive(ref):
+            print(f"start: stopping orphaned container {ref[1]}", flush=True)
+            _stop_container(ref)
     for svc in svcs:
         if not svc.get("autostart", True):
             continue
@@ -244,7 +311,16 @@ def _run(svcs: list[dict], cfg: dict) -> None:
         print(f"swap: {active_excl} -> {want}", flush=True)
         cur = excl.get(active_excl or "")
         if cur and cur["name"] != svc["name"]:
-            _stop_one(procs, cur["name"])
+            _stop_one(procs, cur)
+        # Zombie defense: a container whose attached client died (crashed
+        # client, previous supervisor run, manual start) is invisible to
+        # `procs` but still holds its VRAM — sweep every exclusive sibling's
+        # container by name before loading the requested one.
+        for entry_name, s in excl.items():
+            ref = s.get("container")
+            if entry_name != want and ref and _container_alive(ref):
+                print(f"swap: stopping orphaned container {ref[1]}", flush=True)
+                _stop_container(ref)
         if svc["name"] not in procs or procs[svc["name"]].poll() is not None:
             procs.pop(svc["name"], None)                   # a re-request after a timeout
             (LOGS / f"{svc['name']}.log").write_bytes(b"")  # keeps a live loader running
@@ -292,9 +368,12 @@ def _run(svcs: list[dict], cfg: dict) -> None:
                 print(f"{name}: {failed[name]}", flush=True)
             else:
                 print(f"{name} exited rc={p.returncode} — restarting", flush=True)
+                ref = by_name[name].get("container")
+                if ref and _container_alive(ref):      # client died, workload survived
+                    _stop_container(ref)               # — clear it or the name collides
                 procs[name] = spawn(by_name[name])
             sync_state()
-    _shutdown(procs)
+    _shutdown(procs, by_name)
 
 
 # ── commands ──────────────────────────────────────────────────────────────────
@@ -367,6 +446,17 @@ def cmd_stop() -> int:
         if alive(pid):
             _killpg(pid, signal.SIGTERM)
             print(f"reaped stale {name} (pid={pid})")
+    # …and our named model containers, which outlive their attached clients
+    try:
+        cfg = load_cfg()
+        from . import serving as sv
+        for e in cfg["serving"]["llms"]:
+            ref = sv.container_ref(cfg, str(e.get("name") or ""))
+            if ref and _container_alive(ref):
+                print(f"stopping orphaned container {ref[1]}")
+                _stop_container(ref)
+    except Exception:
+        pass                                           # config broken — pids were reaped
     try:
         STATE.unlink()
     except OSError:

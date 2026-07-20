@@ -128,6 +128,27 @@ def _container_runtime(entry: dict) -> str:
         "nvidia-container-toolkit), or set runtime=/path on the entry")
 
 
+def container_name(entry_name: str) -> str:
+    """The deterministic container name llm_argv assigns an engine="container"
+    entry — the handle the supervisor stops the WORKLOAD by.  The attached
+    client process is only a window onto the container (conmon/containerd owns
+    it), so signalling the client can never be the authoritative stop."""
+    return f"vinur-llm-{entry_name}"
+
+
+def container_ref(cfg: dict, entry_name: str) -> tuple | None:
+    """(runtime, container_name) for an engine="container" llms entry, or None
+    when the entry isn't containerised — or no runtime is installed (nothing to
+    stop through a runtime that isn't there)."""
+    for e in (cfg.get("serving") or {}).get("llms") or []:
+        if str(e.get("name")) == str(entry_name) and e.get("engine") == "container":
+            try:
+                return _container_runtime(e), container_name(str(entry_name))
+            except FileNotFoundError:
+                return None
+    return None
+
+
 def llm_argv(entry: dict, root: Path = ROOT) -> list[str]:
     """argv for one llms[] entry ({name, engine, model, port, host, exclusive,
     default, env, args} + the first-class tuning keys in _VLLM_KEYS /
@@ -147,7 +168,7 @@ def llm_argv(entry: dict, root: Path = ROOT) -> list[str]:
         rt = _container_runtime(entry)
         is_podman = "podman" in os.path.basename(rt)
         hf = root / "var" / "cache" / "huggingface"
-        argv = [rt, "run", "--rm", "--name", f"vinur-llm-{entry['name']}"]
+        argv = [rt, "run", "--rm", "--name", container_name(str(entry["name"]))]
         if is_podman:
             # --replace clears a stale same-name container after an unclean
             # stop; CDI is the toolkit's GPU wiring (nvidia-ctk cdi generate).
