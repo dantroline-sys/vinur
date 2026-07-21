@@ -190,9 +190,22 @@ if [ "$WITH_LLAMA" -eq 1 ]; then
     fi
     src="var/build/llama.cpp"
     say "llama: cloning/updating llama.cpp into $src"
-    if [ -d "$src/.git" ]; then git -C "$src" pull --ff-only; else
+    if [ ! -d "$src/.git" ]; then
       mkdir -p var/build
       git clone --depth 1 https://github.com/ggml-org/llama.cpp "$src"
+    fi
+    # Supply-chain pin: LLAMA_CPP_REF=<tag|commit> builds exactly that ref;
+    # unset keeps rolling master (new model archs land there weekly), but the
+    # commit actually built is recorded in bin/llama-server.commit either way,
+    # so a known-good build can be pinned after the fact.
+    if [ -n "${LLAMA_CPP_REF:-}" ]; then
+      say "llama: pinning to $LLAMA_CPP_REF"
+      git -C "$src" fetch --depth 1 origin "$LLAMA_CPP_REF" \
+        && git -C "$src" checkout -q FETCH_HEAD \
+        || die "could not fetch LLAMA_CPP_REF=$LLAMA_CPP_REF"
+    else
+      git -C "$src" checkout -q master 2>/dev/null || true
+      git -C "$src" pull --ff-only || true
     fi
     say "llama: building llama-server ($cuda_flag) — this takes a while"
     # shellcheck disable=SC2086
@@ -205,7 +218,8 @@ if [ "$WITH_LLAMA" -eq 1 ]; then
       || die "llama-server build failed — see above"
     mkdir -p bin
     cp "$src/build/bin/llama-server" bin/
-    say "installed bin/llama-server (found automatically by serving.py + run-reranker.sh)"
+    git -C "$src" rev-parse HEAD > bin/llama-server.commit 2>/dev/null || true
+    say "installed bin/llama-server @ $(cut -c1-12 bin/llama-server.commit 2>/dev/null || echo '?') (found automatically by serving.py + run-reranker.sh)"
   fi
 fi
 
