@@ -324,6 +324,12 @@ class Handler(BaseHTTPRequestHandler):
                           "leased": r.leased, "enabled": r.enabled,
                           "auth": bool(r.auth), "lease": live.get(r.name)}
                          for r in rules]
+            from . import posture as _posture
+            try:
+                posture = _posture.scan(self.cfg)
+            except Exception as e:                 # a broken check must not
+                posture = {"checks": [], "summary": {   # take the tab down
+                    "overall": "unknown", "error": f"{type(e).__name__}: {e}"}}
             return self._send_json({
                 "ok": True, "settings": net_view(self.cfg),
                 "writable": bool(self.cfg.get("_config_path")),
@@ -334,6 +340,7 @@ class Handler(BaseHTTPRequestHandler):
                 "stats": _audit.summarize(),
                 "events": _audit.tail(10),
                 "audit_path": str(_audit.LOG_PATH),
+                "posture": posture,
                 "warning": sv.proxy_warning(self.cfg)})
         if path == "/serving/swap":                # exclusive-model swap state (poll target)
             if not self._authed():

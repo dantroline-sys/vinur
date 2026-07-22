@@ -1762,7 +1762,8 @@ async function loadNetwork() {
     <td style="opacity:.7;font-size:12px">Hugging Face auth for gated repos — held by the BROKER alone (rule auth in egress.toml); inference engines run offline and never see it</td>
     <td><button class="toolbtn" style="font-size:12px;padding:3px 9px" onclick="saveNet('hf_token')">Save</button></td></tr>`;
   $('#results').innerHTML =
-    (r.warning ? `<div class="note" style="margin-bottom:8px">⚠ ${esc(r.warning)}</div>` : '')
+    netPosture(r.posture || {})
+    + (r.warning ? `<div class="note" style="margin-bottom:8px">⚠ ${esc(r.warning)}</div>` : '')
     + `<div style="opacity:.6;margin-bottom:6px">${r.writable
         ? 'writes config.toml in place — proxy credentials are shown REDACTED (***): retype a value to change it; saving the *** form is refused'
         : 'server started without -c — read-only'}</div>`
@@ -1823,6 +1824,28 @@ async function netAct(action, rule, enabled) {
   const r = await postJSON('/net', body).catch(e => ({ ok: false, error: '' + e }));
   $('#banner').innerHTML = `<div class="note">${r.ok ? '✓ ' + esc(r.note || 'done') : '✗ ' + esc(r.error || 'failed')}</div>`;
   if (r.ok) loadNetwork();
+}
+// The posture panel: traffic lights, honestly graded — 'unknown' is its own
+// grey state (a check that couldn't run is NOT a pass), every non-green row
+// names its one-line fix.
+const POSTC = { good: '#22aa66', warn: '#e0a800', bad: '#cc4444', unknown: '#888888' };
+const POSTW = { good: 'good', warn: 'worth fixing', bad: 'UNSAFE / broken', unknown: 'not verified' };
+function netPosture(p) {
+  const s = p.summary || {};
+  const dot = st => `<span style="color:${POSTC[st] || '#888'};font-size:15px">●</span>`;
+  const rows = (p.checks || []).map(c => `<tr>
+    <td style="white-space:nowrap">${dot(c.state)} <b style="font-size:13px">${esc(c.name)}</b></td>
+    <td style="font-size:12px;opacity:.85">${esc(c.detail)}${c.fix
+      ? `<div style="opacity:.75;margin-top:2px">→ ${esc(c.fix)}</div>` : ''}</td></tr>`).join('');
+  const head = s.error
+    ? `posture scan failed: ${esc(s.error)}`
+    : `${dot(s.overall || 'unknown')} overall: <b>${POSTW[s.overall] || '?'}</b>
+       — ${s.good || 0} good · ${s.warn || 0} worth fixing · ${s.bad || 0} unsafe · ${s.unknown || 0} not verified`;
+  return `<div class="cfg-group" style="margin-bottom:14px"><b style="font-size:13px">Leak check</b>
+    <span style="opacity:.55;font-size:12px"> — read-only: what listens where, is the policy tight,
+    do running engines really carry the offline environment, is there an overlay. Re-runs on Refresh.</span>
+    <div style="margin:6px 0 4px;font-size:13px">${head}</div>
+    <table>${rows}</table></div>`;
 }
 async function saveNet(key) {
   const el = document.querySelector(`#results [data-nk="${key}"]`);
