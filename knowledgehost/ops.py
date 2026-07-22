@@ -34,8 +34,10 @@ COMMANDS: dict = {
     "recard":     {"limit": "int", "bundle": "str"},   # cards-only re-pass (see HELP)
     # janitor: chunks holding text the corpus already has (no LM involved)
     "dedupe":     {"near": "bool", "threshold": "float", "apply": "bool", "bundle": "str"},
+    # hub search: candidates sized + judged against this machine's memory
+    "find":       {"query": "str", "limit": "int"},
     # model weights via the egress broker (policy-checked, audited, resumable)
-    "pull":       {"model": "str", "revision": "str"},
+    "pull":       {"model": "str", "revision": "str", "include": "str"},
     # External-dataset bulk imports (KB-only; path defaults to <name>_path in config —
     # the option only overrides it).  Long-running; stream their progress to the log.
     "import-conceptnet": {"path": "path", "min_weight": "float", "all": "bool",
@@ -105,6 +107,14 @@ HELP: dict = {
                "apply": "near mode: actually mark them (default is report only — "
                         "'almost the same' can also mean 'a revision of')",
                "bundle": "ONLY chunks from this provenance bundle; empty = everything"},
+    "find": {"_": "Search huggingface.co (through the egress broker) and judge each "
+                  "hit against this machine: exact weight size from the hub's file "
+                  "list, then fits / tight / too big for the detected VRAM (or "
+                  "unified/system memory). GGUF repos expand into their individual "
+                  "quantisation files. Rows are numbered — pull one by giving the "
+                  "pull op that number as its model",
+             "query": "search words, e.g. 'qwen3 32b fp8'",
+             "limit": "max candidates to size up (default 8)"},
     "pull": {"_": "Download model weights through the egress broker into the local "
                   "model store (models/<Org--Name>/). Policy-checked against "
                   "egress.toml, audited to var/log/egress.jsonl, resumable "
@@ -112,8 +122,10 @@ HELP: dict = {
                   "otherwise), sha256-verified against the hub's published digests. "
                   "Inference engines run OFFLINE and load the result from disk — "
                   "they never download, never hold the token, never phone home",
-             "model": "the HF model id (org/Name)",
-             "revision": "repo revision (default main)"},
+             "model": "the HF model id (org/Name), or a row number from the last find",
+             "revision": "repo revision (default main)",
+             "include": "only repo files matching this glob (a single GGUF quant); "
+                        "find fills this in automatically for numbered rows"},
     "import-conceptnet": {"_": "Bulk-import the ConceptNet commonsense graph",
                           "path": "assertions.csv dump (default from config)",
                           "min_weight": "drop assertions weaker than this",

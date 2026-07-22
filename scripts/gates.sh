@@ -46,6 +46,7 @@ run "compile sweep"     ""     "$PY" -W error::SyntaxWarning -m py_compile \
                                    tests/*.py scripts/*.py
 run "dependency ratchet" ""    "$PY" tests/deps_test.py
 run "broker battery"    ""     "$PY" tests/amiga_net_test.py
+run "model finder"      ""     "$PY" tests/modelfind_test.py
 run "G-8 broker size"   ""     "$PY" - <<'EOF'
 import pathlib, sys
 n = sum(len(p.read_text().splitlines())

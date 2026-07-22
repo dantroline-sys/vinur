@@ -18,6 +18,15 @@ broker — engines themselves run **offline** and load from the local store:
 Budget ~60 GB of disk. Pulls are resumable, audited (`./vinur.sh net`), and
 aria2c-accelerated when installed.
 
+Don't know the exact id? Search instead — every hit comes back with its real
+weight size and a fits / tight / too big verdict for **this** machine's
+detected VRAM (GGUF repos expand into their individual quant files):
+
+```bash
+./vinur.sh find qwen3 32b fp8     # numbered candidates, sized and judged
+./vinur.sh pull 2                 # pull a row by its number
+```
+
 ```toml
 [[serving.llms]]
 name   = "primary"                       # card extraction / distill battery

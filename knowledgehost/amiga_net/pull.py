@@ -16,6 +16,7 @@ huggingface_hub, no Xet side-channel connections.
 """
 from __future__ import annotations
 
+import fnmatch
 import json
 import time
 from pathlib import Path
@@ -55,11 +56,13 @@ def _tree(model_id: str, revision: str) -> list[dict]:
     return [e for e in out if e.get("type") == "file"]
 
 
-def _wanted(files: list[dict]) -> list[dict]:
+def _wanted(files: list[dict], include: str = "") -> list[dict]:
     have_st = any(f["path"].endswith(".safetensors") for f in files)
     keep = []
     for f in files:
         p = f["path"]
+        if include and not fnmatch.fnmatch(p, include):
+            continue                          # a quant pick: only that file(s)
         if p.startswith(_SKIP_PREFIX) or p.endswith(_SKIP_SUFFIX):
             continue
         if have_st and (p.endswith(".bin") or p.endswith(".pth")):
@@ -69,25 +72,35 @@ def _wanted(files: list[dict]) -> list[dict]:
 
 
 def pull(model_id: str, revision: str = "main", root: Path | None = None,
-         say=print) -> Path:
+         say=print, include: str = "") -> Path:
     """Fetch one model snapshot into the store.  Idempotent and resumable:
-    complete files are skipped by size+digest, partial ones resume."""
+    complete files are skipped by size+digest, partial ones resume.  `include`
+    narrows to files matching a glob — how a single GGUF quant is pulled."""
     root = root or Path(__file__).resolve().parent.parent.parent
     dest = store_dir(root, model_id)
     dest.mkdir(parents=True, exist_ok=True)
     purpose = f"model weights: {model_id}"
 
     with broker.lease(purpose, rule_name="huggingface"):
-        files = _wanted(_tree(model_id, revision))
+        files = _wanted(_tree(model_id, revision), include=include)
         if not files:
             raise RuntimeError(f"{model_id}@{revision}: the tree API returned no "
-                               "files — wrong id, private repo without a token, "
-                               "or a licence not yet accepted on huggingface.co")
+                               + (f"files matching '{include}'" if include else
+                                  "files — wrong id, private repo without a token, "
+                                  "or a licence not yet accepted on huggingface.co"))
         total = sum(int(f.get("size") or 0) for f in files)
         say(f"pull {model_id}@{revision}: {len(files)} file(s), "
             f"~{total / 2**30:.1f} GB -> {dest}")
         manifest = {"model": model_id, "revision": revision, "files": {},
                     "pulled_at": time.time()}
+        old = dest / ".pull.json"             # a second quant pull must not
+        if include and old.exists():          # orphan the first from the manifest
+            try:
+                prev = json.loads(old.read_text())
+                if prev.get("revision") == revision:
+                    manifest["files"].update(prev.get("files") or {})
+            except (OSError, ValueError):
+                pass
         for i, f in enumerate(files, 1):
             rel_path = f["path"]
             sha = str((f.get("lfs") or {}).get("oid") or "")

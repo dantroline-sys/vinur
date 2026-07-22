@@ -837,7 +837,7 @@ def main(argv=None):
     ap = argparse.ArgumentParser(prog="knowledgehost",
                                  description="Vinur — a local general-knowledge tool host.")
     ap.add_argument("command", nargs="?", default="serve",
-                    choices=["serve", "ingest", "distill", "recard", "dedupe", "pull", "adjudicate", "reconcile",
+                    choices=["serve", "ingest", "distill", "recard", "dedupe", "find", "pull", "adjudicate", "reconcile",
                              "link", "refine", "import-conceptnet", "import-atomic",
                              "import-glucose", "import-causenet", "unimport", "embed-nodes", "build-ann",
                              "optimize", "stats", "reset", "bump-version", "migrate-vocab",
@@ -911,8 +911,13 @@ def main(argv=None):
                     help="dedupe --near: similarity floor (default 0.9)")
     ap.add_argument("--apply", action="store_true",
                     help="dedupe --near: mark them (default reports only)")
-    ap.add_argument("--model", help="pull: the HF model id to fetch (org/Name)")
+    ap.add_argument("--model", help="pull: the HF model id to fetch (org/Name), "
+                                    "or a row number from the last find")
     ap.add_argument("--revision", default="main", help="pull: repo revision (default main)")
+    ap.add_argument("--include", help="pull: only repo files matching this glob "
+                                      "(how a single GGUF quant is pulled)")
+    ap.add_argument("--query", help="find: search words (the CLI also takes them "
+                                    "positionally: ./vinur.sh find qwen3 32b)")
     ap.add_argument("--out", help="split: output directory for bundle files")
     ap.add_argument("--license", help="source: SPDX licence id (e.g. CC-BY-NC-4.0, proprietary)")
     ap.add_argument("--license-holder", dest="license_holder",
@@ -1083,19 +1088,53 @@ def main(argv=None):
         return _run_recard(cfg, store, embedder, log, limit=args.limit,
                            bundle=getattr(args, "bundle", None))
 
+    if args.command == "find":                 # hub search + fits-this-machine verdicts
+        store.close()
+        from . import modelfind
+        from .amiga_net import broker as _broker
+        from .serving import proxy_env
+        os.environ.update(proxy_env(cfg))      # the broker honours the proxy too
+        query = (args.query or " ".join(args.args)).strip()
+        if not query:
+            log.error("find needs a search query:  ./vinur.sh find <words>")
+            return 2
+        try:
+            n = modelfind.find(query, limit=args.limit or 8,
+                               say=lambda m: log.info("%s", m))
+            ops_mod.emit_result(True, query=query, results=n)
+            return 0
+        except _broker.EgressDenied as e:
+            log.error("%s", e)
+        except Exception as e:
+            log.error("find failed: %s", e)
+        ops_mod.emit_result(False, query=query)
+        return 1
+
     if args.command == "pull":                 # model weights via the egress broker
         store.close()
         if not args.model:
-            log.error("pull needs --model org/Name")
+            log.error("pull needs --model org/Name (or a row number from find)")
             return 2
         from .amiga_net import broker as _broker
         from .amiga_net import pull as _pull
         from .serving import proxy_env
         os.environ.update(proxy_env(cfg))      # the broker honours the proxy too
+        model, include = args.model, args.include or ""
+        if model.isdigit():                    # a row number from the last find
+            from . import modelfind
+            sel = modelfind.pick(int(model))
+            if not sel:
+                log.error("no row %s in the last find — run ./vinur.sh find "
+                          "<query> first, or give the org/Name id", model)
+                return 2
+            model, saved_include = sel
+            include = include or saved_include
+            log.info("pull row %s -> %s%s", args.model, model,
+                     f" (only {include})" if include else "")
         try:
-            _pull.pull(args.model, revision=args.revision,
+            _pull.pull(model, revision=args.revision, include=include,
                        say=lambda m: log.info("%s", m))
-            ops_mod.emit_result(True, model=args.model)
+            ops_mod.emit_result(True, model=model)
             return 0
         except _broker.EgressDenied as e:
             log.error("%s", e)
@@ -1103,7 +1142,7 @@ def main(argv=None):
             log.info("pull interrupted — partial files are kept; re-run to resume")
         except Exception as e:
             log.error("pull failed: %s — partial files are kept; re-run to resume", e)
-        ops_mod.emit_result(False, model=args.model)
+        ops_mod.emit_result(False, model=model)
         return 1
 
     if args.command == "dedupe":               # janitor: duplicate text, no LM

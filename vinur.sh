@@ -10,6 +10,10 @@
 #   ./vinur.sh swap <llm>       # exclusive models: load this one in place of the
 #                               #   resident one (waits for /health; minutes for big weights)
 #   ./vinur.sh logs [svc]       # follow logs (Ctrl-C detaches)
+#   ./vinur.sh find <words>     # search the hub for models — each hit sized and
+#                               #   judged (fits / tight / too big) for THIS machine
+#   ./vinur.sh pull <id | row#> # download one via the egress broker (resumable)
+#   ./vinur.sh net              # the broker's window: policy, leases, activity
 #
 # With no [serving] entries this is simply a supervised ./run.sh.  To serve
 # another machine (Vinkona elsewhere), set host = "0.0.0.0" AND auth_token in
@@ -31,9 +35,16 @@ fi
 
 case "${1:-}" in
     -h|--help|help|"") sed -n '2,/^set /p' "$0" | sed -n 's/^#\{1,\} \{0,1\}//p' ;;
-    pull)   # model weights via the egress broker:  ./vinur.sh pull org/Name
+    find)   # search the hub, sized + judged against this machine:  ./vinur.sh find qwen3 32b
         shift
-        exec "$PY" -m knowledgehost pull --model "${1:?usage: ./vinur.sh pull <org/Name> [revision]}" ${2:+--revision "$2"} ;;
+        exec "$PY" -m knowledgehost find "$@" ;;
+    pull)   # model weights via the egress broker:  ./vinur.sh pull <org/Name | row# from find>
+        shift
+        M="${1:?usage: ./vinur.sh pull <org/Name | row number from find> [revision] [--include glob]}"
+        shift
+        REV=""
+        if [ $# -ge 1 ] && [ "${1#--}" = "$1" ]; then REV="$1"; shift; fi
+        exec "$PY" -m knowledgehost pull --model "$M" ${REV:+--revision "$REV"} "$@" ;;
     net)    # the egress broker's window: policy, live leases, recent activity
         exec "$PY" -m knowledgehost.amiga_net.status ;;
     *) exec "$PY" -m knowledgehost.supervisor "$@" ;;
