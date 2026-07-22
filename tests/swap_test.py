@@ -1152,6 +1152,83 @@ def main():
     assert "hunter2" not in red[-1] and "***:***@proxy:3128" in red[-1], red
     ok("proxy_env: passed to engines, loopback exempt, warning + credentials redacted")
 
+    # ── /serving/model end-to-end: the picker's Deploy button ───────────────
+    # GET offers choices → POST repoints the entry → file, live view and the
+    # supervisor (a restart request for a running service) all update.
+    with tempfile.TemporaryDirectory() as td12:
+        root12 = Path(td12)
+        import json as _json
+        for nm in ("alpha", "beta"):
+            d = root12 / "models" / f"org--{nm}"
+            d.mkdir(parents=True)
+            (d / "model.safetensors").write_bytes(b"w" * 32)
+            (d / ".pull.json").write_text(_json.dumps(
+                {"model": f"org/{nm}", "files": {"model.safetensors": {"size": 32}}}))
+        toml12 = root12 / "config.toml"
+        toml12.write_text('[[serving.llms]]\nname = "big"\nengine = "container"\n'
+                          'model = "org/alpha"   # keep me\nport = 11438\n'
+                          'image = "img:v1"\nexclusive = true\n')
+        cfg12 = load_config(str(toml12))
+        cfg12.update({"host": "127.0.0.1", "port": 0, "auth_token": "tk",
+                      "_config_path": str(toml12)})
+        from knowledgehost import supervisor as sup_mod
+        keep = (sv.ROOT, sv.eligible_models.__defaults__, sv.SVC_REQ_DIR,
+                sup_mod.read_state)
+        try:
+            sv.ROOT = root12
+            sv.eligible_models.__defaults__ = (root12, None)
+            sv.SVC_REQ_DIR = root12 / "var" / "run" / "svcreq"
+            sup_mod.read_state = lambda: {}        # no supervisor: save-only lane
+            khs12 = KnowledgeHostServer(cfg12, SimpleNamespace(), SimpleNamespace(),
+                                        kb=None)
+            p12 = khs12.server_address[1]
+            threading.Thread(target=khs12.serve_forever, daemon=True).start()
+
+            def call12(method, path, body=None):
+                req = urllib.request.Request(
+                    f"http://127.0.0.1:{p12}{path}",
+                    data=_json.dumps(body).encode() if body is not None else None,
+                    headers={"Authorization": "Bearer tk",
+                             "Content-Type": "application/json"}, method=method)
+                try:
+                    with urllib.request.urlopen(req, timeout=10) as r:
+                        return r.status, _json.loads(r.read())
+                except urllib.error.HTTPError as e:
+                    return e.code, _json.loads(e.read())
+
+            code, st = call12("GET", "/serving/status")
+            assert code == 200 and st["llms"][0]["model"] == "org/alpha"
+            assert [c["model"] for c in st["llms"][0]["choices"]] == \
+                ["org/alpha", "org/beta"], st["llms"][0]["choices"]
+            code, res = call12("POST", "/serving/model",
+                               {"name": "big", "model": "org/beta"})
+            assert code == 200 and res["was"] == "org/alpha", res
+            assert "saved" in res["note"]          # nothing running: no restart
+            code, st = call12("GET", "/serving/status")
+            assert st["llms"][0]["model"] == "org/beta"   # runtime view updated
+            line = next(ln for ln in toml12.read_text().splitlines() if "model" in ln)
+            assert line == 'model = "org/beta"   # keep me', line   # comment kept
+            # a running service gets a live restart request (the hot path)
+            me = os.getpid()
+            sup_mod.read_state = lambda: {"supervisor": me,
+                                          "services": {"llm-big": me}}
+            code, res = call12("POST", "/serving/model",
+                               {"name": "big", "model": "org/alpha"})
+            assert code == 200 and "restarting llm-big" in res["note"], res
+            reqf = sv.SVC_REQ_DIR / "llm-big.req"
+            assert _json.loads(reqf.read_text())["action"] == "restart"
+            # a model that is not on this disk is refused, nothing written
+            code, res = call12("POST", "/serving/model",
+                               {"name": "big", "model": "org/ghost"})
+            assert code == 400 and "pull it first" in res["error"], res
+            assert 'model = "org/alpha"' in toml12.read_text()
+            khs12.shutdown()
+        finally:
+            (sv.ROOT, sv.eligible_models.__defaults__, sv.SVC_REQ_DIR,
+             sup_mod.read_state) = keep
+    ok("/serving/model deploy: choices offered, file+runtime repointed "
+       "(comment kept), running service restarted, off-disk model refused")
+
     print(f"swap_test: {PASS} checks OK")
 
 

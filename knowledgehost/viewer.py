@@ -1186,16 +1186,23 @@ async function svPickModel(name, model, prev, sel) {
   $('#banner').innerHTML = 'switching <b>' + esc(name) + '</b> to <b>' + esc(model) + '</b>…';
   const r = await postJSON('/serving/model', { name, model })
     .catch(e => ({ ok: false, error: netErr(e) }));
-  if (!r.ok) { $('#banner').innerHTML = '✗ ' + esc(r.error || 'request failed'); if (sel) sel.value = prev; }
-  else $('#banner').innerHTML = '✓ ' + esc(r.note || 'saved');
-  if (sel) sel.blur();
+  if (!r.ok) { svNote('✗ ' + esc(r.error || 'request failed'), 30); if (sel) sel.value = prev; }
+  else { svNote('✓ ' + esc(r.note || 'saved'), 20); if (sel) sel.dataset.cur = model; }
+  if (sel) {
+    // decision made either way: hide the Deploy affordance so the poll guard
+    // releases and the table renders the truth (frozen polls looked like
+    // "the model never got set")
+    const w = sel.parentElement.querySelector('.svdeploy');
+    if (w) w.style.display = 'none';
+    sel.blur();
+  }
   pollServing();
 }
 async function svcAction(svc, action) {
   $('#banner').innerHTML = `${esc(action)} requested for <b>${esc(svc)}</b>…`;
   const r = await postJSON('/serving/control', { service: svc, action })
     .catch(e => ({ ok: false, error: netErr(e) }));
-  if (!r.ok) $('#banner').innerHTML = '✗ ' + esc(r.error || 'request failed');
+  if (!r.ok) svNote('✗ ' + esc(r.error || 'request failed'), 30);
   pollServing();
 }
 async function svShowLog(svc) { SVLOG = { name: svc, text: 'loading…' }; await pollServing(); }
@@ -1226,10 +1233,24 @@ function svLogPanel() {
 async function doSwap(name) {
   $('#banner').innerHTML = `swapping to <b>${esc(name)}</b> — weights load; this can take minutes…`;
   const r = await postJSON('/serving/swap', { name }).catch(e => ({ ok: false, error: netErr(e) }));
-  if (!r.ok) $('#banner').innerHTML = '✗ ' + esc(r.error || 'swap request failed');
+  if (!r.ok) svNote('✗ ' + esc(r.error || 'swap request failed'), 30);
   pollServing();
 }
 let SVBUSY = false;
+let SVNOTE = null;      // the last action's outcome — survives poll re-renders
+function svNote(html, secs) {
+  SVNOTE = { html, until: Date.now() + secs * 1000 };
+  $('#banner').innerHTML = html;
+}
+function svHold(live) {
+  // the user is mid-decision: a picker holds focus, or a Deploy button is
+  // showing — re-rendering now would reset the selection (or delete the
+  // button) under their cursor
+  const ae = document.activeElement;
+  if (ae && ae.tagName === 'SELECT' && live.contains(ae)) return true;
+  const pending = live.querySelector('.svdeploy');
+  return !!(pending && pending.style.display !== 'none');
+}
 async function pollServing() {
   // never stack polls (a status call that outlasts the 2.5s interval must
   // skip ticks, not pile up) …
@@ -1242,13 +1263,11 @@ async function pollServing_() {
   // and results, and an open picker dropdown is never yanked shut
   const live = $('#svlive');
   if (!live) return;
-  const ae = document.activeElement;
-  if (ae && ae.tagName === 'SELECT' && live.contains(ae)) return;
-  // ...nor while a Deploy decision is pending — re-rendering would reset the
-  // selection under the button the user is about to press
-  const pending = live.querySelector('.svdeploy');
-  if (pending && pending.style.display !== 'none') return;
+  if (svHold(live)) return;
   let r; try { r = await (await authFetch('/serving/status')).json(); } catch (e) { return; }
+  // the guard must hold AFTER the await too: a response already in flight
+  // when the user picked used to land and wipe the selection mid-click
+  if (svHold(live)) return;
   if (!r.ok) { live.className = 'empty';
     live.textContent = (r.error === 'unauthorized')
       ? 'enter the auth token above to view Serving' : ('error: ' + r.error); return; }
@@ -1275,6 +1294,10 @@ async function pollServing_() {
   if (job.running && (job.command === 'pull' || job.command === 'find'))
     banner += `${banner ? '<br>' : ''}⬇ <b>${esc(job.command)}</b> running — ${job.elapsed_s}s;
       the weight chips below update live (full log: Operations tab)`;
+  // the last action's verdict outlives the 2.5s cadence — a '✗ refused'
+  // wiped by the next poll was never readable
+  if (SVNOTE && Date.now() < SVNOTE.until)
+    banner += (banner ? '<br>' : '') + SVNOTE.html;
   $('#banner').innerHTML = banner;
   const rows = (r.llms || []).map(m => {
     const role = m.exclusive ? (m.default ? 'exclusive · boots' : 'exclusive') : 'resident';
@@ -1299,6 +1322,7 @@ async function pollServing_() {
       <td>${svActions(Object.assign({ name: a.name, exclusive: false }, a.s),
                       sup.running, sw.status === 'swapping')}</td></tr>`).join('');
   await svFetchLog();
+  if (svHold(live)) return;   // …and after this await, for the same reason
   // the tab re-renders every 2.5s: keep the reader's place unless they were
   // already at the bottom, where following the tail is what they want
   const pre0 = $('#svlogpre');
