@@ -101,6 +101,14 @@ def pull(model_id: str, revision: str = "main", root: Path | None = None,
                     manifest["files"].update(prev.get("files") or {})
             except (OSError, ValueError):
                 pass
+        for f in files:
+            manifest["files"][f["path"]] = {
+                "size": int(f.get("size") or 0),
+                "sha256": str((f.get("lfs") or {}).get("oid") or "")}
+        # The manifest is written BEFORE the transfers: the Serving tab can
+        # then show have/total % while the pull runs, and pulled() stays
+        # false until every listed file reaches its full size.
+        (dest / ".pull.json").write_text(json.dumps(manifest, indent=1))
         for i, f in enumerate(files, 1):
             rel_path = f["path"]
             sha = str((f.get("lfs") or {}).get("oid") or "")
@@ -113,7 +121,7 @@ def pull(model_id: str, revision: str = "main", root: Path | None = None,
                 say(f"  [{i}/{len(files)}] {rel_path} ({size / 2**20:.0f} MB)")
                 broker.download(purpose, f"{HF}/{model_id}/resolve/{revision}/{rel_path}",
                                 out, sha256=sha, size=size, progress=say)
-            manifest["files"][rel_path] = {"size": size, "sha256": sha}
+        manifest["pulled_at"] = time.time()
         (dest / ".pull.json").write_text(json.dumps(manifest, indent=1))
     say(f"done — point the serving entry's model at '{model_id}' as before; "
         f"it now resolves to {dest} and the engine runs offline")

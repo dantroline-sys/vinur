@@ -779,13 +779,21 @@ def main():
             ws = sv.weights_status("vllm", "org/pulling")
             assert ws["status"] == "incomplete" and "downloading now" in ws["detail"], ws
             assert "1 file(s) done, 1 in flight" in ws["detail"], ws
+            # the manifest is written first, so mid-pull the tab knows the %
+            (sd6 / ".pull.json").write_text(_json.dumps(
+                {"model": "org/pulling", "files": {
+                    "config.json": {"size": 2},
+                    "model.safetensors": {"size": 4096}}}))
+            ws = sv.weights_status("vllm", "org/pulling")
+            assert ws["pct"] == 50 and "(50%)" in ws["detail"], ws
             old6 = time.time() - 3600
             os.utime(sd6 / "model.safetensors.part", (old6, old6))
             ws = sv.weights_status("vllm", "org/pulling")
             assert ws["status"] == "stalled" and ws["idle_s"] >= 3500, ws
             assert "re-run it" in ws["detail"], ws
             (sd6 / "model.safetensors.part").unlink()
-            ws = sv.weights_status("vllm", "org/pulling")
+            os.utime(sd6 / "config.json", (old6, old6))   # nothing fresh left:
+            ws = sv.weights_status("vllm", "org/pulling")  # that's INTERRUPTED
             assert ws["status"] == "incomplete" and "never finished" in ws["detail"], ws
             assert sv.weights_status("vllm", "org/absent6")["status"] == "missing"
         finally:

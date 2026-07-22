@@ -999,19 +999,26 @@ async function pfSearch() {
       judged against ${esc(r.budget_label || 'unknown hardware')}${esc(pfHidden(r))}</div>
     <table><tr><th>engine</th><th>model</th><th>size</th><th>fits?</th><th>pulls</th><th></th></tr>${rows}</table>
     <div style="opacity:.55;font-size:12px;margin-top:4px">hover a verdict for the arithmetic —
-      Pull streams into the log below; once done the model appears in the Serving tab's picker</div>`;
+      Pull runs in the background (weight chips show live %; full log in Operations); a finished
+      model appears in the service pickers above</div>`;
+}
+function pfNote(html) {
+  const el = $('#opstatus') || $('#banner');            // Ops tab or Serving tab
+  if (el) el.innerHTML = html;
 }
 async function pfPull(i) {
   const x = PFROWS[i]; if (!x) return;
   const me = $('#op_model'), ie = $('#op_include');     // mirror into the args
   if (me) me.value = x.id;                              // editor so what runs
   if (ie) ie.value = x.include || '';                   // is what's shown
-  $('#opstatus').textContent = `launching pull ${x.id}…`;
+  pfNote(`launching pull <b>${esc(x.id)}</b>…`);
   const args = Object.assign({ model: x.id }, x.include ? { include: x.include } : {});
   const r = await postJSON('/ops/run', { command: 'pull', args })
     .catch(e => ({ ok: false, error: '' + e }));
-  if (!r.ok) { $('#opstatus').textContent = '✗ ' + (r.error || 'failed'); return; }
-  pollOps();
+  if (!r.ok) { pfNote('✗ ' + esc(r.error || 'failed')); return; }
+  pfNote(`⬇ pulling <b>${esc(x.id)}</b> in the background — the weight chip shows live
+    progress once a service uses it; full log in Operations`);
+  if ($('#opstatus')) pollOps();
 }
 function gatherArgs() {
   const cmd = $('#opcmd').value, spec = OPSPEC[cmd] || {}, args = {};
@@ -1084,7 +1091,9 @@ function svWeights(w) {
   if (!w) return '';
   const c = w.status === 'ready' ? '#22aa66'
     : w.status === 'incomplete' ? '#e0a800' : '#cc4444';   // stalled/missing both red
-  const t = 'weights: ' + w.status + (w.size_gb ? ` · ${w.size_gb} GB` : '');
+  const t = (w.pct != null && w.status === 'incomplete')
+    ? `downloading · ${w.pct}% of ${w.total_gb} GB`
+    : 'weights: ' + w.status + (w.size_gb ? ` · ${w.size_gb} GB` : '');
   const tip = (w.path || '') + (w.detail ? ' — ' + w.detail : '');
   // The on-disk path is shown, not just tipped: 'where are the weights?' is a
   // question people answer with a file manager, and a tooltip can't be copied.
@@ -1128,11 +1137,30 @@ function svModelPicker(m, enabled) {
     + esc(c.model + (c.size_gb ? ` — ${c.size_gb} GB` : '')
           + (c.via === 'hub cache' ? ' (hub cache)' : ''))
     + `</option>`).join('');
-  const tip = `every model on this disk that ${esc(m.engine)} can serve — picking one `
-    + `rewrites this entry's model in config.toml and restarts the service`;
-  return `<select ${enabled ? '' : 'disabled '}style="max-width:360px;font-size:13px"
-    title="${tip}" onchange="svPickModel('${esc(m.name)}', this.value, '${esc(m.model)}', this)"
-    >${opts}</select>`;
+  const tip = `every model on this disk that ${esc(m.engine)} can serve — pick one, then Deploy`;
+  // nothing happens on selection alone: Deploy applies it, and says what
+  // that means for THIS service before you click
+  const cons = m.service === 'up'
+    ? `restarts <b>llm-${esc(m.name)}</b> now — drops the loaded model, new weights load (minutes)`
+    : (m.exclusive && m.service === 'standby')
+      ? `saved to config.toml — used when this entry next swaps in`
+      : `saved to config.toml — used on this service's next start`;
+  return `<span data-picker="${esc(m.name)}">
+    <select ${enabled ? '' : 'disabled '}style="max-width:340px;font-size:13px"
+      title="${tip}" data-cur="${esc(m.model)}" onchange="svPickChanged(this)">${opts}</select>
+    <span class="svdeploy" style="display:none">
+      <button class="toolbtn" style="font-size:12px;padding:2px 10px;font-weight:600"
+        onclick="svDeploy('${esc(m.name)}', this)">Deploy</button>
+      <span style="opacity:.65;font-size:12px">${cons}</span>
+    </span></span>`;
+}
+function svPickChanged(sel) {
+  const wrap = sel.parentElement.querySelector('.svdeploy');
+  if (wrap) wrap.style.display = sel.value === sel.dataset.cur ? 'none' : 'inline';
+}
+function svDeploy(name, btn) {
+  const sel = btn.closest('[data-picker]').querySelector('select');
+  svPickModel(name, sel.value, sel.dataset.cur, sel);
 }
 async function svPickModel(name, model, prev, sel) {
   if (model === prev) return;
@@ -1183,21 +1211,28 @@ async function doSwap(name) {
   pollServing();
 }
 async function pollServing() {
-  // the tab re-renders every 2.5s — never yank a model picker out from under
-  // an open dropdown (the re-render lands on the next tick instead)
+  // only #svlive re-renders on the 2.5s poll: the search section below keeps
+  // its input and results, and an open picker dropdown is never yanked shut
+  const live = $('#svlive');
+  if (!live) return;
   const ae = document.activeElement;
-  if (ae && ae.tagName === 'SELECT' && $('#results').contains(ae)) return;
+  if (ae && ae.tagName === 'SELECT' && live.contains(ae)) return;
+  // ...nor while a Deploy decision is pending — re-rendering would reset the
+  // selection under the button the user is about to press
+  const pending = live.querySelector('.svdeploy');
+  if (pending && pending.style.display !== 'none') return;
   let r; try { r = await (await authFetch('/serving/status')).json(); } catch (e) { return; }
-  if (!r.ok) { $('#results').className = 'empty';
-    $('#results').textContent = (r.error === 'unauthorized')
+  if (!r.ok) { live.className = 'empty';
+    live.textContent = (r.error === 'unauthorized')
       ? 'enter the auth token above to view Serving' : ('error: ' + r.error); return; }
-  $('#results').className = '';
+  live.className = '';
   if (!r.hosting) {
-    $('#results').innerHTML = `<p style="opacity:.7">This box hosts <b>no models</b> — the
+    live.innerHTML = `<p style="opacity:.7">This box hosts <b>no models</b> — the
       <code>[serving]</code> table in config.toml is empty, so the knowledge host only answers
       queries and borrows LMs from the endpoints in Settings (distill/extract/verify URLs).
       To serve models here, declare them in <code>[serving]</code> and start with
-      <code>./vinur.sh</code> — see <code>serving/README.md</code>.</p>`;
+      <code>./vinur.sh</code> — see <code>serving/README.md</code>. Pull weights below, then
+      add a service for them.</p>`;
     return;
   }
   const sup = r.supervisor || {};
@@ -1206,6 +1241,10 @@ async function pollServing() {
     `⚠ the process supervisor is not running — states below are from disk only. Start with <code>./vinur.sh start</code>.`;
   if (sw.status === 'swapping') banner = `⏳ swap in progress → <b>${esc(sw.request || '')}</b> (weights loading)`;
   else if (sw.status === 'error') banner = `✗ last swap failed: ${esc(sw.error || '')}`;
+  const job = r.job || {};
+  if (job.running && (job.command === 'pull' || job.command === 'find'))
+    banner += `${banner ? '<br>' : ''}⬇ <b>${esc(job.command)}</b> running — ${job.elapsed_s}s;
+      the weight chips below update live (full log: Operations tab)`;
   $('#banner').innerHTML = banner;
   const rows = (r.llms || []).map(m => {
     const role = m.exclusive ? (m.default ? 'exclusive · boots' : 'exclusive') : 'resident';
@@ -1235,7 +1274,7 @@ async function pollServing() {
   const pre0 = $('#svlogpre');
   const keep = pre0 ? pre0.scrollTop : 0;
   const atEnd = pre0 ? (pre0.scrollHeight - pre0.scrollTop - pre0.clientHeight < 40) : true;
-  $('#results').innerHTML =
+  live.innerHTML =
     `<p style="margin:4px 0 10px">This box <b>hosts models</b> for the knowledge host`
     + (sup.running ? ` — supervisor pid ${sup.pid}.` : '.')
     + ` Weight chips show the on-disk state: <i>incomplete</i> during a download <b>and</b> after a
@@ -1266,7 +1305,11 @@ function svCache(c) {
     instead of a repo id is read from there and never enters this cache.</p>`;
 }
 async function loadServing() {
-  $('#banner').innerHTML = ''; $('#results').className = ''; $('#results').textContent = 'loading serving state…';
+  // scaffold once: #svlive re-renders on every poll, the get-models section
+  // below it does NOT (its search box and results must survive the polls)
+  $('#banner').innerHTML = ''; $('#results').className = '';
+  $('#results').innerHTML = `<div id="svlive">loading serving state…</div>
+    <div style="margin-top:16px">${pullFindUI()}</div>`;
   pollServing();
 }
 

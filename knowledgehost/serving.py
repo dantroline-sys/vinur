@@ -851,30 +851,53 @@ def weights_status(engine: str, model: str) -> dict:
                 if parts or done:
                     out = {"path": str(sd),
                            "size_gb": round(_tree_size(sd) / 2**30, 1)}
-                    if parts:
-                        try:
-                            age = time.time() - max(f.stat().st_mtime for f in parts)
-                        except (OSError, ValueError):
-                            age = None
-                        out["idle_s"] = round(age) if age is not None else None
-                        if age is not None and age > 120:
-                            out.update(status="stalled",
-                                       detail=f"a pull left {len(parts)} file(s) "
-                                              "mid-download and NOTHING has been written "
-                                              f"for {_ago(age)} — re-run it (Ops › pull); "
-                                              "partial files resume, nothing restarts "
-                                              "from zero")
-                        else:
-                            out.update(status="incomplete",
-                                       detail=f"downloading now — {len(done)} file(s) "
-                                              f"done, {len(parts)} in flight, last "
-                                              "written "
-                                              f"{_ago(age) if age is not None else 'just now'}"
-                                              " ago")
+                    prog = ""
+                    try:                       # the manifest is written FIRST,
+                        man = json.loads((sd / ".pull.json").read_text())
+                        want = man.get("files") or {}       # so have/total is known
+                        total = sum(int(v.get("size") or 0) for v in want.values())
+                        have = 0
+                        for rel, meta in want.items():
+                            fp = sd / rel
+                            pp = fp.with_suffix(fp.suffix + ".part")
+                            sz = fp.stat().st_size if fp.exists() else \
+                                (pp.stat().st_size if pp.exists() else 0)
+                            have += min(sz, int(meta.get("size") or 0))
+                        if total:
+                            out["have_gb"] = round(have / 2**30, 2)
+                            out["total_gb"] = round(total / 2**30, 2)
+                            out["pct"] = round(100 * have / total)
+                            prog = (f"{out['have_gb']} of {out['total_gb']} GB "
+                                    f"({out['pct']}%), ")
+                    except (OSError, ValueError):
+                        pass
+                    # freshness over the parts when there are any, else over the
+                    # finished files — a pull BETWEEN two files has no .part for
+                    # a moment and must not read as interrupted
+                    try:
+                        age = time.time() - max(f.stat().st_mtime
+                                                for f in (parts or done))
+                    except (OSError, ValueError):
+                        age = None
+                    out["idle_s"] = round(age) if age is not None else None
+                    fresh = age is not None and age <= 120
+                    if parts and not fresh:
+                        out.update(status="stalled",
+                                   detail=f"a pull left {len(parts)} file(s) "
+                                          "mid-download and NOTHING has been written "
+                                          f"for {_ago(age)} — re-run it (Ops › pull); "
+                                          "partial files resume, nothing restarts "
+                                          "from zero")
+                    elif parts or fresh:
+                        out.update(status="incomplete",
+                                   detail=f"downloading now — {prog}{len(done)} file(s) "
+                                          f"done, {len(parts)} in flight, last written "
+                                          f"{_ago(age) if age is not None else 'just now'}"
+                                          " ago")
                     else:
                         out.update(status="incomplete",
-                                   detail=f"{len(done)} file(s) here but the pull never "
-                                          "finished — re-run it to fetch the rest "
+                                   detail=f"{prog}{len(done)} file(s) here but the pull "
+                                          "never finished — re-run it to fetch the rest "
                                           "(resumable)")
                     return out
         d = hf_cache_dir() / ("models--" + model.replace("/", "--"))

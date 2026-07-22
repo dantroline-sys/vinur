@@ -345,7 +345,8 @@ class Handler(BaseHTTPRequestHandler):
                 return self._send_json({"ok": False, "error": "unauthorized"}, 401)
             from . import serving as sv
             try:
-                return self._send_json({"ok": True, **sv.serving_status(self.cfg)})
+                return self._send_json({"ok": True, **sv.serving_status(self.cfg),
+                                        "job": self.server.ops.status()})
             except Exception as e:                 # pragma: no cover - defensive
                 return self._send_json({"ok": False, "error": f"{type(e).__name__}: {e}"}, 500)
         if path == "/serving/find":                # Ops › pull: hub-search pick-list
