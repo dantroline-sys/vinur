@@ -193,11 +193,16 @@ def find(query: str, root: Path | None = None, limit: int = 8, say=print,
     for c in cands:
         pulls = f"{_human(c['downloads'])} pulls"
         hint = _fmt_hint(c)
-        tail = f"[{hint + ', ' if hint else ''}{pulls}]"
+        # which engine serves this: GGUF files are the llama engine's food,
+        # safetensors repos feed the vllm/container engines
+        gguf = bool(c.get("quants")) or hint == "gguf"
+        eng = "llama.cpp" if gguf else "vllm"
+        tail = "[" + " · ".join(x for x in (eng, "" if gguf else hint, pulls) if x) + "]"
         if c.get("blocked"):
             say(row(f"{c['id']:<44} gated — accept its licence on "
                     f"huggingface.co (and set hf_token), then pull  {tail}"))
-            picks[-1] = {"id": c["id"], "include": ""}
+            picks[-1] = {"id": c["id"], "include": "",
+                         "engine": "llama" if gguf else "vllm"}
         elif c.get("quants"):
             say(f"     {c['id']} — GGUF repo, pick a file:  {tail}")
             shown = [q for q in c["quants"]
@@ -208,7 +213,8 @@ def find(query: str, root: Path | None = None, limit: int = 8, say=print,
                 label = m.group(1) if m else Path(key).stem
                 verdict, why = fit(size, budget_bytes)
                 say(row(f"  {label:<12} {size / GiB:6.1f} GB  {verdict:<8} {why}"))
-                picks[-1] = {"id": c["id"], "include": key[:-len(".gguf")] + "*"}
+                picks[-1] = {"id": c["id"], "include": key[:-len(".gguf")] + "*",
+                             "engine": "llama"}
             if len(shown) < len(c["quants"]):
                 say(f"       … {len(c['quants']) - len(shown)} more quantisation(s) "
                     "not shown (won't fit / smaller than needed)")
@@ -216,11 +222,13 @@ def find(query: str, root: Path | None = None, limit: int = 8, say=print,
             size = int(c.get("bytes") or 0)
             verdict, why = fit(size, budget_bytes)
             say(row(f"{c['id']:<44} {size / GiB:6.1f} GB  {verdict:<8} {why}  {tail}"))
-            picks[-1] = {"id": c["id"], "include": ""}
+            picks[-1] = {"id": c["id"], "include": "", "engine": "vllm"}
 
     path = _picks_path(root)
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps({"query": query, "at": time.time(), "picks": picks},
                                indent=1))
     say("pull one:  ./vinur.sh pull <row number>     (or ./vinur.sh pull org/Name)")
+    say("engine tags: [vllm] = safetensors for the vllm/container engines; "
+        "[llama.cpp] = GGUF files for engine = \"llama\" entries")
     return len(picks)

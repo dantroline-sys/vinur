@@ -890,6 +890,58 @@ def weights_status(engine: str, model: str) -> dict:
     return {"status": "unknown", "detail": f"unknown engine '{engine}'"}
 
 
+def eligible_models(engine: str, root: Path = ROOT, cfg: dict | None = None) -> list[dict]:
+    """Every model ON THIS DISK that `engine` could serve — the Serving tab's
+    picker.  vllm/container: complete broker-store snapshots holding
+    safetensors, plus complete legacy hub-cache snapshots.  llama: every GGUF
+    under models/ (embed/reranker support files excluded; only the first part
+    of a split GGUF — llama-server finds the siblings itself).  Disk only:
+    nothing here goes near the network."""
+    from .amiga_net import pull as pull_mod
+    out: list[dict] = []
+    seen: set[str] = set()
+
+    def add(model: str, size_gb: float, via: str) -> None:
+        if model and model not in seen:
+            seen.add(model)
+            out.append({"model": model, "size_gb": size_gb, "via": via})
+
+    store = root / "models"
+    if engine in ("vllm", "container"):
+        for mf in sorted(store.glob("*/.pull.json")):
+            try:
+                man = json.loads(mf.read_text())
+            except (OSError, ValueError):
+                continue
+            files = man.get("files") or {}
+            if not any(k.endswith(".safetensors") for k in files):
+                continue                      # a GGUF store dir: llama's lane
+            mid = str(man.get("model") or "")
+            if mid and pull_mod.pulled(root, mid):
+                gb = round(sum(int(v.get("size") or 0) for v in files.values()) / 2**30, 1)
+                add(mid, gb, "store")
+        hub = hf_cache_dir()
+        if hub.is_dir():
+            for d in sorted(hub.glob("models--*")):
+                snaps = d / "snapshots"
+                if snaps.is_dir() and any(
+                        _snapshot_complete(s) and any(s.glob("*.safetensors"))
+                        for s in snaps.iterdir()):
+                    add(d.name[len("models--"):].replace("--", "/", 1),
+                        round(_tree_size(d) / 2**30, 1), "hub cache")
+    elif engine == "llama":
+        skip = {EMBED_MODEL_FILE,
+                str((cfg or {}).get("rerank_model") or "bge-reranker-v2-m3-Q8_0.gguf")}
+        for p in sorted(store.rglob("*.gguf")) if store.is_dir() else []:
+            if p.name in skip or not p.is_file():
+                continue
+            m = re.search(r"-(\d{5})-of-\d{5}\.gguf$", p.name)
+            if m and m.group(1) != "00001":
+                continue                      # later split parts aren't loadable alone
+            add(str(p.relative_to(root)), round(p.stat().st_size / 2**30, 2), "models/")
+    return out
+
+
 def serving_status(cfg: dict) -> dict:
     """Everything the panel's Serving tab shows: declared models, their
     supervisor state (up/standby/dead/failed + last log line), weights-on-disk
@@ -941,13 +993,17 @@ def serving_status(cfg: dict) -> dict:
         return d
 
     llms = []
+    choices_by_engine: dict = {}               # one disk scan per engine, not per entry
     for e in cfg["serving"]["llms"]:
         name = str(e.get("name") or "")
-        item = {"name": name, "engine": str(e.get("engine") or ""),
+        engine = str(e.get("engine") or "")
+        if engine not in choices_by_engine:
+            choices_by_engine[engine] = eligible_models(engine, cfg=cfg)
+        item = {"name": name, "engine": engine,
                 "model": str(e.get("model") or ""), "port": e.get("port"),
                 "exclusive": bool(e.get("exclusive")), "default": bool(e.get("default")),
-                "weights": weights_status(str(e.get("engine") or ""),
-                                          str(e.get("model") or ""))}
+                "choices": choices_by_engine[engine],
+                "weights": weights_status(engine, str(e.get("model") or ""))}
         item.update(svc_state(f"llm-{name}", name))
         llms.append(item)
 

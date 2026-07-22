@@ -1033,6 +1033,35 @@ function svActions(m, supRunning, swapping) {
   b.push(svBtn('Log', `svShowLog('${esc(svc)}')`, 'opacity:.75'));
   return `<div style="display:flex;gap:4px;flex-wrap:wrap">${b.join('')}</div>`;
 }
+// The model itself is a picker: every model on this disk that the entry's
+// engine can serve (broker store + legacy hub cache for vLLM, GGUFs under
+// models/ for llama.cpp).  Picking rewrites config.toml and restarts the
+// service — the launcher re-reads config on every spawn.
+function svModelPicker(m, enabled) {
+  const ch = (m.choices || []).slice();
+  if (!ch.some(c => c.model === m.model))
+    ch.unshift({ model: m.model, size_gb: 0, via: 'configured' });
+  if (ch.length < 2) return esc(m.model);
+  const opts = ch.map(c => `<option value="${esc(c.model)}"${c.model === m.model ? ' selected' : ''}>`
+    + esc(c.model + (c.size_gb ? ` — ${c.size_gb} GB` : '')
+          + (c.via === 'hub cache' ? ' (hub cache)' : ''))
+    + `</option>`).join('');
+  const tip = `every model on this disk that ${esc(m.engine)} can serve — picking one `
+    + `rewrites this entry's model in config.toml and restarts the service`;
+  return `<select ${enabled ? '' : 'disabled '}style="max-width:360px;font-size:13px"
+    title="${tip}" onchange="svPickModel('${esc(m.name)}', this.value, '${esc(m.model)}', this)"
+    >${opts}</select>`;
+}
+async function svPickModel(name, model, prev, sel) {
+  if (model === prev) return;
+  $('#banner').innerHTML = 'switching <b>' + esc(name) + '</b> to <b>' + esc(model) + '</b>…';
+  const r = await postJSON('/serving/model', { name, model })
+    .catch(e => ({ ok: false, error: '' + e }));
+  if (!r.ok) { $('#banner').innerHTML = '✗ ' + esc(r.error || 'request failed'); if (sel) sel.value = prev; }
+  else $('#banner').innerHTML = '✓ ' + esc(r.note || 'saved');
+  if (sel) sel.blur();
+  pollServing();
+}
 async function svcAction(svc, action) {
   $('#banner').innerHTML = `${esc(action)} requested for <b>${esc(svc)}</b>…`;
   const r = await postJSON('/serving/control', { service: svc, action })
@@ -1072,6 +1101,10 @@ async function doSwap(name) {
   pollServing();
 }
 async function pollServing() {
+  // the tab re-renders every 2.5s — never yank a model picker out from under
+  // an open dropdown (the re-render lands on the next tick instead)
+  const ae = document.activeElement;
+  if (ae && ae.tagName === 'SELECT' && $('#results').contains(ae)) return;
   let r; try { r = await (await authFetch('/serving/status')).json(); } catch (e) { return; }
   if (!r.ok) { $('#results').className = 'empty';
     $('#results').textContent = (r.error === 'unauthorized')
@@ -1100,7 +1133,8 @@ async function pollServing() {
       + ((m.cause || []).join(' · ') || m.reason || m.last_log
          || (m.weights && m.weights.detail) || '');
     return `<tr><td><b>${esc(m.name)}</b></td>
-      <td>${esc(m.model)}<br><span style="opacity:.6">${esc(m.engine)} · :${m.port} · ${role}</span></td>
+      <td>${svModelPicker(m, sup.running && sw.status !== 'swapping')}<br>
+        <span style="opacity:.6">${esc(m.engine)} · :${m.port} · ${role}</span></td>
       <td>${svState(m.service)}</td><td>${svWeights(m.weights)}</td>
       <td style="max-width:340px;font-size:12px;opacity:.8">${esc(note)}</td><td>${act}</td></tr>`;
   }).join('');

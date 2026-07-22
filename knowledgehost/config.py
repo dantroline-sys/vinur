@@ -702,6 +702,43 @@ def update_config_file(path: str, updates: dict) -> dict:
     return applied
 
 
+def update_llm_model(config_path: str, name: str, model: str) -> str:
+    """Rewrite ONE [[serving.llms]] entry's `model = ...` line in config.toml,
+    in place, preserving comments and everything else — the Serving tab's
+    model picker.  Returns the old value.  ValueError when no entry carries
+    that name (or it has no model line to rewrite)."""
+    import re as _re
+    p = Path(config_path).expanduser()
+    lines = p.read_text().splitlines()
+    blocks: list[tuple[int, int]] = []
+    start = None
+    for i, ln in enumerate(lines):
+        s = ln.strip()
+        if s.startswith("["):
+            if start is not None:
+                blocks.append((start, i))
+                start = None
+            if s == "[[serving.llms]]":
+                start = i
+    if start is not None:
+        blocks.append((start, len(lines)))
+    name_re = _re.compile(r"""^\s*name\s*=\s*["'](?P<v>[^"']*)["']""")
+    model_re = _re.compile(r"""^(\s*model\s*=\s*)(["'].*?["'])(\s*(?:#.*)?)$""")
+    for a, b in blocks:
+        if not any((m := name_re.match(lines[j])) and m.group("v") == name
+                   for j in range(a, b)):
+            continue
+        for j in range(a, b):
+            m = model_re.match(lines[j])
+            if m:
+                old = m.group(2)[1:-1]
+                lines[j] = f'{m.group(1)}"{model}"{m.group(3)}'
+                _replace_text(p, "\n".join(lines) + "\n")
+                return old
+        raise ValueError(f"entry '{name}' has no model = \"…\" line to rewrite")
+    raise ValueError(f"no [[serving.llms]] entry named '{name}' in {p.name}")
+
+
 # ── web-managed library folders (sandboxed under library_root) ─────────────────────
 # The Settings firewall keeps path keys out of HTTP; the Library panel carries the
 # deliberate exceptions.  Subfolder toggles are narrow: the web sends bare NAMES,

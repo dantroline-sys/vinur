@@ -442,7 +442,7 @@ class Handler(BaseHTTPRequestHandler):
         if path not in ("/call", "/ops/run", "/ops/stop", "/ops/reload", "/config",
                         "/ops/autopilot", "/library/config", "/library/root",
                         "/source", "/scenario", "/brain", "/drop", "/serving/swap",
-                        "/serving/control",
+                        "/serving/control", "/serving/model",
                         "/metrics/mark", "/gaps/close", "/settings/paths"):
             return self._send_json({"ok": False, "error": "not found"}, 404)
         if not self._authed():
@@ -517,6 +517,50 @@ class Handler(BaseHTTPRequestHandler):
             return self._send_json({"ok": True, "service": name, "action": action,
                                     "note": "the supervisor acts within a few seconds — "
                                             "re-poll /serving/status"})
+        if path == "/serving/model":                   # repoint one entry at another model
+            # The Serving tab's picker: rewrite the entry's model line in
+            # config.toml (the launcher re-reads config on every spawn, so a
+            # restart/swap-in is all it takes) and restart the service if it
+            # is up right now.  Only models actually on this disk are
+            # accepted — the picker is not a download button.
+            from . import serving as sv
+            from . import supervisor as sup
+            from .config import update_llm_model
+            cp = self.cfg.get("_config_path")
+            if not cp:
+                return self._send_json(
+                    {"ok": False, "error": "server started without -c; no config file to write"}, 400)
+            name = str(req.get("name") or "")
+            model = str(req.get("model") or "").strip()
+            entry = next((e for e in self.cfg["serving"]["llms"]
+                          if str(e.get("name")) == name), None)
+            if entry is None:
+                return self._send_json(
+                    {"ok": False, "error": f"'{name}' is not a serving.llms entry"}, 400)
+            if not model:
+                return self._send_json({"ok": False, "error": "model required"}, 400)
+            engine = str(entry.get("engine") or "")
+            if model != str(entry.get("model") or "") and \
+                    model not in {c["model"] for c in sv.eligible_models(engine, cfg=self.cfg)}:
+                return self._send_json(
+                    {"ok": False, "error": f"'{model}' is not on this disk in a form "
+                     f"{engine} can serve — pull it first (Ops › find / pull)"}, 400)
+            try:
+                old = update_llm_model(cp, name, model)
+            except (ValueError, OSError) as e:
+                return self._send_json({"ok": False, "error": str(e)}, 400)
+            entry["model"] = model                     # the live view stays truthful
+            svc = f"llm-{name}"
+            st = sup.read_state()
+            pid = (st.get("services") or {}).get(svc)
+            if sup.alive(st.get("supervisor", 0)) and pid and sup.alive(int(pid)):
+                sv.request_service(svc, "restart")
+                note = (f"restarting {svc} with {model} — weights load, "
+                        "this can take minutes")
+            else:
+                note = "saved — applies when the service next starts or swaps in"
+            return self._send_json({"ok": True, "name": name, "model": model,
+                                    "was": old, "note": note})
         if path == "/drop":                            # research hand-off over HTTP
             # A remote Vinkona's exporter posts solved/*.md here instead of
             # writing a shared folder; ingest mines research_solved_dir either way.

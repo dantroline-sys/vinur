@@ -139,30 +139,31 @@ assert "org/hidden" not in out, "private repos never listed"
 ok("find(): runs end-to-end, picks saved, private repos dropped")
 
 assert "org/dense-fp8" in out and "fits" in out
-assert "35.0 GB" in out and "3.1M pulls" in out and "[fp8" in out
-ok("a dense repo: exact size from the tree API, verdict, format hint, pulls")
+assert "35.0 GB" in out and "3.1M pulls" in out and "[vllm · fp8" in out
+ok("a dense repo: exact size from the tree API, verdict, engine tag, pulls")
 
 assert "org/dense-huge" in out and "too big" in out and "200.0 GB" in out
 ok("an oversized dense repo says 'too big', with the arithmetic shown")
 
-assert "GGUF repo, pick a file" in out
+assert "GGUF repo, pick a file" in out and "[llama.cpp" in out
 assert "Q8_0" in out and "Q4_K_M" in out and "20.0 GB" in out
 assert "F16" not in out.replace("96 GB VRAM", ""), "a 120 GB quant must be hidden"
 assert "1 more quantisation" in out
-ok("a GGUF repo: quants expanded, split files summed (2x10 -> 20 GB), "
-   "oversized ones hidden but counted")
+ok("a GGUF repo: llama.cpp-tagged, quants expanded, split files summed "
+   "(2x10 -> 20 GB), oversized ones hidden but counted")
 
 assert "org/locked" in out and "gated" in out and "licence" in out
 ok("a gated repo is marked and numbered, not fatal to the whole find")
 
 # ── numbered picks resolve to id (+ include glob for quants) ────────────────
 picks = json.loads((TD / "var/run/find.json").read_text())["picks"]
-assert picks[0] == {"id": "org/dense-fp8", "include": ""}
+assert picks[0] == {"id": "org/dense-fp8", "include": "", "engine": "vllm"}
 q4 = next(p for p in picks if "Q4_K_M" in p.get("include", ""))
 assert q4["id"] == "org/tiny-GGUF" and q4["include"] == "tiny-Q4_K_M*"
+assert q4["engine"] == "llama"
 assert modelfind.pick(1, root=TD) == ("org/dense-fp8", "")
 assert modelfind.pick(99, root=TD) is None
-ok("picks: row -> (id, include); out-of-range and missing file give None")
+ok("picks: row -> (id, include) + engine recorded; out-of-range gives None")
 
 # ── the whole find ran under ONE lease, all requests audited ────────────────
 evs = audit.tail(200)

@@ -728,6 +728,67 @@ def main():
         assert argv3[argv3.index("img:v1") + 1] == "/model", argv3
     ok("resolve_model: pulled store wins, incomplete never resolves; container mounts ro")
 
+    # ── eligible_models: the Serving tab's picker (disk only, per engine) ────
+    with tempfile.TemporaryDirectory() as td4:
+        root4 = Path(td4)
+        st4 = root4 / "models" / "org--dense"
+        st4.mkdir(parents=True)
+        (st4 / "model.safetensors").write_bytes(b"w" * 32)
+        import json as _json
+        (st4 / ".pull.json").write_text(_json.dumps(
+            {"model": "org/dense", "files": {"model.safetensors": {"size": 32}}}))
+        half = root4 / "models" / "org--half"          # incomplete: never offered
+        half.mkdir()
+        (half / "model.safetensors").write_bytes(b"w")
+        (half / ".pull.json").write_text(_json.dumps(
+            {"model": "org/half", "files": {"model.safetensors": {"size": 999}}}))
+        gg = root4 / "models" / "org--tiny-GGUF"
+        gg.mkdir()
+        (gg / "tiny-Q4_K_M.gguf").write_bytes(b"g" * 16)
+        (gg / "big-00001-of-00002.gguf").write_bytes(b"g")
+        (gg / "big-00002-of-00002.gguf").write_bytes(b"g")
+        (gg / ".pull.json").write_text(_json.dumps(
+            {"model": "org/tiny-GGUF", "files": {"tiny-Q4_K_M.gguf": {"size": 16}}}))
+        (root4 / "models" / "nomic-embed-text-v1.5.f16.gguf").write_bytes(b"e")
+        vll = sv.eligible_models("vllm", root=root4)
+        assert [c["model"] for c in vll] == ["org/dense"], vll
+        lla = [c["model"] for c in sv.eligible_models("llama", root=root4)]
+        assert "models/org--tiny-GGUF/tiny-Q4_K_M.gguf" in lla, lla
+        assert "models/org--tiny-GGUF/big-00001-of-00002.gguf" in lla, lla
+        assert not any("00002-of" in m for m in lla), lla
+        assert not any("nomic-embed" in m for m in lla), lla
+    ok("eligible_models: complete safetensors stores for vllm; GGUFs for llama "
+       "(first split part only, embed model excluded)")
+
+    # ── update_llm_model: the picker's config.toml rewrite ───────────────────
+    from knowledgehost.config import update_llm_model
+    with tempfile.TemporaryDirectory() as td5:
+        cp5 = Path(td5) / "config.toml"
+        cp5.write_text('port = 8770\n'
+                       '[[serving.llms]]\n'
+                       'name   = "primary"\n'
+                       'model  = "org/old"     # the resident model\n'
+                       'port   = 11438\n'
+                       '[[serving.llms]]\n'
+                       'name = "secondary"\n'
+                       "model = 'org/other'\n"
+                       'port = 11439\n'
+                       '[serving.embed]\n'
+                       'enabled = true\n')
+        old = update_llm_model(str(cp5), "primary", "org/new")
+        assert old == "org/old"
+        txt = cp5.read_text()
+        assert 'model  = "org/new"     # the resident model' in txt, txt
+        assert "'org/other'" in txt, "the OTHER entry must be untouched"
+        assert "# the resident model" in txt and "port = 8770" in txt
+        try:
+            update_llm_model(str(cp5), "nope", "x")
+            raise AssertionError("unknown entry must raise")
+        except ValueError as e:
+            assert "nope" in str(e)
+    ok("update_llm_model: rewrites ONE entry's model in place — comments, "
+       "spacing, and the other entries untouched")
+
     # ── proxy: nothing in the stack reads OS proxy settings, so we pass it ───
     pcfg = {"serving": {"llms": [{"name": "a", "host": "10.0.0.5"}]},
             "http_proxy": "http://proxy.corp:3128"}

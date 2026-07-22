@@ -27,6 +27,13 @@ detected VRAM (GGUF repos expand into their individual quant files):
 ./vinur.sh pull 2                 # pull a row by its number
 ```
 
+Every row carries an engine tag: `[vllm]` rows are safetensors for the
+vllm/container engines, `[llama.cpp]` rows are GGUF files for `engine =
+"llama"` entries — pick ones that match the entry you're feeding.  Once
+pulled, the panel's Serving tab shows the model as a **picker**: it lists
+every model on disk that the entry's engine can serve, and choosing one
+rewrites config.toml and restarts the service with it.
+
 ```toml
 [[serving.llms]]
 name   = "primary"                       # card extraction / distill battery
