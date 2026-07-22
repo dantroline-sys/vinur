@@ -41,6 +41,7 @@ class Rule:
         self.ttl_seconds = float(d.get("ttl_seconds") or 0)
         self.max_uses = int(d.get("max_uses") or 0)
         self.auth = str(d.get("auth") or "")
+        self.enabled = bool(d.get("enabled", True))   # a kill switch, not a delete
 
     @property
     def leased(self) -> bool:
@@ -133,3 +134,42 @@ def live_leases(rules: list[Rule]) -> list[dict]:
             d["remaining_s"] = max(0, int(float(d.get("expires", 0)) - time.time()))
             out.append(d)
     return out
+
+
+def set_rule_enabled(name: str, on: bool, path: Path | None = None) -> None:
+    """Flip one rule's kill switch in egress.toml, in place — comments and the
+    rest of the file untouched.  Disabling never deletes: the rule stays
+    visible (and re-enableable) in the policy window."""
+    import re as _re
+    p = path or POLICY_PATH
+    lines = p.read_text().splitlines()
+    blocks: list[tuple[int, int]] = []
+    start = None
+    for i, ln in enumerate(lines):
+        s = ln.strip()
+        if s.startswith("["):
+            if start is not None:
+                blocks.append((start, i))
+                start = None
+            if s == "[[rule]]":
+                start = i
+    if start is not None:
+        blocks.append((start, len(lines)))
+    name_re = _re.compile(r"""^\s*name\s*=\s*["'](?P<v>[^"']*)["']""")
+    en_re = _re.compile(r"^(\s*)enabled\s*=.*$")
+    for a, b in blocks:
+        if not any((m := name_re.match(lines[j])) and m.group("v") == name
+                   for j in range(a, b)):
+            continue
+        for j in range(a, b):
+            m = en_re.match(lines[j])
+            if m:
+                lines[j] = f"{m.group(1)}enabled = {'true' if on else 'false'}"
+                break
+        else:
+            lines[a + 1:a + 1] = [f"enabled = {'true' if on else 'false'}"]
+        tmp = p.with_suffix(".tmp")
+        tmp.write_text("\n".join(lines) + "\n")
+        os.replace(tmp, p)
+        return
+    raise ValueError(f"no rule named '{name}' in {p.name}")

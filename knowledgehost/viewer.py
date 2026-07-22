@@ -1702,9 +1702,62 @@ async function loadNetwork() {
         ? 'writes config.toml in place — proxy credentials are shown REDACTED (***): retype a value to change it; saving the *** form is refused'
         : 'server started without -c — read-only'}</div>`
     + `<table><tr><th>key</th><th>value</th><th>what it is</th><th></th></tr>${prox}${engRow}${tokRow}</table>`
-    + `<div class="cfg-group" style="margin-top:14px"><b style="font-size:13px">The broker's window</b>
-       <span style="opacity:.55;font-size:12px"> — policy, open leases, recent egress (same as ./vinur.sh net) · audit log: <code>${esc(r.audit_path || '')}</code></span>
-       <pre style="margin-top:6px;font-size:12px;line-height:1.5;white-space:pre-wrap">${esc(r.policy || '')}</pre></div>`;
+    + netRules(r.rules || [])
+    + netStats(r.stats || {})
+    + netEvents(r.events || [], r.audit_path || '');
+}
+function netGB(b) { return b >= 2 ** 30 ? (b / 2 ** 30).toFixed(2) + ' GB' : b >= 2 ** 20 ? (b / 2 ** 20).toFixed(1) + ' MB' : b + ' B'; }
+function netRules(rules) {
+  const rows = rules.map(x => {
+    const lease = x.lease
+      ? `<span class="badge" style="background:#e0a80033;border-color:#e0a80066"
+           title="${esc(x.lease.purpose || '')}">OPEN · ${Math.round((x.lease.remaining_s || 0) / 60)}m left · ${x.lease.uses || 0} uses</span>
+         <button class="toolbtn" style="font-size:12px;padding:2px 8px" onclick="netAct('revoke_lease','${esc(x.name)}')">Revoke</button>`
+      : (x.leased ? '<span style="opacity:.55;font-size:12px">lease-only · closed</span>'
+                  : '<span class="badge" style="background:#cc444433;border-color:#cc444466">standing (always open)</span>');
+    const en = x.enabled
+      ? `<button class="toolbtn" style="font-size:12px;padding:2px 8px" onclick="netAct('rule','${esc(x.name)}',false)">Disable</button>`
+      : `<span class="badge" style="background:#cc444433;border-color:#cc444466">DISABLED</span>
+         <button class="toolbtn" style="font-size:12px;padding:2px 8px" onclick="netAct('rule','${esc(x.name)}',true)">Enable</button>`;
+    return `<tr${x.enabled ? '' : ' style="opacity:.55"'}><td><b>${esc(x.name)}</b>${x.auth ? ' 🔑' : ''}</td>
+      <td style="font-size:12px">${esc(x.hosts.join(', '))} :${x.port} ${esc(x.methods.join('/'))}</td>
+      <td style="font-size:12px;opacity:.75">${esc(x.purpose)}</td>
+      <td>${lease}</td><td>${en}</td></tr>`;
+  }).join('');
+  return `<div class="cfg-group" style="margin-top:14px"><b style="font-size:13px">Rules & leases</b>
+    <span style="opacity:.55;font-size:12px"> — deny by default: traffic needs a rule, leased rules also need an open lease.
+    Revoke kills the current operation's permission mid-flight; Disable is the per-rule kill switch (audited).</span>
+    <table style="margin-top:6px"><tr><th>rule</th><th>allows</th><th>why it exists</th><th>lease</th><th></th></tr>
+    ${rows || '<tr><td colspan="5" style="opacity:.6">no rules — everything is denied</td></tr>'}</table></div>`;
+}
+function netStats(s) {
+  const rows = (s.rules || []).filter(x => x.rule !== '-').map(x => `<tr>
+    <td><b>${esc(x.rule)}</b></td><td style="text-align:right">${x.requests}</td>
+    <td style="text-align:right">${netGB(x.bytes_in)}</td><td style="text-align:right">${netGB(x.bytes_out)}</td>
+    <td style="text-align:right${x.denied ? ';color:var(--warn,#b45309)' : ''}">${x.denied}</td>
+    <td style="text-align:right${x.auth_rejects ? ';color:var(--warn,#b45309)' : ''}">${x.auth_rejects}</td>
+    <td style="font-size:12px;opacity:.7">${esc((x.last_ts || '').replace('T', ' ').replace('Z', ''))} ${esc(x.last_purpose || '')}</td></tr>`).join('');
+  const stray = (s.rules || []).find(x => x.rule === '-');
+  return `<div class="cfg-group" style="margin-top:14px"><b style="font-size:13px">Traffic</b>
+    <span style="opacity:.55;font-size:12px"> — ${esc(s.window || '')}; byte counts only, bodies are never logged</span>
+    <table style="margin-top:6px"><tr><th>rule</th><th>requests</th><th>in</th><th>out</th><th>denied</th><th>auth ✗</th><th>last activity</th></tr>
+    ${rows || '<tr><td colspan="7" style="opacity:.6">no traffic yet</td></tr>'}</table>
+    ${stray && stray.denied ? `<div style="font-size:12px;margin-top:4px;color:var(--warn,#b45309)">
+      ${stray.denied} request(s) denied with NO matching rule — something tried to reach an undeclared destination; see the events below.</div>` : ''}</div>`;
+}
+function netEvents(evs, auditPath) {
+  const lines = evs.map(e =>
+    `${(e.ts || '').replace('T', ' ').replace('Z', '')}  ${e.verdict}  ${e.rule || '-'}  ${e.purpose || ''}`
+    + (e.bytes_in ? `  in:${netGB(e.bytes_in)}` : '') + (e.detail ? `  — ${e.detail}` : '')).join(String.fromCharCode(10));
+  return `<div class="cfg-group" style="margin-top:14px"><b style="font-size:13px">Recent decisions</b>
+    <span style="opacity:.55;font-size:12px"> — the audit log's tail (full log: <code>${esc(auditPath)}</code>, same view: ./vinur.sh net)</span>
+    <pre style="margin-top:6px;font-size:12px;line-height:1.5;white-space:pre-wrap">${esc(lines || '(none yet)')}</pre></div>`;
+}
+async function netAct(action, rule, enabled) {
+  const body = action === 'rule' ? { action, rule, enabled } : { action, rule };
+  const r = await postJSON('/net', body).catch(e => ({ ok: false, error: '' + e }));
+  $('#banner').innerHTML = `<div class="note">${r.ok ? '✓ ' + esc(r.note || 'done') : '✗ ' + esc(r.error || 'failed')}</div>`;
+  if (r.ok) loadNetwork();
 }
 async function saveNet(key) {
   const el = document.querySelector(`#results [data-nk="${key}"]`);

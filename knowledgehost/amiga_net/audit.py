@@ -16,7 +16,7 @@ ROOT = Path(__file__).resolve().parent.parent.parent
 LOG_PATH = ROOT / "var" / "log" / "egress.jsonl"
 
 VERDICTS = ("ALLOWED", "DENIED", "LEASE_OPEN", "LEASE_CLOSE", "AUTH_REJECT",
-            "POSTURE")
+            "POSTURE", "POLICY")   # POLICY = an operator changed the rules/leases
 
 
 def component() -> str:
@@ -53,3 +53,33 @@ def tail(n: int = 40, path: Path | None = None) -> list[dict]:
         except ValueError:
             continue
     return out
+
+
+def summarize(n: int = 5000, path: Path | None = None) -> dict:
+    """Per-rule traffic rollup over the last n events — the Network tab's
+    'some statistics, nothing too detailed': requests, bytes each way,
+    denials, when it last talked.  Counting only; nothing here re-reads
+    bodies because bodies were never written."""
+    per: dict[str, dict] = {}
+    denied_total = 0
+    for ev in tail(n, path):
+        v = ev.get("verdict")
+        rule = ev.get("rule") or "-"
+        r = per.setdefault(rule, {"rule": rule, "requests": 0, "bytes_in": 0,
+                                  "bytes_out": 0, "denied": 0, "auth_rejects": 0,
+                                  "last_ts": "", "last_purpose": ""})
+        if v == "ALLOWED":
+            r["requests"] += 1
+            r["bytes_in"] += int(ev.get("bytes_in") or 0)
+            r["bytes_out"] += int(ev.get("bytes_out") or 0)
+            r["last_ts"] = ev.get("ts", "")
+            r["last_purpose"] = ev.get("purpose", "")
+        elif v == "DENIED":
+            r["denied"] += 1
+            denied_total += 1
+            r["last_ts"] = ev.get("ts", "")
+        elif v == "AUTH_REJECT":
+            r["auth_rejects"] += 1
+    rows = sorted(per.values(), key=lambda r: r["last_ts"], reverse=True)
+    return {"rules": rows, "denied_total": denied_total,
+            "window": f"last {n} events"}

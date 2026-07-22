@@ -71,9 +71,15 @@ def _check(purpose: str, url: str, method: str) -> policy.Rule:
             f"egress to {host}:{port} denied — no rule in egress.toml matches. "
             f"Add one deliberately if this destination is legitimate.")
     for rule in hits:
-        if not rule.leased or policy.lease_state(rule) is not None:
+        if rule.enabled and (not rule.leased or policy.lease_state(rule) is not None):
             return rule
     rule = hits[0]
+    if not any(r.enabled for r in hits):
+        audit.write("DENIED", purpose=purpose, host=host, port=port,
+                    rule=rule.name, detail="rule is disabled")
+        raise EgressDenied(
+            f"egress to {host} denied — rule '{rule.name}' is disabled "
+            f"(the Network tab re-enables it).")
     audit.write("DENIED", purpose=purpose, host=host, port=port,
                 rule=rule.name, detail="rule is leased and no lease is open")
     raise EgressDenied(
@@ -91,6 +97,9 @@ def lease(purpose: str, rule_name: str):
     rule = next((r for r in rules if r.name == rule_name), None)
     if rule is None:
         raise EgressDenied(f"no rule named '{rule_name}' in egress.toml")
+    if not rule.enabled:
+        raise EgressDenied(f"rule '{rule_name}' is disabled — no lease can open "
+                           "on it (the Network tab re-enables it)")
     st = policy.lease_open(rule, purpose)
     audit.write("LEASE_OPEN", purpose=purpose, rule=rule.name,
                 detail=f"ttl={int(rule.ttl_seconds or 3600)}s")

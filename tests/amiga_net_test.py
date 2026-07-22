@@ -287,6 +287,40 @@ pull.pull("org/tiny", root=TD, say=lambda m: None)
 assert pull.pulled(TD, "org/tiny") == got
 ok("re-pull heals a damaged file (idempotent, size-checked)")
 
+# ── the kill switches: disable a rule, revoke a lease ───────────────────────
+policy.set_rule_enabled("huggingface", False, POL)
+assert next(r for r in policy.load() if r.name == "huggingface").enabled is False
+try:
+    with broker.lease("nope", "huggingface"):
+        pass
+    raise AssertionError("a disabled rule must refuse a lease")
+except broker.EgressDenied as e:
+    assert "disabled" in str(e)
+policy.set_rule_enabled("huggingface", True, POL)
+with broker.lease("re-enabled", "huggingface"):
+    assert broker.request("re-enabled", f"{BASE}/org/tiny/resolve/main/config.json") == CONFIG
+txt = POL.read_text()
+assert "enabled = true" in txt and txt.count("[[rule]]") == 2, \
+    "the toggle edits ONE rule block in place"
+# revoke: an open lease dies mid-operation, the next request is refused
+st = policy.lease_open(next(r for r in policy.load() if r.name == "huggingface"), "doomed")
+policy.lease_close("huggingface")
+try:
+    broker.request("after revoke", f"{BASE}/org/tiny/resolve/main/config.json")
+    raise AssertionError("a revoked lease must deny")
+except broker.EgressDenied:
+    pass
+ok("kill switches: rule disable refuses leases+requests; revoke ends a live lease")
+
+# ── traffic rollup: some statistics, nothing too detailed ───────────────────
+stats = audit.summarize(5000)
+hf = next(x for x in stats["rules"] if x["rule"] == "huggingface")
+assert hf["requests"] > 0 and hf["bytes_in"] > 0 and hf["last_ts"], hf
+assert stats["denied_total"] > 0, "the denials above must be counted"
+assert not any("architectures" in json.dumps(x) for x in stats["rules"]), \
+    "stats carry counts, never content"
+ok("summarize(): per-rule requests/bytes/denials with last activity")
+
 # ── status is readable ───────────────────────────────────────────────────────
 out = status.render(10)
 assert "deny by default" in out and "test hub" in out

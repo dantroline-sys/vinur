@@ -315,19 +315,24 @@ class Handler(BaseHTTPRequestHandler):
             from . import serving as sv
             from .amiga_net import audit as _audit
             from .amiga_net import broker as _broker
-            from .amiga_net import status as _netstatus
+            from .amiga_net import policy as _policy
             from .config import net_view
-            try:
-                policy_text = _netstatus.render(12)
-            except Exception as e:                 # a broken policy file must
-                policy_text = f"(broker status unavailable: {e})"   # still render
+            rules = _policy.load()
+            live = {d["rule"]: d for d in _policy.live_leases(rules)}
+            rule_rows = [{"name": r.name, "purpose": r.purpose,
+                          "hosts": r.hosts, "port": r.port, "methods": r.methods,
+                          "leased": r.leased, "enabled": r.enabled,
+                          "auth": bool(r.auth), "lease": live.get(r.name)}
+                         for r in rules]
             return self._send_json({
                 "ok": True, "settings": net_view(self.cfg),
                 "writable": bool(self.cfg.get("_config_path")),
                 "engines": {"aria2c": bool(_sh.which("aria2c")),
                             "wget": bool(_sh.which("wget"))},
                 "engine_resolved": _broker._engine(),
-                "policy": policy_text,
+                "rules": rule_rows,
+                "stats": _audit.summarize(),
+                "events": _audit.tail(10),
                 "audit_path": str(_audit.LOG_PATH),
                 "warning": sv.proxy_warning(self.cfg)})
         if path == "/serving/swap":                # exclusive-model swap state (poll target)
@@ -569,7 +574,34 @@ class Handler(BaseHTTPRequestHandler):
             return self._send_json({"ok": True, "service": name, "action": action,
                                     "note": "the supervisor acts within a few seconds — "
                                             "re-poll /serving/status"})
-        if path == "/net":                             # write one broker/network setting
+        if path == "/net":                             # broker: setting write OR action
+            act = str(req.get("action") or "")
+            if act:                                    # operator actions, audited
+                from .amiga_net import audit as _audit
+                from .amiga_net import policy as _policy
+                rule = str(req.get("rule") or "")
+                if act == "revoke_lease":
+                    _policy.lease_close(rule)
+                    _audit.write("POLICY", rule=rule or "-",
+                                 detail="lease revoked by operator (Network tab)")
+                    return self._send_json({"ok": True, "note":
+                        f"lease on '{rule}' revoked — whatever holds it is refused "
+                        "on its next request (partial downloads are kept, resumable)"})
+                if act == "rule":
+                    on = bool(req.get("enabled"))
+                    try:
+                        _policy.set_rule_enabled(rule, on)
+                    except (ValueError, OSError) as e:
+                        return self._send_json({"ok": False, "error": str(e)}, 400)
+                    if not on:
+                        _policy.lease_close(rule)      # a disabled rule keeps no lease
+                    _audit.write("POLICY", rule=rule,
+                                 detail=("rule enabled" if on else "rule disabled")
+                                        + " by operator (Network tab)")
+                    return self._send_json({"ok": True, "note":
+                        f"rule '{rule}' " + ("enabled" if on else
+                        "disabled — nothing can use or lease it until re-enabled")})
+                return self._send_json({"ok": False, "error": f"unknown action {act}"}, 400)
             from .config import set_net_setting
             cp = self.cfg.get("_config_path")
             if not cp:

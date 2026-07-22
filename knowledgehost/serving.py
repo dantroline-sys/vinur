@@ -168,8 +168,14 @@ def hf_env(cfg: dict, engine: str, root: Path = ROOT) -> dict:
     of quietly succeeding."""
     if engine not in ("vllm", "container"):
         return {}
+    # Belt AND braces: the offline flags say "don't", the null endpoint says
+    # "can't" — any code path that ignores HF_HUB_OFFLINE dials a loopback
+    # port nothing listens on and fails in milliseconds instead of leaking.
     return {"HF_HUB_OFFLINE": "1", "TRANSFORMERS_OFFLINE": "1",
-            "VLLM_NO_USAGE_STATS": "1", "DO_NOT_TRACK": "1"}
+            "HF_ENDPOINT": "http://127.0.0.1:9",     # discard port: refused instantly
+            "HF_HUB_DISABLE_TELEMETRY": "1",
+            "VLLM_NO_USAGE_STATS": "1", "VLLM_DO_NOT_TRACK": "1",
+            "DO_NOT_TRACK": "1"}
 
 
 _PROXY_KEYS = ("http_proxy", "https_proxy", "all_proxy")

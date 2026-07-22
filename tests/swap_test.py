@@ -674,6 +674,10 @@ def main():
         for eng in ("container", "vllm"):
             e = sv.hf_env(hcfg, eng)
             assert e["HF_HUB_OFFLINE"] == "1" and e["TRANSFORMERS_OFFLINE"] == "1", e
+            # the null endpoint: even a code path that ignores the offline
+            # flags dials a dead loopback port, not the hub
+            assert e["HF_ENDPOINT"].startswith("http://127.0.0.1:"), e
+            assert e["VLLM_DO_NOT_TRACK"] == "1" and e["HF_HUB_DISABLE_TELEMETRY"] == "1"
             assert e["VLLM_NO_USAGE_STATS"] == "1" and e["DO_NOT_TRACK"] == "1", \
                 "phone-home stats must be off at launch (B-14)"
             assert "HF_TOKEN" not in e and "HUGGING_FACE_HUB_TOKEN" not in e, \
