@@ -93,6 +93,8 @@ def pull(model_id: str, revision: str = "main", root: Path | None = None,
             f"~{total / 2**30:.1f} GB -> {dest}")
         manifest = {"model": model_id, "revision": revision, "files": {},
                     "pulled_at": time.time()}
+        if include:
+            manifest["include"] = include     # so a resume repeats THIS pick
         old = dest / ".pull.json"             # a second quant pull must not
         if include and old.exists():          # orphan the first from the manifest
             try:
@@ -126,6 +128,36 @@ def pull(model_id: str, revision: str = "main", root: Path | None = None,
     say(f"done — point the serving entry's model at '{model_id}' as before; "
         f"it now resolves to {dest} and the engine runs offline")
     return dest
+
+
+def progress(dest: Path) -> dict | None:
+    """Manifest-based transfer state for one store dir — the manifest is
+    written before the transfers, so this is live during a pull.  None when
+    no manifest exists."""
+    try:
+        man = json.loads((dest / ".pull.json").read_text())
+    except (OSError, ValueError):
+        return None
+    want = man.get("files") or {}
+    have = total = done = 0
+    parts = []
+    for rel, meta in want.items():
+        size = int(meta.get("size") or 0)
+        total += size
+        fp = dest / rel
+        pp = fp.with_suffix(fp.suffix + ".part")
+        if fp.exists():
+            sz = fp.stat().st_size
+            if sz >= size:
+                done += 1
+            have += min(sz, size)
+        elif pp.exists():
+            parts.append(str(pp))
+            have += min(pp.stat().st_size, size)
+    return {"model": str(man.get("model") or ""),
+            "include": str(man.get("include") or ""),
+            "have": have, "total": total, "files_done": done,
+            "files_total": len(want), "parts": parts}
 
 
 def pulled(root: Path, model_id: str) -> Path | None:

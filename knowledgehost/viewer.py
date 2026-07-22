@@ -1011,14 +1011,15 @@ async function pfPull(i) {
   const me = $('#op_model'), ie = $('#op_include');     // mirror into the args
   if (me) me.value = x.id;                              // editor so what runs
   if (ie) ie.value = x.include || '';                   // is what's shown
-  pfNote(`launching pull <b>${esc(x.id)}</b>…`);
-  const args = Object.assign({ model: x.id }, x.include ? { include: x.include } : {});
-  const r = await postJSON('/ops/run', { command: 'pull', args })
+  pfNote(`starting download of <b>${esc(x.id)}</b>…`);
+  // the download LANE, not the ops slot: a distill in progress must not
+  // swallow a pull, and the Downloads rows persist (a banner doesn't)
+  const r = await postJSON('/serving/pull',
+    Object.assign({ model: x.id }, x.include ? { include: x.include } : {}))
     .catch(e => ({ ok: false, error: '' + e }));
   if (!r.ok) { pfNote('✗ ' + esc(r.error || 'failed')); return; }
-  pfNote(`⬇ pulling <b>${esc(x.id)}</b> in the background — the weight chip shows live
-    progress once a service uses it; full log in Operations`);
-  if ($('#opstatus')) pollOps();
+  pfNote('⬇ ' + esc(r.note || 'download started') + ' — see the Downloads rows on the Serving tab');
+  if ($('#svlive')) pollServing();
 }
 function gatherArgs() {
   const cmd = $('#opcmd').value, spec = OPSPEC[cmd] || {}, args = {};
@@ -1037,7 +1038,15 @@ function healthStrip(h) {
   return `<span class="badge" style="background:${c}33;border-color:${c}66">GPU `
     + (busy ? 'busy — Vinkona' + (h.lease_fast ? ' · fast' : '') + (h.lease_big ? ' · big' : '') : 'free') + '</span>';
 }
+let OPBUSY = false;
 async function pollOps() {
+  // never stack polls: if the last one hasn't answered, this tick skips —
+  // overlapping fetches were how a slow server melted the browser
+  if (OPBUSY) return;
+  OPBUSY = true;
+  try { await pollOps_(); } finally { OPBUSY = false; }
+}
+async function pollOps_() {
   let r; try { r = await (await authFetch('/ops/log?tail=400')).json(); } catch (e) { return; }
   if (!r.ok) { $('#opstatus').textContent = (r.error === 'unauthorized')
     ? 'enter the auth token above to use Operations' : ('error: ' + r.error); return; }
@@ -1210,9 +1219,17 @@ async function doSwap(name) {
   if (!r.ok) $('#banner').innerHTML = '✗ ' + esc(r.error || 'swap request failed');
   pollServing();
 }
+let SVBUSY = false;
 async function pollServing() {
-  // only #svlive re-renders on the 2.5s poll: the search section below keeps
-  // its input and results, and an open picker dropdown is never yanked shut
+  // never stack polls (a status call that outlasts the 2.5s interval must
+  // skip ticks, not pile up) …
+  if (SVBUSY) return;
+  SVBUSY = true;
+  try { await pollServing_(); } finally { SVBUSY = false; }
+}
+async function pollServing_() {
+  // …and only #svlive re-renders: the search section below keeps its input
+  // and results, and an open picker dropdown is never yanked shut
   const live = $('#svlive');
   if (!live) return;
   const ae = document.activeElement;
@@ -1227,12 +1244,13 @@ async function pollServing() {
       ? 'enter the auth token above to view Serving' : ('error: ' + r.error); return; }
   live.className = '';
   const unHtml = svUnserved(r.unserved || []);
+  const dlHtml = svDownloads(r.downloads || []);
   if (!r.hosting) {
     live.innerHTML = `<p style="opacity:.7">This box hosts <b>no models</b> — the
       <code>[serving]</code> table in config.toml is empty, so the knowledge host only answers
       queries and borrows LMs from the endpoints in Settings (distill/extract/verify URLs).
       Pull weights with the search below, then <b>Add service</b> creates the
-      <code>[serving]</code> entry for you.</p>` + unHtml;
+      <code>[serving]</code> entry for you.</p>` + dlHtml + unHtml;
     return;
   }
   const sup = r.supervisor || {};
@@ -1282,9 +1300,46 @@ async function pollServing() {
        incomplete weights usually means the fetch died: gated repo token, disk, network).</p>
      <table><tr><th>model</th><th>what</th><th>service</th><th>weights</th><th>note</th><th></th></tr>
      ${rows}${auxRows}</table>`
-    + unHtml + svLogPanel() + svCache(r.cache);
+    + dlHtml + unHtml + svLogPanel() + svCache(r.cache);
   const pre = $('#svlogpre');
   if (pre) pre.scrollTop = atEnd ? pre.scrollHeight : keep;
+}
+// Every download as a persistent row — state, %, the pull log's last line —
+// with Pause / Resume / Discard.  Disk truth: any incomplete manifest shows
+// here even if some other process started it.
+function svDownloads(dl) {
+  if (!dl.length) return '';
+  const C = { pulling: '#22aa66', queued: '#888888', paused: '#e0a800', error: '#cc4444' };
+  const rows = dl.map(d => {
+    const prog = d.pct != null
+      ? `${d.pct}% of ${d.total_gb} GB` + (d.files ? ` · file ${d.files}` : '')
+      : '(starting — fetching the file list)';
+    const b = [];
+    if (d.state === 'pulling') b.push(svBtn('Pause', `dlAct('pause','${esc(d.model)}')`));
+    if (d.state === 'queued') b.push(svBtn('Cancel', `dlAct('pause','${esc(d.model)}')`));
+    if (d.state === 'paused' || d.state === 'error') {
+      b.push(svBtn('Resume', `dlAct('resume','${esc(d.model)}')`));
+      b.push(svBtn('Discard', `dlAct('discard','${esc(d.model)}')`));
+    }
+    return `<tr><td>${esc(d.model)}${d.include ? ` <span style="opacity:.6">· ${esc(d.include)}</span>` : ''}</td>
+      <td>${svChip(d.state, C[d.state] || '#888')}</td>
+      <td style="white-space:nowrap">${esc(prog)}</td>
+      <td style="font-size:12px;opacity:.7;max-width:380px;word-break:break-all">${esc(d.detail || '')}</td>
+      <td><div style="display:flex;gap:4px">${b.join('')}</div></td></tr>`;
+  }).join('');
+  return `<div class="cfg-group" style="margin-top:12px"><b style="font-size:13px">Downloads</b>
+    <span style="opacity:.55;font-size:12px"> — one transfer at a time (the egress lease is per-rule;
+    the rest queue and start automatically). Pause keeps partial files; Resume continues from them;
+    Discard deletes the incomplete folder.</span>
+    <table style="margin-top:6px"><tr><th>model</th><th>state</th><th>progress</th><th>last line</th><th></th></tr>${rows}</table></div>`;
+}
+async function dlAct(action, model) {
+  if (action === 'discard' && !confirm(`Delete the incomplete download of ${model}?`)) return;
+  const r = await postJSON(action === 'resume' ? '/serving/pull' : '/serving/download',
+    action === 'resume' ? { model } : { action, model })
+    .catch(e => ({ ok: false, error: '' + e }));
+  $('#banner').innerHTML = r.ok ? '✓ ' + esc(r.note || 'done') : '✗ ' + esc(r.error || 'failed');
+  pollServing();
 }
 // Pulled weights nothing serves yet: one click drafts the [[serving.llms]]
 // entry (name, port, engine, exclusive-or-not all derived) instead of asking

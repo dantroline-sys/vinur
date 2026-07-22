@@ -910,6 +910,54 @@ def main():
     ok("container image pull: policy-leased + audited, never a side effect; "
        "a present image touches no network")
 
+    # ── the download lane: queue, pause/resume/discard, disk truth ──────────
+    from knowledgehost.downloads import Downloads
+    with tempfile.TemporaryDirectory() as td11:
+        r11 = Path(td11)
+        dl = Downloads(r11, "")
+        import subprocess as sp11
+
+        def fake_spawn(model, include, revision):     # a sleeping stand-in child
+            dl.logdir.mkdir(parents=True, exist_ok=True)
+            lf = open(dl._logfile(model), "wb", buffering=0)
+            lf.write(b"pull started\n")
+            proc = sp11.Popen([sys.executable, "-c", "import time; time.sleep(60)"],
+                              stdout=lf, stderr=sp11.STDOUT, start_new_session=True)
+            dl._live[model] = {"proc": proc, "started": time.time(),
+                               "include": include, "revision": revision}
+        dl._spawn = fake_spawn
+        assert dl.start("org/one")["state"] == "pulling"
+        assert dl.start("org/two")["state"] == "queued"
+        assert dl.start("org/one")["ok"] is False          # already downloading
+        sd11 = r11 / "models" / "org--one"                 # manifest-first pulls:
+        sd11.mkdir(parents=True)                           # % is disk truth
+        (sd11 / ".pull.json").write_text(_json.dumps(
+            {"model": "org/one", "include": "m*",
+             "files": {"m.safetensors": {"size": 1000}}}))
+        (sd11 / "m.safetensors.part").write_bytes(b"x" * 250)
+        st = {d["model"]: d for d in dl.status()}
+        assert st["org/one"]["state"] == "pulling" and st["org/one"]["pct"] == 25, st
+        assert st["org/two"]["state"] == "queued"
+        dl.stop("org/one")                                 # pause -> next promoted
+        for _ in range(40):
+            st = {d["model"]: d for d in dl.status()}
+            if st.get("org/two", {}).get("state") == "pulling":
+                break
+            time.sleep(0.1)
+        assert st["org/two"]["state"] == "pulling", st
+        assert st["org/one"]["state"] == "paused", "our SIGTERM is a pause, not an error"
+        dl.stop("org/two")
+        assert dl.discard("org/one")["ok"] and not sd11.exists()
+        done11 = r11 / "models" / "org--done"              # complete = untouchable
+        done11.mkdir()
+        (done11 / "w.safetensors").write_bytes(b"x" * 10)
+        (done11 / ".pull.json").write_text(_json.dumps(
+            {"model": "org/done", "files": {"w.safetensors": {"size": 10}}}))
+        assert dl.start("org/done")["ok"] is False
+        assert dl.discard("org/done")["ok"] is False and done11.exists()
+    ok("download lane: own slot + visible queue, pause promotes the next, "
+       "manifest %, discard only ever touches incomplete folders")
+
     # ── adopt: legacy hub-cache snapshots -> the models/ store ───────────────
     with tempfile.TemporaryDirectory() as td9:
         root9 = Path(td9)

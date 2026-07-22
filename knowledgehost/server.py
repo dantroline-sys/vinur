@@ -353,7 +353,8 @@ class Handler(BaseHTTPRequestHandler):
             from . import serving as sv
             try:
                 return self._send_json({"ok": True, **sv.serving_status(self.cfg),
-                                        "job": self.server.ops.status()})
+                                        "job": self.server.ops.status(),
+                                        "downloads": self.server.downloads.status()})
             except Exception as e:                 # pragma: no cover - defensive
                 return self._send_json({"ok": False, "error": f"{type(e).__name__}: {e}"}, 500)
         if path == "/serving/find":                # Ops › pull: hub-search pick-list
@@ -507,7 +508,8 @@ class Handler(BaseHTTPRequestHandler):
         if path not in ("/call", "/ops/run", "/ops/stop", "/ops/reload", "/config",
                         "/ops/autopilot", "/library/config", "/library/root",
                         "/source", "/scenario", "/brain", "/drop", "/serving/swap",
-                        "/serving/control", "/serving/model", "/serving/add", "/net",
+                        "/serving/control", "/serving/model", "/serving/add",
+                        "/serving/pull", "/serving/download", "/net",
                         "/metrics/mark", "/gaps/close", "/settings/paths"):
             return self._send_json({"ok": False, "error": "not found"}, 404)
         if not self._authed():
@@ -625,6 +627,19 @@ class Handler(BaseHTTPRequestHandler):
                     if key == "hf_token" else
                     "applies to the next pull / search (jobs read config at launch)")
             return self._send_json({"ok": True, "key": key, "note": note})
+        if path == "/serving/pull":                    # start/resume a download
+            return self._send_json(self.server.downloads.start(
+                str(req.get("model") or ""), include=str(req.get("include") or ""),
+                revision=str(req.get("revision") or "main")))
+        if path == "/serving/download":                # pause | discard one download
+            act = str(req.get("action") or "")
+            model = str(req.get("model") or "")
+            if act == "pause":
+                return self._send_json(self.server.downloads.stop(model))
+            if act == "discard":
+                return self._send_json(self.server.downloads.discard(model))
+            return self._send_json({"ok": False, "error": f"unknown action {act} "
+                                    "(pause | discard; resume = /serving/pull)"}, 400)
         if path == "/serving/add":                     # create a [[serving.llms]] entry
             # The fraught part of config.toml is INVENTING an entry — name,
             # port, engine, exclusive-or-not.  This derives all of it from
@@ -880,6 +895,10 @@ class KnowledgeHostServer(ThreadingHTTPServer):
         self.tools = tools
         self.kb = kb
         self.ops = OpsRunner(cfg)                   # single-slot maintenance-job runner
+        from . import downloads as _D
+        from .serving import ROOT as _ROOT
+        # pulls get their OWN lane: a transfer must never queue behind a distill
+        self.downloads = _D.Downloads(_ROOT, str(cfg.get("_config_path") or ""))
         from . import autopilot as _A
         from . import lm_lease as _L
         self.autopilot = _A.Autopilot(cfg, self.ops, lease_mod=_L)   # priority-driven verb runner

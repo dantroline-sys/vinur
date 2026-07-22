@@ -730,7 +730,29 @@ def toolkit_warning(cfg: dict, toolkit_present: bool | None = None) -> str | Non
 
 # ── panel status: is this box hosting models, and are the weights here? ─────
 
+# The Serving tab polls every 2.5s and its status walks real directory trees
+# (a 200 GB hub cache, multi-shard model stores).  Uncached, that pegged a
+# core and let poll responses outlast the poll interval — requests pile up
+# and the BROWSER drowns in overlapping fetches.  Ten-second memoization is
+# invisible to a human watching a download and removes the whole class.
+_MEMO: dict = {}
+
+
+def _memo(key, ttl: float, fn):
+    now = time.time()
+    hit = _MEMO.get(key)
+    if hit and now - hit[0] < ttl:
+        return hit[1]
+    val = fn()
+    _MEMO[key] = (now, val)
+    return val
+
+
 def _tree_size(p: Path) -> int:
+    return _memo(("tree", str(p)), 10.0, lambda: _tree_size_now(p))
+
+
+def _tree_size_now(p: Path) -> int:
     total = 0
     try:
         for f in p.rglob("*"):
@@ -788,7 +810,12 @@ def hf_cache_dir() -> Path:
 def hf_cache_status() -> dict:
     """Where downloaded weights live, for anyone asking 'where did the 200 GB
     go?' — the path to open, what's in it, and the stale-partial litter that a
-    completed retry leaves behind (safe to delete, so it's worth naming)."""
+    completed retry leaves behind (safe to delete, so it's worth naming).
+    Memoized 10s: this walks the whole cache, and the panel polls."""
+    return _memo(("cache_status", str(hf_cache_dir())), 10.0, _hf_cache_status_now)
+
+
+def _hf_cache_status_now() -> dict:
     hub = hf_cache_dir()
     out = {"path": str(hub), "exists": hub.is_dir(), "repos": 0,
            "size_gb": 0.0, "incomplete_gb": 0.0,
@@ -959,10 +986,15 @@ def weights_status(engine: str, model: str) -> dict:
 def eligible_models(engine: str, root: Path = ROOT, cfg: dict | None = None) -> list[dict]:
     """Every model ON THIS DISK that `engine` could serve — the Serving tab's
     picker.  vllm/container: complete broker-store snapshots holding
-    safetensors, plus complete legacy hub-cache snapshots.  llama: every GGUF
-    under models/ (embed/reranker support files excluded; only the first part
-    of a split GGUF — llama-server finds the siblings itself).  Disk only:
-    nothing here goes near the network."""
+    safetensors.  llama: every GGUF under models/ (embed/reranker support
+    files excluded; only the first part of a split GGUF — llama-server finds
+    the siblings itself).  Disk only; memoized 10s (the panel polls)."""
+    rr = str((cfg or {}).get("rerank_model") or "")
+    return _memo(("eligible", engine, str(root), rr), 10.0,
+                 lambda: _eligible_models_now(engine, root, cfg))
+
+
+def _eligible_models_now(engine: str, root: Path, cfg: dict | None) -> list[dict]:
     from .amiga_net import pull as pull_mod
     out: list[dict] = []
     seen: set[str] = set()
