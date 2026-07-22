@@ -1274,6 +1274,7 @@ async function pollServing_() {
   live.className = '';
   SVSCHEMA = r.tuning_schema || SVSCHEMA;      // the Tune editor's vocabulary
   SVLLMS = r.llms || [];
+  SVBUDGET = r.vram_budget_gb || SVBUDGET;     // the Tune editor's VRAM context
   const unHtml = svUnserved(r.unserved || []);
   const dlHtml = svDownloads(r.downloads || []);
   if (!r.hosting) {
@@ -1303,7 +1304,8 @@ async function pollServing_() {
     const role = m.exclusive ? (m.default ? 'exclusive · boots' : 'exclusive') : 'resident';
     const act = svActions(m, sup.running, sw.status === 'swapping');
     // cause first: the line that names the failure beats the last line printed
-    const note = (m.hint ? '💡 ' + m.hint + ' · ' : '')
+    const note = (m.tune_note ? '⚠ ' + m.tune_note + ' · ' : '')
+      + (m.hint ? '💡 ' + m.hint + ' · ' : '')
       + ((m.cause || []).join(' · ') || m.reason || m.last_log
          || (m.weights && m.weights.detail) || '');
     return `<tr><td><b>${esc(m.name)}</b></td>
@@ -1346,12 +1348,12 @@ async function pollServing_() {
 // key is REMOVED from config.toml).  Each knob carries a recommended starting
 // point (one click applies it) and a plain-language explanation; changes save
 // in one POST and apply on the service's next restart / swap-in.
-let SVSCHEMA = [], SVLLMS = [];
+let SVSCHEMA = [], SVLLMS = [], SVBUDGET = null;
 function svTuneOpen(name) {
   const m = SVLLMS.find(x => x.name === name);
   const box = $('#svtune');
   if (!m || !box) return;
-  const rows = SVSCHEMA.filter(t => (t.engines || []).includes(m.engine)).map(t => {
+  const row = t => {
     const cur = (m.tuning || {})[t.key];
     let inp;
     if (t.type === 'bool')
@@ -1363,12 +1365,15 @@ function svTuneOpen(name) {
         <option value="false"${cur === false ? ' selected' : ''}>off</option></select>`;
     else if (t.type === 'choice')
       inp = `<select data-tk="${t.key}">
-        <option value=""${cur == null ? ' selected' : ''}>engine default</option>`
+        <option value=""${cur == null ? ' selected' : ''}>${t.required ? '' : 'engine default'}</option>`
         + (t.choices || []).map(c => `<option${c === cur ? ' selected' : ''}>${esc(c)}</option>`).join('')
         + `</select>`;
+    else if (t.type === 'str')
+      inp = `<input data-tk="${t.key}" type="text" value="${cur == null ? '' : esc(String(cur))}"
+        placeholder="engine default" style="width:280px">`;
     else
       inp = `<input data-tk="${t.key}" type="number"${t.type === 'float' ? ' step="any"' : ''}
-        value="${cur == null ? '' : cur}" placeholder="engine default" style="width:110px"
+        value="${cur == null ? '' : cur}" placeholder="${t.required ? '' : 'engine default'}" style="width:110px"
         ${t.min != null ? `min="${t.min}"` : ''} ${t.max != null ? `max="${t.max}"` : ''}>`;
     const rec = t.recommended == null ? ''
       : `<button class="toolbtn" style="font-size:11px;padding:1px 7px"
@@ -1380,22 +1385,40 @@ function svTuneOpen(name) {
         <code style="font-size:11px;opacity:.55">${t.key}</code></td>
       <td style="white-space:nowrap">${inp} ${rec}</td>
       <td style="font-size:12px;opacity:.8">${esc(t.help)}${applies}</td></tr>`;
-  }).join('');
+  };
+  const mine = t => (t.engines || []).includes(m.engine);
+  const modelRows = SVSCHEMA.filter(t => mine(t) && (t.scope || 'model') === 'model').map(row).join('');
+  const entryRows = SVSCHEMA.filter(t => mine(t) && t.scope === 'entry').map(row).join('');
+  const wgb = m.weights && m.weights.size_gb ? m.weights.size_gb + ' GB weights' : '';
+  const fit = (wgb || SVBUDGET)
+    ? `<span style="opacity:.6;font-size:12px">${wgb}${wgb && SVBUDGET ? ' · ' : ''}${SVBUDGET ? 'box VRAM: ' + SVBUDGET + ' GB' : ''}</span>` : '';
+  const home = m.tune_file
+    ? `saved beside the weights in <code>${esc(m.tune_file)}</code>, so they follow the
+       model through Deploy and Swap — pick a different model and ITS tuning loads instead`
+    : `this model has no folder under <code>models/</code> yet, so these save to its
+       config.toml entry — pull or adopt it to make tuning travel with the weights`;
+  const th = `<tr><th>knob</th><th>value</th><th>what it does</th></tr>`;
   box.innerHTML = `<div class="cfg-group" style="margin-top:12px">
     <div style="display:flex;gap:8px;align-items:center;margin-bottom:4px">
       <b>Tune llm-${esc(name)}</b>
       <span style="opacity:.6;font-size:12px">${esc(m.model)} · ${esc(m.engine)}</span>
+      ${fit}
       <span style="flex:1"></span>
       ${svBtn('Save', `svTuneSave('${esc(name)}')`, 'font-weight:600')}
       ${svBtn('Close', `svTuneClose()`)}
     </div>
     <div style="opacity:.6;font-size:12px;margin-bottom:8px">Empty = the engine's own default
-      (the key is removed from config.toml). Save edits this entry in place; <b>Restart the
-      service</b> (or swap it in) to apply. Rows marked
-      <span style="color:var(--warn,#b45309)">needs supervisor restart</span> change the swap
-      topology — apply with <code>./vinur.sh restart</code>. Watch the Stats tab (waiting queue,
-      KV-cache %) to see what a knob actually did.</div>
-    <table><tr><th>knob</th><th>value</th><th>what it does</th></tr>${rows}</table></div>`;
+      (the key is removed). Ordinary knobs apply on <b>Restart</b> (or the next swap-in); rows
+      marked <span style="color:var(--warn,#b45309)">needs supervisor restart</span> change what
+      the supervisor froze at start — apply with <code>./vinur.sh restart</code>. Watch the
+      Stats tab (waiting queue, KV-cache %) to see what a knob actually did.</div>
+    <div style="font-size:12px;margin:6px 0 4px"><b>Model tuning</b>
+      <span style="opacity:.7">— ${home}</span></div>
+    <table>${th}${modelRows}</table>
+    <div style="font-size:12px;margin:12px 0 4px"><b>Service entry</b>
+      <span style="opacity:.7">— the slot's own properties (swap group, port${m.engine === 'container' ? ', image, runtime' : ''}),
+      saved on the <code>[[serving.llms]]</code> entry in config.toml.</span></div>
+    <table>${th}${entryRows}</table></div>`;
 }
 function svTuneClose() { const b = $('#svtune'); if (b) b.innerHTML = ''; }
 function svTuneRec(key, val) {

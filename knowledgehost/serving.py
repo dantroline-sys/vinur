@@ -27,6 +27,7 @@ import os
 import re
 import sys
 import time
+import tomllib
 import urllib.error
 import urllib.request
 from pathlib import Path
@@ -116,9 +117,14 @@ def _mapped_flags(entry: dict, table: list) -> list[str]:
 # recommended starting point and a plain-language explanation.  `applies` says
 # what has to restart before a change takes effect: "service" = Restart (or
 # next swap-in) of that one model; "supervisor" = ./vinur.sh restart, because
-# exclusive/default change the swap-group topology the supervisor froze at
-# start.  Recommendations are starting points, not laws — the Stats tab
-# (waiting queue, KV-cache %) shows what a knob actually did.
+# exclusive/default/port/runtime change what the supervisor froze at start.
+# `scope` says where the value LIVES: "model" keys are the model's own fit
+# (context, VRAM share, cache dtypes …) and save to tune.toml BESIDE THE
+# WEIGHTS, so they travel with the model through Deploy/Swap; "entry" keys
+# are properties of the service slot (swap group, port, container image) and
+# stay on the [[serving.llms]] entry in config.toml.  Recommendations are
+# starting points, not laws — the Stats tab (waiting queue, KV-cache %) shows
+# what a knob actually did.
 TUNING_SCHEMA = [
     {"key": "max_model_len", "label": "Context window", "type": "int",
      "engines": ["vllm", "container"], "min": 512, "max": 1048576,
@@ -127,7 +133,7 @@ TUNING_SCHEMA = [
      "help": "How many tokens of context the engine reserves KV cache for, per "
              "sequence. Bigger windows eat VRAM fast, and the model's own trained "
              "maximum is the ceiling. Raise it only if you actually feed longer "
-             "documents.", "applies": "service"},
+             "documents.", "applies": "service", "scope": "model"},
     {"key": "gpu_memory_utilization", "label": "VRAM share", "type": "float",
      "engines": ["vllm", "container"], "min": 0.05, "max": 0.98,
      "recommended": 0.9,
@@ -135,7 +141,7 @@ TUNING_SCHEMA = [
      "help": "The fraction of GPU memory vLLM claims at startup for weights plus "
              "KV cache. 0.90 for an exclusive model. Models running TOGETHER must "
              "share — their fractions (plus headroom) must sum below 1.0 or the "
-             "second one dies at start.", "applies": "service"},
+             "second one dies at start.", "applies": "service", "scope": "model"},
     {"key": "max_num_seqs", "label": "Parallel sequences", "type": "int",
      "engines": ["vllm", "container"], "min": 1, "max": 4096,
      "recommended": 64,
@@ -143,14 +149,14 @@ TUNING_SCHEMA = [
      "help": "How many requests may run in one batch step. Higher lifts throughput "
              "until KV cache runs out. On the Stats tab: 'waiting' above zero means "
              "raise it; KV-cache % pinned at 100 means lower it (or shrink the "
-             "context window).", "applies": "service"},
+             "context window).", "applies": "service", "scope": "model"},
     {"key": "max_num_batched_tokens", "label": "Prefill budget", "type": "int",
      "engines": ["vllm", "container"], "min": 256, "max": 262144,
      "recommended": 8192,
      "why": "fast long-prompt prefill without VRAM spikes",
      "help": "The scheduler's token budget per engine step (chunked prefill). "
              "Higher = faster processing of long prompts but spikier memory use.",
-     "applies": "service"},
+     "applies": "service", "scope": "model"},
     {"key": "kv_cache_dtype", "label": "KV-cache dtype", "type": "choice",
      "engines": ["vllm", "container"], "choices": ["auto", "fp8"],
      "recommended": "fp8",
@@ -158,36 +164,53 @@ TUNING_SCHEMA = [
      "help": "The number format of the KV cache. fp8 HALVES its memory — double "
              "the concurrent context for a barely measurable quality cost on "
              "modern NVIDIA cards. auto = the model's own dtype.",
-     "applies": "service"},
+     "applies": "service", "scope": "model"},
     {"key": "enable_prefix_caching", "label": "Prefix caching", "type": "bool3",
      "engines": ["vllm", "container"], "recommended": True,
      "why": "the kb's prompts share long identical headers",
      "help": "Reuse computed KV for prompts that share a prefix. The distiller "
              "sends thousands of prompts with the same header, so this saves real "
              "prefill time. Turn it off only when VRAM is critically tight.",
-     "applies": "service"},
+     "applies": "service", "scope": "model"},
     {"key": "ctx_size", "label": "Context size", "type": "int",
      "engines": ["llama"], "min": 256, "max": 1048576, "recommended": 4096,
      "why": "knowledge chunks are ≤2048 tokens — a few k is plenty",
      "help": "llama-server's context window. Costs VRAM like any KV cache; "
-             "raise it only for genuinely long prompts.", "applies": "service"},
+             "raise it only for genuinely long prompts.", "applies": "service", "scope": "model"},
     {"key": "n_gpu_layers", "label": "GPU layers", "type": "int",
      "engines": ["llama"], "min": 0, "max": 999, "recommended": 99,
      "why": "a box serving LMs wants the whole model on the GPU",
      "help": "How many model layers live on the GPU. 99 = all of them. Lower it "
              "only when a model won't fit — every CPU layer costs real speed.",
-     "applies": "service"},
+     "applies": "service", "scope": "model"},
     {"key": "exclusive", "label": "Exclusive", "type": "bool",
      "engines": ["vllm", "container", "llama"], "recommended": True,
      "why": "big models can't share the card",
      "help": "Exclusive models form ONE group of which exactly one is loaded at a "
              "time — Deploy/Swap moves between them. Untick only for models small "
              "enough to co-reside (then set their VRAM shares to fit together).",
-     "applies": "supervisor"},
+     "applies": "supervisor", "scope": "entry"},
     {"key": "default", "label": "Boots first", "type": "bool",
      "engines": ["vllm", "container", "llama"], "recommended": None,
      "help": "The exclusive-group member that loads on startup. Exactly one entry "
-             "should carry this.", "applies": "supervisor"},
+             "should carry this.", "applies": "supervisor", "scope": "entry"},
+    {"key": "port", "label": "Port", "type": "int", "required": True,
+     "engines": ["vllm", "container", "llama"], "min": 1024, "max": 65535,
+     "help": "The local port this service answers on. Must be unique per entry; "
+             "everything that talks to the model (distill endpoints, the swap "
+             "router) finds it here.", "applies": "supervisor", "scope": "entry"},
+    {"key": "image", "label": "Container image", "type": "str",
+     "engines": ["container"],
+     "help": "The vLLM image this entry runs (e.g. docker.io/vllm/vllm-openai:v0.9.2). "
+             "Pin a tag for anything you care about. Empty = the built-in default "
+             "image. A new image is pulled under the broker's container-images "
+             "rule at next start.", "applies": "service", "scope": "entry"},
+    {"key": "runtime", "label": "Container runtime", "type": "choice",
+     "engines": ["container"], "choices": ["podman", "docker"],
+     "help": "Which runtime executes the container. Empty = autodetect (podman "
+             "first). Podman is preferred: daemonless, so the supervisor owns "
+             "the process like any other child.",
+     "applies": "supervisor", "scope": "entry"},
 ]
 
 
@@ -204,9 +227,17 @@ def validate_tuning(engine: str, updates: dict) -> dict:
         if engine not in t["engines"]:
             raise ValueError(f"{k} does not apply to engine '{engine}'")
         if raw is None or raw == "":
+            if t.get("required"):
+                raise ValueError(f"{k} is required — it cannot be emptied")
             out[k] = None
             continue
         ty = t["type"]
+        if ty == "str":
+            v0 = str(raw).strip()
+            if not v0 or any(c.isspace() for c in v0):
+                raise ValueError(f"{k} must be a single token (no spaces)")
+            out[k] = v0
+            continue
         if ty == "int":
             v: object = int(raw)
         elif ty == "float":
@@ -279,6 +310,116 @@ def resolve_model(entry: dict, root: Path = ROOT) -> dict:
     from .amiga_net import pull as pull_mod
     local = pull_mod.pulled(root, model)
     return {**entry, "model": str(local)} if local else entry
+
+
+# ── per-model tuning: tune.toml lives WITH the weights ───────────────────────
+# The model-fit knobs (context, VRAM share, cache dtype …) belong to the
+# MODEL, not to the service slot: a 24B swapped in where a 122B ran must not
+# inherit the 122B's settings.  So they live in a flat tune.toml beside the
+# weights (next to .pull.json) and follow the model through Deploy/Swap.
+# Keys still set on the [[serving.llms]] entry override the file — that is
+# how old configs keep working; the Tune editor migrates them on first save.
+TUNE_FILE = "tune.toml"
+
+
+def tuning_path(entry: dict, root: Path | None = None):
+    """Where THIS entry's model keeps its tuning file, or None when the model
+    has no folder of its own (a hub-cache id that was never pulled/adopted —
+    tuning then stays on the config entry, the legacy lane)."""
+    root = Path(root) if root is not None else ROOT
+    engine = str(entry.get("engine") or "")
+    model = str(entry.get("model") or "")
+    if not model:
+        return None
+    if engine == "llama":
+        p = Path(_anchored(model))
+        # per-FILE, not per-folder: two quants of one repo share a dir but
+        # want different offload budgets
+        return p.parent / (p.name + "." + TUNE_FILE) if p.is_file() else None
+    if engine in ("vllm", "container"):
+        mp = Path(model).expanduser()
+        if mp.is_dir():
+            return mp / TUNE_FILE
+        if _HF_ID.match(model):
+            from .amiga_net import pull as pull_mod
+            local = pull_mod.pulled(root, model)
+            if local:
+                return local / TUNE_FILE
+            sd = pull_mod.store_dir(root, model)
+            if sd.is_dir():                    # mid-pull: still the model's home
+                return sd / TUNE_FILE
+    return None
+
+
+def read_model_tuning(entry: dict, root: Path | None = None) -> tuple[dict, str]:
+    """(values, note) from the model's tune.toml.  Tolerant by design — this
+    runs at every spawn and every poll, and a hand-edited file must degrade,
+    not crash: unreadable file → ({}, why); unknown/entry-only/bad-value keys
+    are dropped and named in the note.  Accepted keys: the schema's
+    model-scope knobs for this engine, plus the rest of the engine's
+    first-class table (quantization, dtype, served_model_name …)."""
+    tp = tuning_path(entry, root)
+    if tp is None or not tp.exists():
+        return {}, ""
+    try:
+        raw = tomllib.loads(tp.read_text())
+    except (OSError, tomllib.TOMLDecodeError) as e:
+        return {}, f"{tp.name} is unreadable ({e}) — fix or delete it; running on engine defaults"
+    engine = str(entry.get("engine") or "")
+    rows = {t["key"]: t for t in TUNING_SCHEMA
+            if t.get("scope", "model") == "model" and engine in t["engines"]}
+    extra = ({k for k, _, _ in _VLLM_KEYS} - set(rows)
+             if engine in ("vllm", "container") else set())
+    out: dict = {}
+    dropped: list[str] = []
+    for k, v in raw.items():
+        if k in rows:
+            try:
+                got = validate_tuning(engine, {k: v}).get(k)
+            except ValueError:
+                dropped.append(k)
+                continue
+            if got is not None:
+                out[k] = got
+        elif k in extra and isinstance(v, (str, int, float, bool)):
+            out[k] = v
+        else:
+            dropped.append(k)
+    note = (f"{tp.name}: ignored key(s) {', '.join(sorted(dropped))}"
+            if dropped else "")
+    return out, note
+
+
+def write_model_tuning(path: Path, updates: dict) -> dict:
+    """Merge updates into the model's tune.toml (None removes a key; an empty
+    result removes the file).  Flat keys, same vocabulary as the config entry
+    — hand editing stays possible, just never required."""
+    from .config import _toml_scalar
+    cur: dict = {}
+    if path.exists():
+        try:
+            cur = tomllib.loads(path.read_text())
+        except (OSError, tomllib.TOMLDecodeError):
+            cur = {}                           # unreadable: this rewrite repairs it
+    for k, v in (updates or {}).items():
+        if v is None:
+            cur.pop(k, None)
+        else:
+            cur[k] = v
+    if not cur:
+        try:
+            path.unlink()
+        except OSError:
+            pass
+        return {}
+    lines = ["# model tuning — travels with these weights (Serving › Tune edits this).",
+             "# Same keys as a [[serving.llms]] entry; a key set on the entry in",
+             "# config.toml overrides this file."]
+    lines += [f"{k} = {_toml_scalar(cur[k])}" for k in sorted(cur)]
+    tmp = path.with_name(path.name + ".tmp")
+    tmp.write_text("\n".join(lines) + "\n")
+    os.replace(tmp, path)
+    return cur
 
 
 def hf_env(cfg: dict, engine: str, root: Path = ROOT) -> dict:
@@ -413,6 +554,11 @@ def llm_argv(entry: dict, root: Path = ROOT) -> list[str]:
     for k in ("name", "engine", "model", "port"):
         if not entry.get(k):
             raise ValueError(f"serving.llms entry needs '{k}': {entry}")
+    # the model's own tune.toml first, then the config entry on top — an
+    # entry key still wins, which is exactly how pre-file configs behaved
+    tune, _ = read_model_tuning(entry, root)
+    if tune:
+        entry = {**tune, **entry}
     host = str(entry.get("host") or "127.0.0.1")
     port = str(int(entry["port"]))
     args = [str(a) for a in (entry.get("args") or [])]
@@ -1397,13 +1543,27 @@ def serving_status(cfg: dict) -> dict:
         engine = str(e.get("engine") or "")
         if engine not in choices_by_engine:
             choices_by_engine[engine] = eligible_models(engine, cfg=cfg)
+        # effective tuning = the model's tune.toml under any entry overrides;
+        # entry-scope keys (swap group, port, image) come from the entry alone
+        fvals, tnote = read_model_tuning(e)
+        tun = {}
+        for t in TUNING_SCHEMA:
+            if engine not in t["engines"]:
+                continue
+            k = t["key"]
+            if t.get("scope", "model") == "entry":
+                tun[k] = e.get(k)
+            else:
+                tun[k] = e.get(k, fvals.get(k))
         item = {"name": name, "engine": engine,
                 "model": str(e.get("model") or ""), "port": e.get("port"),
                 "exclusive": bool(e.get("exclusive")), "default": bool(e.get("default")),
                 "choices": choices_by_engine[engine],
-                "tuning": {t["key"]: e.get(t["key"]) for t in TUNING_SCHEMA
-                           if engine in t["engines"]},
+                "tuning": tun,
+                "tune_file": str(tuning_path(e) or ""),
                 "weights": weights_status(engine, str(e.get("model") or ""))}
+        if tnote:
+            item["tune_note"] = tnote
         item.update(svc_state(f"llm-{name}", name))
         llms.append(item)
 
@@ -1443,11 +1603,17 @@ def serving_status(cfg: dict) -> dict:
         unserved.extend({**c, "engine": lane} for c in cands
                         if c["model"] not in configured)
 
+    # the box's VRAM budget (memoized: nvidia-smi) — the Tune editor shows it
+    # beside the model's weight size so VRAM-share choices are informed
+    from . import modelfind
+    vb = _memo(("vrambudget",), 60.0,
+               lambda: round(modelfind.budget()[0] / 2**30, 1))
     return {"hosting": bool(llms or embed["enabled"] or reranker["enabled"]),
             "supervisor": {"running": sup_alive,
                            "pid": st.get("supervisor") if sup_alive else None},
             "swap": swap_state(), "llms": llms, "embed": embed, "reranker": reranker,
-            "unserved": unserved, "cache": hf_cache_status()}
+            "unserved": unserved, "cache": hf_cache_status(),
+            "vram_budget_gb": vb}
 
 
 def main(argv: list[str] | None = None) -> None:

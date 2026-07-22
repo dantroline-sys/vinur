@@ -71,6 +71,11 @@ auth_token = ""         # if set, /call requires Authorization: Bearer <token>
 #                                 #   default "auto" = the model dtype (16-bit)
 # trust_remote_code = false       # required by some architectures' repos
 #   # ── how it runs / fits ────────────────────────────────────────────────
+#   # These model-fit knobs normally live in tune.toml BESIDE THE WEIGHTS
+#   # (models/<Org--Name>/tune.toml, written by the panel: Serving › Tune) so
+#   # each model keeps its own tuning and it travels through Deploy/Swap.
+#   # Setting one HERE still works and OVERRIDES the file — the first save
+#   # from the Tune editor migrates entry keys into the file for you.
 # max_model_len          = 16384  # context window actually served (KV budget!)
 # gpu_memory_utilization = 0.90   # fraction of VRAM vLLM may claim — resident
 #                                 #   PAIRS must sum ≤ ~0.9; a lone exclusive

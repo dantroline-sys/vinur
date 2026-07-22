@@ -836,8 +836,11 @@ def main():
     keys_in_table = {k for k, _, _ in sv._VLLM_KEYS}
     for t in sv.TUNING_SCHEMA:
         assert t["key"] and t["label"] and t["help"] and t["applies"], t
-        assert t["type"] in ("int", "float", "bool", "bool3", "choice"), t
-        if "vllm" in t["engines"] and t["key"] not in ("exclusive", "default"):
+        assert t["type"] in ("int", "float", "bool", "bool3", "choice", "str"), t
+        assert t.get("scope") in ("model", "entry"), t
+        # model-scope knobs must be forwarded flags; entry-scope keys are
+        # consumed by llm_argv/supervisor directly (port, image, runtime …)
+        if "vllm" in t["engines"] and t.get("scope") == "model":
             assert t["key"] in keys_in_table, \
                 f"schema offers {t['key']} but llm_argv never forwards it"
         r = t.get("recommended")
@@ -1306,6 +1309,148 @@ def main():
         assert sv.weights_status("container", str(flat))["status"] == "ready"
     ok("local-dir weights: flat/hub-root/nested/sharded-index/.bin/store-"
        "manifest/mid-download all judged honestly; wrong path names contents")
+
+    # ── per-model tuning: tune.toml lives WITH the weights ──────────────────
+    with tempfile.TemporaryDirectory() as td14:
+        import json as _json
+        r14 = Path(td14)
+        for nm, tune in (("alpha", 'max_model_len = 8192\nkv_cache_dtype = "fp8"\n'),
+                         ("beta", "max_model_len = 32768\n")):
+            d = r14 / "models" / f"org--{nm}"
+            d.mkdir(parents=True)
+            (d / "model.safetensors").write_bytes(b"w" * 16)
+            (d / ".pull.json").write_text(_json.dumps(
+                {"model": f"org/{nm}", "files": {"model.safetensors": {"size": 16}}}))
+            (d / "tune.toml").write_text(tune)
+        gg = r14 / "models" / "org--gg"
+        gg.mkdir()
+        (gg / "m-Q4.gguf").write_bytes(b"g")
+        (gg / "m-Q4.gguf.tune.toml").write_text("ctx_size = 2048\n")
+
+        e_id = {"name": "a", "engine": "container", "model": "org/alpha", "port": 1}
+        assert sv.tuning_path(e_id, root=r14) == \
+            r14 / "models" / "org--alpha" / "tune.toml"
+        bdir = r14 / "models" / "org--beta"
+        assert sv.tuning_path({"engine": "vllm", "model": str(bdir)}) == \
+            bdir / "tune.toml"
+        e_gg = {"name": "g", "engine": "llama", "model": str(gg / "m-Q4.gguf"),
+                "port": 2}
+        assert sv.tuning_path(e_gg) == gg / "m-Q4.gguf.tune.toml"
+        assert sv.tuning_path({"engine": "container", "model": "org/ghost"},
+                              root=r14) is None
+        ok("tuning_path: store id / local dir / per-GGUF sibling; homeless id -> None")
+
+        vals, note = sv.read_model_tuning(e_id, root=r14)
+        assert vals == {"max_model_len": 8192, "kv_cache_dtype": "fp8"} and not note
+        tp = sv.tuning_path(e_id, root=r14)
+        tp.write_text('max_model_len = 8192\nexclusive = true\nbogus = 3\n'
+                      'dtype = "bfloat16"\nmax_num_seqs = 999999\n')
+        vals, note = sv.read_model_tuning(e_id, root=r14)
+        assert vals["max_model_len"] == 8192 and vals["dtype"] == "bfloat16"
+        assert "max_num_seqs" not in vals              # out of bounds: dropped
+        assert "exclusive" in note and "bogus" in note, note
+        tp.write_text("not = [valid")
+        vals, note = sv.read_model_tuning(e_id, root=r14)
+        assert vals == {} and "unreadable" in note
+        ok("read_model_tuning: schema-validated, entry-only/unknown/bad keys "
+           "dropped AND named, syntax errors degrade to engine defaults")
+
+        sv.write_model_tuning(tp, {"max_model_len": 4096, "max_num_seqs": 32})
+        got = sv.read_model_tuning(e_id, root=r14)[0]
+        assert got == {"max_model_len": 4096, "max_num_seqs": 32}   # repaired too
+        sv.write_model_tuning(tp, {"max_num_seqs": None})
+        assert "max_num_seqs" not in sv.read_model_tuning(e_id, root=r14)[0]
+        sv.write_model_tuning(tp, {"max_model_len": None})
+        assert not tp.exists()                         # empty file removed
+        ok("write_model_tuning: merge, None removes, empty removes the file")
+
+        vdir = r14 / "serving" / ".venv" / "bin"
+        vdir.mkdir(parents=True)
+        (vdir / "vllm").write_text("")
+        ev = {"name": "b", "engine": "vllm", "model": str(bdir), "port": 9}
+        s = " ".join(sv.llm_argv(ev, root=r14))
+        assert "--max-model-len 32768" in s, s          # from beta's tune.toml
+        s = " ".join(sv.llm_argv({**ev, "max_model_len": 1024}, root=r14))
+        assert "--max-model-len 1024" in s and "32768" not in s   # entry wins
+        env0 = os.environ.get("LLAMA_SERVER")
+        os.environ["LLAMA_SERVER"] = "/usr/bin/env"
+        try:
+            s = " ".join(sv.llm_argv(e_gg, root=r14))
+            assert "-c 2048" in s, s                    # per-GGUF file applies
+        finally:
+            os.environ.pop("LLAMA_SERVER", None)
+            if env0 is not None:
+                os.environ["LLAMA_SERVER"] = env0
+        ok("llm_argv: tune.toml supplies flags, a config-entry key overrides")
+
+        # E2E /serving/tune: lanes split, legacy keys migrate, tuning follows
+        # the model through Deploy
+        toml14 = r14 / "config.toml"
+        toml14.write_text('[[serving.llms]]\nname = "big"\nengine = "container"\n'
+                          'model = "org/alpha"\nport = 11438\n'
+                          'image = "img:v1"\nexclusive = true\n'
+                          'max_num_seqs = 64   # legacy: predates tune.toml\n')
+        cfg14 = load_config(str(toml14))
+        cfg14.update({"host": "127.0.0.1", "port": 0, "auth_token": "tk",
+                      "_config_path": str(toml14)})
+        from knowledgehost import supervisor as sup_mod
+        keep14 = (sv.ROOT, sv.eligible_models.__defaults__, sup_mod.read_state)
+        try:
+            sv.ROOT = r14
+            sv.eligible_models.__defaults__ = (r14, None)
+            sup_mod.read_state = lambda: {}
+            khs14 = KnowledgeHostServer(cfg14, SimpleNamespace(), SimpleNamespace(),
+                                        kb=None)
+            p14 = khs14.server_address[1]
+            threading.Thread(target=khs14.serve_forever, daemon=True).start()
+
+            def call14(method, path, body=None):
+                req = urllib.request.Request(
+                    f"http://127.0.0.1:{p14}{path}",
+                    data=_json.dumps(body).encode() if body is not None else None,
+                    headers={"Authorization": "Bearer tk",
+                             "Content-Type": "application/json"}, method=method)
+                try:
+                    with urllib.request.urlopen(req, timeout=10) as r:
+                        return r.status, _json.loads(r.read())
+                except urllib.error.HTTPError as e:
+                    return e.code, _json.loads(e.read())
+
+            code, res = call14("POST", "/serving/tune",
+                               {"name": "big",
+                                "updates": {"gpu_memory_utilization": 0.85}})
+            assert code == 200 and "moved 1 older setting" in res["note"], res
+            atoml = (r14 / "models" / "org--alpha" / "tune.toml").read_text()
+            assert "gpu_memory_utilization = 0.85" in atoml
+            assert "max_num_seqs = 64" in atoml         # legacy key migrated in
+            assert "max_num_seqs" not in toml14.read_text()   # …and out of config
+            code, st = call14("GET", "/serving/status")
+            t14 = st["llms"][0]
+            assert t14["tuning"]["gpu_memory_utilization"] == 0.85
+            assert t14["tuning"]["max_num_seqs"] == 64  # effective, from the file
+            assert t14["tune_file"].endswith("org--alpha/tune.toml")
+            # entry lane: image edits the config entry; empty port refused
+            code, res = call14("POST", "/serving/tune",
+                               {"name": "big", "updates": {"image": "img:v2"}})
+            assert code == 200 and 'image = "img:v2"' in toml14.read_text(), res
+            code, res = call14("POST", "/serving/tune",
+                               {"name": "big", "updates": {"port": ""}})
+            assert code == 400 and "required" in res["error"], res
+            # Deploy: the OTHER model's tune.toml rides along
+            code, res = call14("POST", "/serving/model",
+                               {"name": "big", "model": "org/beta"})
+            assert code == 200, res
+            code, st = call14("GET", "/serving/status")
+            assert st["llms"][0]["tuning"]["max_model_len"] == 32768, \
+                st["llms"][0]["tuning"]      # beta's own tuning, not alpha's
+            assert st["llms"][0]["tuning"].get("gpu_memory_utilization") is None
+            khs14.shutdown()
+        finally:
+            (sv.ROOT, sv.eligible_models.__defaults__,
+             sup_mod.read_state) = keep14
+    ok("/serving/tune: model knobs -> tune.toml (legacy keys migrate out of "
+       "config.toml), slot keys -> entry, required port refused, and Deploy "
+       "brings the new model's own tuning")
 
     print(f"swap_test: {PASS} checks OK")
 

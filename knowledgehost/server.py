@@ -679,21 +679,65 @@ class Handler(BaseHTTPRequestHandler):
                 return self._send_json({"ok": False, "error": str(e)}, 400)
             if not coerced:
                 return self._send_json({"ok": False, "error": "nothing to change"}, 400)
-            try:
-                update_llm_entry(cp, name, coerced)
-            except (ValueError, OSError) as e:
-                return self._send_json({"ok": False, "error": str(e)}, 400)
-            for k, v in coerced.items():               # the live view stays truthful
-                if v is None:
-                    entry.pop(k, None)
-                else:
-                    entry[k] = v
-            topo = [k for k in coerced if k in ("exclusive", "default")]
-            note = ("saved — exclusive/default change the swap topology: restart "
-                    "the supervisor (./vinur.sh restart) to re-group"
-                    if topo else
-                    f"saved — Restart llm-{name} (or its next swap-in) applies it")
-            return self._send_json({"ok": True, "applied": coerced, "note": note})
+            # two destinations: model-fit knobs go to tune.toml BESIDE THE
+            # WEIGHTS (they travel with the model); slot properties (swap
+            # group, port, image, runtime) stay on the config.toml entry
+            rows = {t["key"]: t for t in sv.TUNING_SCHEMA}
+            model_lane = {k: v for k, v in coerced.items()
+                          if rows[k].get("scope", "model") == "model"}
+            entry_lane = {k: v for k, v in coerced.items()
+                          if rows[k].get("scope", "model") == "entry"}
+            if entry_lane.get("port") is not None and \
+                    any(int(x.get("port") or 0) == entry_lane["port"] and x is not entry
+                        for x in self.cfg["serving"]["llms"]):
+                return self._send_json(
+                    {"ok": False,
+                     "error": f"port {entry_lane['port']} is taken by another entry"}, 400)
+            bits = []
+            tp = sv.tuning_path(entry)
+            if model_lane and tp is None:
+                # legacy lane: a hub-cache id with no folder of its own —
+                # tuning stays on the entry until pull/adopt gives it a home
+                entry_lane.update(model_lane)
+                model_lane = {}
+                bits.append("this model has no folder under models/, so tuning "
+                            "stays on the config entry — pull or adopt it to make "
+                            "tuning travel with the weights")
+            if model_lane:
+                # one-shot graceful upgrade: legacy model-fit keys still on the
+                # entry migrate into the file alongside this save
+                legacy = {k: entry[k] for k, t in rows.items()
+                          if t.get("scope", "model") == "model"
+                          and k in entry and k not in model_lane}
+                try:
+                    sv.write_model_tuning(tp, {**legacy, **model_lane})
+                except OSError as e:
+                    return self._send_json(
+                        {"ok": False, "error": f"could not write {tp}: {e}"}, 400)
+                entry_lane.update({k: None for k in set(legacy) | set(model_lane)
+                                   if k in entry})
+                if legacy:
+                    bits.append(f"moved {len(legacy)} older setting(s) out of "
+                                f"config.toml into {tp.name} — tuning now travels "
+                                "with the model")
+            if entry_lane:
+                try:
+                    update_llm_entry(cp, name, entry_lane)
+                except (ValueError, OSError) as e:
+                    return self._send_json({"ok": False, "error": str(e)}, 400)
+                for k, v in entry_lane.items():        # the live view stays truthful
+                    if v is None:
+                        entry.pop(k, None)
+                    else:
+                        entry[k] = v
+            topo = [k for k in coerced if rows[k].get("applies") == "supervisor"]
+            bits.append("exclusive/boots-first/port/runtime change what the "
+                        "supervisor froze at start — ./vinur.sh restart to apply"
+                        if topo else
+                        f"Restart llm-{name} (or its next swap-in) applies it")
+            return self._send_json({"ok": True, "applied": coerced,
+                                    "tune_file": str(tp or ""),
+                                    "note": "saved — " + "; ".join(bits)})
         if path == "/serving/pull":                    # start/resume a download
             return self._send_json(self.server.downloads.start(
                 str(req.get("model") or ""), include=str(req.get("include") or ""),
