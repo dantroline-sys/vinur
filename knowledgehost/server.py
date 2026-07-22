@@ -308,6 +308,28 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/tools":
             return self._send_json(self.server.tools.catalogue())
         # ── control panel (auth-gated when a token is set) ──
+        if path == "/net":                         # Settings › Network: the egress broker
+            if not self._authed():
+                return self._send_json({"ok": False, "error": "unauthorized"}, 401)
+            import shutil as _sh
+            from . import serving as sv
+            from .amiga_net import audit as _audit
+            from .amiga_net import broker as _broker
+            from .amiga_net import status as _netstatus
+            from .config import net_view
+            try:
+                policy_text = _netstatus.render(12)
+            except Exception as e:                 # a broken policy file must
+                policy_text = f"(broker status unavailable: {e})"   # still render
+            return self._send_json({
+                "ok": True, "settings": net_view(self.cfg),
+                "writable": bool(self.cfg.get("_config_path")),
+                "engines": {"aria2c": bool(_sh.which("aria2c")),
+                            "wget": bool(_sh.which("wget"))},
+                "engine_resolved": _broker._engine(),
+                "policy": policy_text,
+                "audit_path": str(_audit.LOG_PATH),
+                "warning": sv.proxy_warning(self.cfg)})
         if path == "/serving/swap":                # exclusive-model swap state (poll target)
             if not self._authed():
                 return self._send_json({"ok": False, "error": "unauthorized"}, 401)
@@ -472,7 +494,7 @@ class Handler(BaseHTTPRequestHandler):
         if path not in ("/call", "/ops/run", "/ops/stop", "/ops/reload", "/config",
                         "/ops/autopilot", "/library/config", "/library/root",
                         "/source", "/scenario", "/brain", "/drop", "/serving/swap",
-                        "/serving/control", "/serving/model",
+                        "/serving/control", "/serving/model", "/net",
                         "/metrics/mark", "/gaps/close", "/settings/paths"):
             return self._send_json({"ok": False, "error": "not found"}, 404)
         if not self._authed():
@@ -547,6 +569,22 @@ class Handler(BaseHTTPRequestHandler):
             return self._send_json({"ok": True, "service": name, "action": action,
                                     "note": "the supervisor acts within a few seconds — "
                                             "re-poll /serving/status"})
+        if path == "/net":                             # write one broker/network setting
+            from .config import set_net_setting
+            cp = self.cfg.get("_config_path")
+            if not cp:
+                return self._send_json(
+                    {"ok": False, "error": "server started without -c; no config file to write"}, 400)
+            key = str(req.get("key") or "")
+            try:
+                v = set_net_setting(cp, key, req.get("value"))
+            except (ValueError, OSError) as e:
+                return self._send_json({"ok": False, "error": str(e)}, 400)
+            self.cfg[key] = v                          # live for this process too
+            note = ("the broker attaches it per egress.toml's rule auth — engines never see it"
+                    if key == "hf_token" else
+                    "applies to the next pull / search (jobs read config at launch)")
+            return self._send_json({"ok": True, "key": key, "note": note})
         if path == "/serving/model":                   # repoint one entry at another model
             # The Serving tab's picker: rewrite the entry's model line in
             # config.toml (the launcher re-reads config on every spawn, so a

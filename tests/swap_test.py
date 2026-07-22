@@ -694,7 +694,9 @@ def main():
     from knowledgehost.config import settings_schema
     assert "hf_token" not in settings_schema(), \
         "a secret must never surface in the panel schema"
-    # a proxy URL can carry credentials: file/env only, never over HTTP
+    # a proxy URL can carry credentials: the GENERIC schema never carries it —
+    # the Network tab lane (net_view/set_net_setting) is the deliberate,
+    # REDACTED exception, tested below
     assert "http_proxy" not in settings_schema()
     ok("hf_env: engines offline + statless, no tokens; secrets stay off panel/logs")
 
@@ -815,6 +817,46 @@ def main():
             assert "nope" in str(e)
     ok("update_llm_model: rewrites ONE entry's model in place — comments, "
        "spacing, and the other entries untouched")
+
+    # ── Settings › Network: the broker's deliberate, REDACTED settings lane ──
+    from knowledgehost.config import net_view, set_net_setting
+    with tempfile.TemporaryDirectory() as td7:
+        cp7 = Path(td7) / "config.toml"
+        cp7.write_text('# mine\nport = 8770\n\n[serving.embed]\nenabled = false\n')
+        set_net_setting(str(cp7), "https_proxy", "http://bob:hunter2@proxy.corp:3128")
+        set_net_setting(str(cp7), "fetch_engine", "wget")
+        txt7 = cp7.read_text()
+        assert "hunter2" in txt7 and "# mine" in txt7 and "port = 8770" in txt7
+        assert txt7.index("fetch_engine") < txt7.index("[serving.embed]"), \
+            "new keys must stay top-level (before the first table)"
+        cfg7 = load_config(str(cp7))
+        view7 = net_view(cfg7)
+        assert view7["https_proxy"] == "http://***:***@proxy.corp:3128", view7
+        assert view7["hf_token_set"] is False and "hf_token" not in view7
+        try:                       # the redacted echo must never clobber the real value
+            set_net_setting(str(cp7), "https_proxy", view7["https_proxy"])
+            raise AssertionError("redacted echo must be refused")
+        except ValueError as e:
+            assert "REDACTED" in str(e)
+        try:
+            set_net_setting(str(cp7), "fetch_engine", "curl")
+            raise AssertionError("unknown engine must be refused")
+        except ValueError:
+            pass
+        try:
+            set_net_setting(str(cp7), "http_proxy", "proxy.corp:3128")
+            raise AssertionError("bare host:port must be refused (URL wanted)")
+        except ValueError:
+            pass
+        set_net_setting(str(cp7), "hf_token", "hf_secretsecret")
+        view7 = net_view(load_config(str(cp7)))
+        assert view7["hf_token_set"] is True and view7["hf_token_hint"] == "…cret"
+        # and config-file proxies now actually REACH the engines/broker env
+        env7 = sv.proxy_env(load_config(str(cp7)))
+        assert env7["https_proxy"] == "http://bob:hunter2@proxy.corp:3128", env7
+        assert "127.0.0.1" in env7["no_proxy"]
+    ok("network settings: redacted view, redacted-echo/bad values refused, "
+       "token write-only, config proxies reach proxy_env")
 
     # ── proxy: nothing in the stack reads OS proxy settings, so we pass it ───
     pcfg = {"serving": {"llms": [{"name": "a", "host": "10.0.0.5"}]},

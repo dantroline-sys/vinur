@@ -133,6 +133,13 @@ def _engine() -> str:
     forced = os.environ.get("AMIGA_FETCH_ENGINE", "").strip()
     if forced:
         return forced
+    try:                                      # the fetch_engine config key
+        from ..config import load_config      # (Settings › Network)
+        pick = str(load_config().get("fetch_engine") or "").strip()
+        if pick:
+            return pick
+    except Exception:
+        pass
     for cand in ("aria2c", "wget"):
         if shutil.which(cand):
             return cand

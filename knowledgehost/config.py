@@ -164,10 +164,19 @@ DEFAULTS = {
     "distill_parallel": 0,
     # Hugging Face auth for the egress broker (amiga_net) — model pulls only.
     # Gated repos need it; anonymous requests are also the first to be
-    # throttled.  A SECRET: file/env only, never surfaced over HTTP, attached
-    # to requests BY THE BROKER (rule auth = "hf_token" in egress.toml) —
-    # inference engines run offline and never see it.
+    # throttled.  A SECRET: file, env, or the panel's Network tab (write-only
+    # there), attached to requests BY THE BROKER (rule auth = "hf_token" in
+    # egress.toml) — inference engines run offline and never see it.
     "hf_token": "",
+    # Outbound proxy for the egress broker and container engines
+    # (serving.proxy_env): set here, in the shell, or on the Network tab;
+    # empty = direct.  A proxy URL may carry credentials (http://u:pw@host) —
+    # the panel shows it redacted.  no_proxy always gains loopback and the
+    # declared serving hosts automatically.
+    "http_proxy": "", "https_proxy": "", "all_proxy": "", "no_proxy": "",
+    # Broker transfer engine for pulls: "" = auto (aria2c > wget > built-in
+    # stream).  AMIGA_FETCH_ENGINE in the environment overrides this key.
+    "fetch_engine": "",
     # Chunk zones the distiller SKIPS (zones.classify: document furniture where
     # nothing distillable lives — bibliographies also mint junk concepts).  The
     # text stays in the store and FTS (library search still finds it); removing
@@ -650,28 +659,13 @@ def _replace_text(p: Path, content: str) -> None:
     os.replace(tmp, p)
 
 
-def update_config_file(path: str, updates: dict) -> dict:
-    """Update top-level scalar keys in a config.toml IN PLACE, preserving comments and any
-    other lines, validating each key/type against the schema.  Keys inside [tables] are left
-    untouched; new keys are inserted before the first table header (so they stay top-level).
-    Returns the applied {key: value}.  Raises ValueError on an unknown/non-scalar key."""
+def _write_scalars(path: str, coerced: dict) -> dict:
+    """Rewrite top-level scalar keys in a config.toml IN PLACE, preserving
+    comments and any other lines.  Keys inside [tables] are left untouched;
+    new keys are inserted before the first table header (so they stay
+    top-level).  Returns the applied {key: value}.  Validation is the
+    CALLER's job — the two entry points carry different allowlists."""
     import re as _re
-    schema = settings_schema()
-    coerced: dict = {}
-    for k, raw in (updates or {}).items():
-        if k not in schema:
-            raise ValueError(f"not an editable scalar setting: {k}")
-        t = schema[k]["type"]
-        if t == "bool":
-            coerced[k] = raw if isinstance(raw, bool) else \
-                str(raw).strip().lower() in ("1", "true", "yes", "on")
-        elif t == "int":
-            coerced[k] = int(raw)
-        elif t == "float":
-            coerced[k] = float(raw)
-        else:
-            coerced[k] = str(raw)
-
     p = Path(path).expanduser()
     lines = p.read_text().splitlines() if p.exists() else []
     remaining = dict(coerced)
@@ -700,6 +694,78 @@ def update_config_file(path: str, updates: dict) -> dict:
                       ["", "# --- set via the Settings panel ---", *block])
     _replace_text(p, "\n".join(out) + "\n")
     return applied
+
+
+def update_config_file(path: str, updates: dict) -> dict:
+    """Update top-level scalar keys in a config.toml IN PLACE, preserving comments and any
+    other lines, validating each key/type against the schema.  Raises ValueError on an
+    unknown/non-scalar key."""
+    schema = settings_schema()
+    coerced: dict = {}
+    for k, raw in (updates or {}).items():
+        if k not in schema:
+            raise ValueError(f"not an editable scalar setting: {k}")
+        t = schema[k]["type"]
+        if t == "bool":
+            coerced[k] = raw if isinstance(raw, bool) else \
+                str(raw).strip().lower() in ("1", "true", "yes", "on")
+        elif t == "int":
+            coerced[k] = int(raw)
+        elif t == "float":
+            coerced[k] = float(raw)
+        else:
+            coerced[k] = str(raw)
+    return _write_scalars(path, coerced)
+
+
+# ── the Network tab: the egress broker's settings ────────────────────────────
+# Proxy URLs and the HF token are sensitive BY PATTERN, so the generic
+# Settings schema never carries them (fail-closed, tested).  The Network tab
+# is the deliberate exception — same shape as the Paths tab for path keys:
+# its own token-gated endpoint, this explicit allowlist, and credentials
+# REDACTED on the way out (a proxy URL routinely embeds user:pass; the token
+# is write-only and reads back as set/not-set).
+
+NET_SETTINGS = ("http_proxy", "https_proxy", "all_proxy", "no_proxy",
+                "fetch_engine", "hf_token")
+
+
+def redact_url(v: str) -> str:
+    """user:pass@ inside a URL -> ***:***@ — display form only."""
+    import re as _re
+    return _re.sub(r"(://)[^/@\s]+:[^/@\s]+@", r"\1***:***@", v or "")
+
+
+def net_view(cfg: dict) -> dict:
+    """What the Network tab shows: every NET_SETTINGS value with credentials
+    redacted; the token reduced to set/not-set plus a tail hint."""
+    out: dict = {}
+    for k in NET_SETTINGS:
+        v = str(cfg.get(k) or "")
+        if k == "hf_token":
+            out["hf_token_set"] = bool(v)
+            out["hf_token_hint"] = ("…" + v[-4:]) if len(v) >= 12 else ""
+        else:
+            out[k] = redact_url(v)
+    return out
+
+
+def set_net_setting(config_path: str, key: str, value) -> str:
+    """Write ONE broker/network setting to config.toml.  The redacted display
+    form is refused — saving '***:***@' back would clobber real credentials."""
+    if key not in NET_SETTINGS:
+        raise ValueError(f"not a network setting: {key}")
+    v = str(value if value is not None else "").strip()
+    if "***" in v:
+        raise ValueError("that is the REDACTED display form — retype the real "
+                         "value (credentials are hidden on read, kept on disk)")
+    if key == "fetch_engine" and v not in ("", "aria2c", "wget", "stdlib"):
+        raise ValueError("fetch_engine must be aria2c, wget, stdlib, or empty (auto)")
+    if key in ("http_proxy", "https_proxy", "all_proxy") and v and "://" not in v:
+        raise ValueError(f"{key} should be a URL — e.g. http://host:3128 "
+                         "or socks5://host:1080")
+    _write_scalars(config_path, {key: v})
+    return v
 
 
 def update_llm_model(config_path: str, name: str, model: str) -> str:

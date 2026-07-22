@@ -246,6 +246,19 @@ assert plines and all("GB" in ln and "MB/s" in ln for ln in plines), plines
 ok("download progress: periodic '… have / total GB (%) · MB/s · ETA' lines "
    "from the broker itself — identical for aria2c, wget, and stdlib")
 
+# ── the transfer engine: env override > config fetch_engine > auto-detect ───
+engcfg = TD / "engcfg.toml"
+engcfg.write_text('fetch_engine = "wget"\n')
+del os.environ["AMIGA_FETCH_ENGINE"]
+os.environ["KNOWLEDGEHOST_CONFIG"] = str(engcfg)
+assert broker._engine() == "wget"
+engcfg.write_text('fetch_engine = ""\n')
+assert broker._engine() in ("aria2c", "wget", "stdlib")
+del os.environ["KNOWLEDGEHOST_CONFIG"]
+os.environ["AMIGA_FETCH_ENGINE"] = "stdlib"          # tests stay deterministic
+assert broker._engine() == "stdlib"
+ok("fetch engine: AMIGA_FETCH_ENGINE > fetch_engine key (Network tab) > auto")
+
 # ── audit hygiene ────────────────────────────────────────────────────────────
 raw = audit.LOG_PATH.read_text()
 assert b"architectures"[0:0] == b"" and "architectures" not in raw

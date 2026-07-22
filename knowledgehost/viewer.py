@@ -191,7 +191,7 @@ const GROUPS = [
   ['serving', 'Serving', []],
   ['stats', 'Stats', []],
   ['settings', 'Settings', [['settings', 'General'], ['paths', 'Paths'],
-                            ['bundles', 'Bundles'],
+                            ['network', 'Network'], ['bundles', 'Bundles'],
                             ['library', 'Library'], ['autopilot', 'Prioritizer']]],
 ];
 const PARENT = {};                    // leaf key -> its group key
@@ -289,6 +289,7 @@ function go(k, leaf) {
   else if (k === 'overview') { loadOverview(); }
   else if (k === 'settings') { loadSettings(); }
   else if (k === 'paths') { loadPaths(); }
+  else if (k === 'network') { loadNetwork(); }
   else if (k === 'autopilot') { loadAutopilot(); }
   else if (k === 'bundles') { loadBundles(); }
   else if (k === 'library') { loadLibrary(); }
@@ -363,6 +364,10 @@ function renderBar(k) {
     $('#bar').innerHTML = tokInput()
       + ` <button class="toolbtn" onclick="loadPaths()">Refresh</button>`
       + ` <span style="opacity:.6;font-size:13px">absolute server paths — each row saves on its own</span>`;
+  } else if (k === 'network') {
+    $('#bar').innerHTML = tokInput()
+      + ` <button class="toolbtn" onclick="loadNetwork()">Refresh</button>`
+      + ` <span style="opacity:.6;font-size:13px">the egress broker — every byte out of this box goes through it</span>`;
   } else if (k === 'library') {
     $('#bar').innerHTML = tokInput()
       + ` <button class="toolbtn" onclick="saveLibrarySelection()">Save selection</button>`
@@ -1652,6 +1657,68 @@ async function savePath(key) {
     ? '✓ ' + esc(key) + ' saved — ' + esc(r.note || '')
     : '✗ ' + esc(r.error || 'failed')}</div>`;
   if (r.ok) loadPaths();
+}
+
+// ── Settings › Network: the egress broker — its settings + its live window ──
+// Proxy URLs and the HF token never ride the generic Settings schema (they
+// can carry credentials); this tab is the deliberate lane: values arrive
+// REDACTED, the token is write-only, each row saves on its own.
+const NETHELP = {
+  http_proxy: 'proxy for plain-HTTP egress — URL form (http://host:3128); credentials allowed, shown redacted',
+  https_proxy: 'proxy for HTTPS egress — model pulls and hub searches ride this one',
+  all_proxy: 'catch-all (socks5://host:1080 works here) used when the scheme-specific keys are empty',
+  no_proxy: 'comma-separated hosts that bypass the proxy — loopback and the declared serving hosts are always added automatically',
+  fetch_engine: 'transfer engine for pulls: auto = aria2c > wget > built-in stream (built-in needs nothing installed)',
+};
+async function loadNetwork() {
+  $('#banner').innerHTML = ''; $('#results').className = ''; $('#results').textContent = 'loading broker state…';
+  let r; try { r = await (await authFetch('/net')).json(); } catch (e) { $('#results').textContent = 'request failed: ' + e; return; }
+  if (!r.ok) { $('#results').className = 'empty'; $('#results').textContent = 'enter the auth token above to view Network'; return; }
+  const s = r.settings || {}, eng = r.engines || {};
+  const engNote = `installed here: aria2c ${eng.aria2c ? '✓' : '✗'} · wget ${eng.wget ? '✓' : '✗'}`
+    + ` — resolving to <b>${esc(r.engine_resolved || '?')}</b>`;
+  const prox = ['http_proxy', 'https_proxy', 'all_proxy', 'no_proxy'].map(k => `<tr>
+    <td><code>${k}</code></td>
+    <td><input data-nk="${k}" value="${esc(s[k] || '')}" style="width:320px" placeholder="(empty = direct)"></td>
+    <td style="opacity:.7;font-size:12px">${esc(NETHELP[k])}</td>
+    <td><button class="toolbtn" style="font-size:12px;padding:3px 9px" onclick="saveNet('${k}')">Save</button></td></tr>`).join('');
+  const engRow = `<tr><td><code>fetch_engine</code></td>
+    <td><select data-nk="fetch_engine">${['', 'aria2c', 'wget', 'stdlib'].map(v =>
+      `<option value="${v}"${(s.fetch_engine || '') === v ? ' selected' : ''}>${v || 'auto'}</option>`).join('')}</select>
+      <span style="opacity:.6;font-size:12px"> ${engNote}</span></td>
+    <td style="opacity:.7;font-size:12px">${esc(NETHELP.fetch_engine)}</td>
+    <td><button class="toolbtn" style="font-size:12px;padding:3px 9px" onclick="saveNet('fetch_engine')">Save</button></td></tr>`;
+  const tokRow = `<tr><td><code>hf_token</code></td>
+    <td>${s.hf_token_set
+      ? `<span class="badge">set${s.hf_token_hint ? ' · ' + esc(s.hf_token_hint) : ''}</span>`
+      : `<span class="badge" style="opacity:.6">not set</span>`}
+      <input data-nk="hf_token" type="password" style="width:220px" placeholder="paste a new token (write-only)">
+      ${s.hf_token_set ? `<button class="toolbtn" style="font-size:12px;padding:3px 9px" onclick="clearHfToken()">Clear</button>` : ''}</td>
+    <td style="opacity:.7;font-size:12px">Hugging Face auth for gated repos — held by the BROKER alone (rule auth in egress.toml); inference engines run offline and never see it</td>
+    <td><button class="toolbtn" style="font-size:12px;padding:3px 9px" onclick="saveNet('hf_token')">Save</button></td></tr>`;
+  $('#results').innerHTML =
+    (r.warning ? `<div class="note" style="margin-bottom:8px">⚠ ${esc(r.warning)}</div>` : '')
+    + `<div style="opacity:.6;margin-bottom:6px">${r.writable
+        ? 'writes config.toml in place — proxy credentials are shown REDACTED (***): retype a value to change it; saving the *** form is refused'
+        : 'server started without -c — read-only'}</div>`
+    + `<table><tr><th>key</th><th>value</th><th>what it is</th><th></th></tr>${prox}${engRow}${tokRow}</table>`
+    + `<div class="cfg-group" style="margin-top:14px"><b style="font-size:13px">The broker's window</b>
+       <span style="opacity:.55;font-size:12px"> — policy, open leases, recent egress (same as ./vinur.sh net) · audit log: <code>${esc(r.audit_path || '')}</code></span>
+       <pre style="margin-top:6px;font-size:12px;line-height:1.5;white-space:pre-wrap">${esc(r.policy || '')}</pre></div>`;
+}
+async function saveNet(key) {
+  const el = document.querySelector(`#results [data-nk="${key}"]`);
+  if (!el) return;
+  const r = await postJSON('/net', { key, value: el.value }).catch(e => ({ ok: false, error: '' + e }));
+  $('#banner').innerHTML = `<div class="note">${r.ok
+    ? '✓ ' + esc(key) + ' saved — ' + esc(r.note || '')
+    : '✗ ' + esc(r.error || 'failed')}</div>`;
+  if (r.ok) loadNetwork();
+}
+async function clearHfToken() {
+  const r = await postJSON('/net', { key: 'hf_token', value: '' }).catch(e => ({ ok: false, error: '' + e }));
+  $('#banner').innerHTML = `<div class="note">${r.ok ? '✓ hf_token cleared' : '✗ ' + esc(r.error || 'failed')}</div>`;
+  if (r.ok) loadNetwork();
 }
 
 // ── Stats tab: banked telemetry → small-multiple SVG time-series ────────────
