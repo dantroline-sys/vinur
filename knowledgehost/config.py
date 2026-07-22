@@ -805,6 +805,59 @@ def update_llm_model(config_path: str, name: str, model: str) -> str:
     raise ValueError(f"no [[serving.llms]] entry named '{name}' in {p.name}")
 
 
+def update_llm_entry(config_path: str, name: str, updates: dict) -> dict:
+    """Rewrite / insert / REMOVE scalar keys in ONE [[serving.llms]] block, in
+    place — the Tune editor's writer.  A value of None removes the key, so the
+    engine's own default returns.  Comments (including a rewritten line's
+    trailing comment) and every other line survive.  Returns what applied."""
+    import re as _re
+    p = Path(config_path).expanduser()
+    lines = p.read_text().splitlines()
+    name_re = _re.compile(r"""^\s*name\s*=\s*["'](?P<v>[^"']*)["']""")
+
+    def _block() -> tuple[int, int]:
+        blocks, start = [], None
+        for i, ln in enumerate(lines):
+            s = ln.strip()
+            if s.startswith("["):
+                if start is not None:
+                    blocks.append((start, i))
+                    start = None
+                if s == "[[serving.llms]]":
+                    start = i
+        if start is not None:
+            blocks.append((start, len(lines)))
+        for a, b in blocks:
+            if any((m := name_re.match(lines[j])) and m.group("v") == name
+                   for j in range(a, b)):
+                return a, b
+        raise ValueError(f"no [[serving.llms]] entry named '{name}' in {p.name}")
+
+    _block()                                   # existence check before any edit
+    applied: dict = {}
+    for key, val in (updates or {}).items():
+        if not _re.fullmatch(r"[A-Za-z0-9_]+", key) or key == "name":
+            raise ValueError(f"not an editable entry key: {key}")
+        a, b = _block()                        # recompute: deletes shift lines
+        key_re = _re.compile(
+            rf"""^(\s*{key}\s*=\s*)("[^"]*"|'[^']*'|[^#]*?)(\s*(?:#.*)?)$""")
+        hit = next((j for j in range(a, b) if key_re.match(lines[j])), None)
+        if val is None:
+            if hit is not None:
+                del lines[hit]
+        elif hit is not None:
+            m = key_re.match(lines[hit])
+            lines[hit] = f"{m.group(1)}{_toml_scalar(val)}{m.group(3)}"
+        else:
+            end = b                            # append inside the block, above
+            while end > a + 1 and not lines[end - 1].strip():
+                end -= 1                       # any blank gap before the next header
+            lines[end:end] = [f"{key} = {_toml_scalar(val)}"]
+        applied[key] = val
+    _replace_text(p, "\n".join(lines) + "\n")
+    return applied
+
+
 def add_llm_entry(config_path: str, entry: dict) -> str:
     """Append a new [[serving.llms]] block — the Serving tab's 'Add service'.
     Inserted right after the last existing llms block so the group reads as

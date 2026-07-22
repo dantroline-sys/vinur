@@ -385,7 +385,8 @@ class Handler(BaseHTTPRequestHandler):
             try:
                 return self._send_json({"ok": True, **sv.serving_status(self.cfg),
                                         "job": self.server.ops.status(),
-                                        "downloads": self.server.downloads.status()})
+                                        "downloads": self.server.downloads.status(),
+                                        "tuning_schema": sv.TUNING_SCHEMA})
             except Exception as e:                 # pragma: no cover - defensive
                 return self._send_json({"ok": False, "error": f"{type(e).__name__}: {e}"}, 500)
         if path == "/serving/find":                # Ops › pull: hub-search pick-list
@@ -540,7 +541,7 @@ class Handler(BaseHTTPRequestHandler):
                         "/ops/autopilot", "/library/config", "/library/root",
                         "/source", "/scenario", "/brain", "/drop", "/serving/swap",
                         "/serving/control", "/serving/model", "/serving/add",
-                        "/serving/pull", "/serving/download", "/net",
+                        "/serving/pull", "/serving/download", "/serving/tune", "/net",
                         "/metrics/mark", "/gaps/close", "/settings/paths"):
             return self._send_json({"ok": False, "error": "not found"}, 404)
         if not self._authed():
@@ -658,6 +659,41 @@ class Handler(BaseHTTPRequestHandler):
                     if key == "hf_token" else
                     "applies to the next pull / search (jobs read config at launch)")
             return self._send_json({"ok": True, "key": key, "note": note})
+        if path == "/serving/tune":                    # the Tune editor's save
+            from . import serving as sv
+            from .config import update_llm_entry
+            cp = self.cfg.get("_config_path")
+            if not cp:
+                return self._send_json(
+                    {"ok": False, "error": "server started without -c; no config file to write"}, 400)
+            name = str(req.get("name") or "")
+            entry = next((e for e in self.cfg["serving"]["llms"]
+                          if str(e.get("name")) == name), None)
+            if entry is None:
+                return self._send_json(
+                    {"ok": False, "error": f"'{name}' is not a serving.llms entry"}, 400)
+            try:
+                coerced = sv.validate_tuning(str(entry.get("engine") or ""),
+                                             req.get("updates") or {})
+            except ValueError as e:
+                return self._send_json({"ok": False, "error": str(e)}, 400)
+            if not coerced:
+                return self._send_json({"ok": False, "error": "nothing to change"}, 400)
+            try:
+                update_llm_entry(cp, name, coerced)
+            except (ValueError, OSError) as e:
+                return self._send_json({"ok": False, "error": str(e)}, 400)
+            for k, v in coerced.items():               # the live view stays truthful
+                if v is None:
+                    entry.pop(k, None)
+                else:
+                    entry[k] = v
+            topo = [k for k in coerced if k in ("exclusive", "default")]
+            note = ("saved — exclusive/default change the swap topology: restart "
+                    "the supervisor (./vinur.sh restart) to re-group"
+                    if topo else
+                    f"saved — Restart llm-{name} (or its next swap-in) applies it")
+            return self._send_json({"ok": True, "applied": coerced, "note": note})
         if path == "/serving/pull":                    # start/resume a download
             return self._send_json(self.server.downloads.start(
                 str(req.get("model") or ""), include=str(req.get("include") or ""),

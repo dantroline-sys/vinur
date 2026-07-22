@@ -85,6 +85,8 @@ _VLLM_KEYS = [
     ("max_model_len",          "--max-model-len",          "value"),
     ("gpu_memory_utilization", "--gpu-memory-utilization", "value"),
     ("max_num_seqs",           "--max-num-seqs",           "value"),
+    ("max_num_batched_tokens", "--max-num-batched-tokens", "value"),
+    ("enable_prefix_caching",  "--enable-prefix-caching",  "onoff"),
     ("tensor_parallel",        "--tensor-parallel-size",   "value"),
     ("cpu_offload_gb",         "--cpu-offload-gb",         "value"),
     ("swap_space",             "--swap-space",             "value"),
@@ -103,8 +105,131 @@ def _mapped_flags(entry: dict, table: list) -> list[str]:
         if kind == "flag":
             if v:
                 out.append(flag)
+        elif kind == "onoff":                 # tri-state: absent = engine default
+            out.append(flag if v else flag.replace("--", "--no-", 1))
         elif v is not None and str(v) != "":
             out += [flag, str(v)]
+    return out
+
+
+# What the Serving tab's Tune editor offers: every first-class knob with a
+# recommended starting point and a plain-language explanation.  `applies` says
+# what has to restart before a change takes effect: "service" = Restart (or
+# next swap-in) of that one model; "supervisor" = ./vinur.sh restart, because
+# exclusive/default change the swap-group topology the supervisor froze at
+# start.  Recommendations are starting points, not laws — the Stats tab
+# (waiting queue, KV-cache %) shows what a knob actually did.
+TUNING_SCHEMA = [
+    {"key": "max_model_len", "label": "Context window", "type": "int",
+     "engines": ["vllm", "container"], "min": 512, "max": 1048576,
+     "recommended": 16384,
+     "why": "covers chat and the kb's distill batches without hoarding KV cache",
+     "help": "How many tokens of context the engine reserves KV cache for, per "
+             "sequence. Bigger windows eat VRAM fast, and the model's own trained "
+             "maximum is the ceiling. Raise it only if you actually feed longer "
+             "documents.", "applies": "service"},
+    {"key": "gpu_memory_utilization", "label": "VRAM share", "type": "float",
+     "engines": ["vllm", "container"], "min": 0.05, "max": 0.98,
+     "recommended": 0.9,
+     "why": "right for ONE resident model; co-resident models must split it",
+     "help": "The fraction of GPU memory vLLM claims at startup for weights plus "
+             "KV cache. 0.90 for an exclusive model. Models running TOGETHER must "
+             "share — their fractions (plus headroom) must sum below 1.0 or the "
+             "second one dies at start.", "applies": "service"},
+    {"key": "max_num_seqs", "label": "Parallel sequences", "type": "int",
+     "engines": ["vllm", "container"], "min": 1, "max": 4096,
+     "recommended": 64,
+     "why": "plenty for the kb's distill parallelism without KV-cache thrash",
+     "help": "How many requests may run in one batch step. Higher lifts throughput "
+             "until KV cache runs out. On the Stats tab: 'waiting' above zero means "
+             "raise it; KV-cache % pinned at 100 means lower it (or shrink the "
+             "context window).", "applies": "service"},
+    {"key": "max_num_batched_tokens", "label": "Prefill budget", "type": "int",
+     "engines": ["vllm", "container"], "min": 256, "max": 262144,
+     "recommended": 8192,
+     "why": "fast long-prompt prefill without VRAM spikes",
+     "help": "The scheduler's token budget per engine step (chunked prefill). "
+             "Higher = faster processing of long prompts but spikier memory use.",
+     "applies": "service"},
+    {"key": "kv_cache_dtype", "label": "KV-cache dtype", "type": "choice",
+     "engines": ["vllm", "container"], "choices": ["auto", "fp8"],
+     "recommended": "fp8",
+     "why": "halves KV memory on this class of GPU",
+     "help": "The number format of the KV cache. fp8 HALVES its memory — double "
+             "the concurrent context for a barely measurable quality cost on "
+             "modern NVIDIA cards. auto = the model's own dtype.",
+     "applies": "service"},
+    {"key": "enable_prefix_caching", "label": "Prefix caching", "type": "bool3",
+     "engines": ["vllm", "container"], "recommended": True,
+     "why": "the kb's prompts share long identical headers",
+     "help": "Reuse computed KV for prompts that share a prefix. The distiller "
+             "sends thousands of prompts with the same header, so this saves real "
+             "prefill time. Turn it off only when VRAM is critically tight.",
+     "applies": "service"},
+    {"key": "ctx_size", "label": "Context size", "type": "int",
+     "engines": ["llama"], "min": 256, "max": 1048576, "recommended": 4096,
+     "why": "knowledge chunks are ≤2048 tokens — a few k is plenty",
+     "help": "llama-server's context window. Costs VRAM like any KV cache; "
+             "raise it only for genuinely long prompts.", "applies": "service"},
+    {"key": "n_gpu_layers", "label": "GPU layers", "type": "int",
+     "engines": ["llama"], "min": 0, "max": 999, "recommended": 99,
+     "why": "a box serving LMs wants the whole model on the GPU",
+     "help": "How many model layers live on the GPU. 99 = all of them. Lower it "
+             "only when a model won't fit — every CPU layer costs real speed.",
+     "applies": "service"},
+    {"key": "exclusive", "label": "Exclusive", "type": "bool",
+     "engines": ["vllm", "container", "llama"], "recommended": True,
+     "why": "big models can't share the card",
+     "help": "Exclusive models form ONE group of which exactly one is loaded at a "
+             "time — Deploy/Swap moves between them. Untick only for models small "
+             "enough to co-reside (then set their VRAM shares to fit together).",
+     "applies": "supervisor"},
+    {"key": "default", "label": "Boots first", "type": "bool",
+     "engines": ["vllm", "container", "llama"], "recommended": None,
+     "help": "The exclusive-group member that loads on startup. Exactly one entry "
+             "should carry this.", "applies": "supervisor"},
+]
+
+
+def validate_tuning(engine: str, updates: dict) -> dict:
+    """Coerce and bound the Tune editor's updates against TUNING_SCHEMA.
+    None (or empty) = remove the key — the engine default returns.  A false
+    bool also removes: absent IS false for exclusive/default."""
+    rows = {t["key"]: t for t in TUNING_SCHEMA}
+    out: dict = {}
+    for k, raw in (updates or {}).items():
+        t = rows.get(k)
+        if t is None:
+            raise ValueError(f"not a tunable key: {k}")
+        if engine not in t["engines"]:
+            raise ValueError(f"{k} does not apply to engine '{engine}'")
+        if raw is None or raw == "":
+            out[k] = None
+            continue
+        ty = t["type"]
+        if ty == "int":
+            v: object = int(raw)
+        elif ty == "float":
+            v = float(raw)
+        elif ty in ("bool", "bool3"):
+            v = raw if isinstance(raw, bool) else \
+                str(raw).strip().lower() in ("1", "true", "on", "yes")
+            if ty == "bool" and not v:
+                out[k] = None
+                continue
+        elif ty == "choice":
+            v = str(raw)
+            if v not in t.get("choices", []):
+                raise ValueError(f"{k} must be one of {t['choices']}")
+        else:
+            v = str(raw)
+        lo, hi = t.get("min"), t.get("max")
+        if isinstance(v, (int, float)) and not isinstance(v, bool):
+            if lo is not None and v < lo:
+                raise ValueError(f"{k}: {v} is below the sane floor {lo}")
+            if hi is not None and v > hi:
+                raise ValueError(f"{k}: {v} is above the sane ceiling {hi}")
+        out[k] = v
     return out
 
 
@@ -1184,6 +1309,8 @@ def serving_status(cfg: dict) -> dict:
                 "model": str(e.get("model") or ""), "port": e.get("port"),
                 "exclusive": bool(e.get("exclusive")), "default": bool(e.get("default")),
                 "choices": choices_by_engine[engine],
+                "tuning": {t["key"]: e.get(t["key"]) for t in TUNING_SCHEMA
+                           if engine in t["engines"]},
                 "weights": weights_status(engine, str(e.get("model") or ""))}
         item.update(svc_state(f"llm-{name}", name))
         llms.append(item)

@@ -832,6 +832,85 @@ def main():
     ok("update_llm_model: rewrites ONE entry's model in place — comments, "
        "spacing, and the other entries untouched")
 
+    # ── the Tune editor: schema, validation, flag mapping, config writer ─────
+    keys_in_table = {k for k, _, _ in sv._VLLM_KEYS}
+    for t in sv.TUNING_SCHEMA:
+        assert t["key"] and t["label"] and t["help"] and t["applies"], t
+        assert t["type"] in ("int", "float", "bool", "bool3", "choice"), t
+        if "vllm" in t["engines"] and t["key"] not in ("exclusive", "default"):
+            assert t["key"] in keys_in_table, \
+                f"schema offers {t['key']} but llm_argv never forwards it"
+        r = t.get("recommended")
+        if isinstance(r, (int, float)) and not isinstance(r, bool):
+            assert t.get("min", r) <= r <= t.get("max", r), f"{t['key']}: rec out of bounds"
+    ok("TUNING_SCHEMA: every knob typed, explained, and actually forwarded")
+
+    fl = sv._mapped_flags({"enable_prefix_caching": True, "max_num_batched_tokens": 8192},
+                          sv._VLLM_KEYS)
+    assert "--enable-prefix-caching" in fl and "8192" in fl, fl
+    fl = sv._mapped_flags({"enable_prefix_caching": False}, sv._VLLM_KEYS)
+    assert "--no-enable-prefix-caching" in fl, fl
+    assert "--enable-prefix-caching" not in fl
+    fl = sv._mapped_flags({}, sv._VLLM_KEYS)
+    assert not any("prefix" in f for f in fl), "absent = the engine's default"
+    ok("prefix caching: tri-state on/off/absent maps to the right vLLM flags")
+
+    co = sv.validate_tuning("vllm", {"max_model_len": "16384", "kv_cache_dtype": "fp8",
+                                     "enable_prefix_caching": "false",
+                                     "gpu_memory_utilization": 0.9,
+                                     "exclusive": False, "max_num_seqs": None})
+    assert co["max_model_len"] == 16384 and co["kv_cache_dtype"] == "fp8"
+    assert co["enable_prefix_caching"] is False and co["gpu_memory_utilization"] == 0.9
+    assert co["exclusive"] is None, "bool false = remove (absent IS false)"
+    assert co["max_num_seqs"] is None
+    for bad in ({"ctx_size": 4096},                      # llama key on vllm
+                {"kv_cache_dtype": "int4"},              # not a choice
+                {"gpu_memory_utilization": 1.5},         # above ceiling
+                {"nonsense": 1}):
+        try:
+            sv.validate_tuning("vllm", bad)
+            raise AssertionError(f"must refuse {bad}")
+        except ValueError:
+            pass
+    ok("validate_tuning: coercion + engine gating + bounds + choice checks")
+
+    from knowledgehost.config import update_llm_entry
+    with tempfile.TemporaryDirectory() as td12:
+        cp12 = Path(td12) / "config.toml"
+        cp12.write_text('[[serving.llms]]\nname   = "primary"\n'
+                        'model  = "org/a"\nport   = 11438\n'
+                        'max_model_len = 8192     # tuned by hand once\n'
+                        '\n[[serving.llms]]\nname = "secondary"\nmodel = "org/b"\n'
+                        'port = 11439\n\n[serving.embed]\nenabled = false\n')
+        update_llm_entry(str(cp12), "primary",
+                         {"max_model_len": 16384,          # rewrite, keep comment
+                          "kv_cache_dtype": "fp8",         # insert new key
+                          "enable_prefix_caching": True})  # insert bool
+        txt12 = cp12.read_text()
+        assert "max_model_len = 8192" not in txt12
+        assert "max_model_len = 16384     # tuned by hand once" in txt12, \
+            "a rewritten line keeps its trailing comment"
+        assert txt12.index('kv_cache_dtype = "fp8"') < txt12.index('name = "secondary"'), \
+            "new keys land inside PRIMARY's block"
+        assert "enable_prefix_caching = true" in txt12
+        cfg12 = load_config(str(cp12))["serving"]["llms"]
+        assert cfg12[0]["max_model_len"] == 16384 and cfg12[1].get("kv_cache_dtype") is None
+        update_llm_entry(str(cp12), "primary", {"kv_cache_dtype": None})   # remove
+        cfg12 = load_config(str(cp12))["serving"]["llms"]
+        assert "kv_cache_dtype" not in cfg12[0], "None removes the key (engine default)"
+        try:
+            update_llm_entry(str(cp12), "primary", {"name": "x"})
+            raise AssertionError("name must not be editable here")
+        except ValueError:
+            pass
+        try:
+            update_llm_entry(str(cp12), "ghost", {"max_model_len": 1024})
+            raise AssertionError("unknown entry must raise")
+        except ValueError:
+            pass
+    ok("update_llm_entry: rewrite keeps comments, insert stays in-block, "
+       "None removes, siblings untouched")
+
     # ── add_llm_entry: the Add-service flow's config writer ─────────────────
     from knowledgehost.config import add_llm_entry
     with tempfile.TemporaryDirectory() as td8:

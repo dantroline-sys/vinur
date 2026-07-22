@@ -1139,6 +1139,7 @@ function svActions(m, supRunning, swapping) {
     // the supervisor clears the verdict and the restart budget with it.
     b.push(svBtn('Start', `svcAction('${esc(svc)}','start')`));
   }
+  if (m.engine) b.push(svBtn('Tune', `svTuneOpen('${esc(m.name)}')`, 'opacity:.85'));
   b.push(svBtn('Log', `svShowLog('${esc(svc)}')`, 'opacity:.75'));
   return `<div style="display:flex;gap:4px;flex-wrap:wrap">${b.join('')}</div>`;
 }
@@ -1252,6 +1253,8 @@ async function pollServing_() {
     live.textContent = (r.error === 'unauthorized')
       ? 'enter the auth token above to view Serving' : ('error: ' + r.error); return; }
   live.className = '';
+  SVSCHEMA = r.tuning_schema || SVSCHEMA;      // the Tune editor's vocabulary
+  SVLLMS = r.llms || [];
   const unHtml = svUnserved(r.unserved || []);
   const dlHtml = svDownloads(r.downloads || []);
   if (!r.hosting) {
@@ -1313,6 +1316,98 @@ async function pollServing_() {
   const pre = $('#svlogpre');
   if (pre) pre.scrollTop = atEnd ? pre.scrollHeight : keep;
 }
+// ── the Tune editor: every first-class engine knob, graphically ─────────────
+// Renders into #svtune, which the 2.5s poll never touches — an open editor
+// keeps its half-typed values.  Empty field = the engine's own default (the
+// key is REMOVED from config.toml).  Each knob carries a recommended starting
+// point (one click applies it) and a plain-language explanation; changes save
+// in one POST and apply on the service's next restart / swap-in.
+let SVSCHEMA = [], SVLLMS = [];
+function svTuneOpen(name) {
+  const m = SVLLMS.find(x => x.name === name);
+  const box = $('#svtune');
+  if (!m || !box) return;
+  const rows = SVSCHEMA.filter(t => (t.engines || []).includes(m.engine)).map(t => {
+    const cur = (m.tuning || {})[t.key];
+    let inp;
+    if (t.type === 'bool')
+      inp = `<input type="checkbox" data-tk="${t.key}"${cur ? ' checked' : ''}>`;
+    else if (t.type === 'bool3')
+      inp = `<select data-tk="${t.key}">
+        <option value=""${cur == null ? ' selected' : ''}>engine default</option>
+        <option value="true"${cur === true ? ' selected' : ''}>on</option>
+        <option value="false"${cur === false ? ' selected' : ''}>off</option></select>`;
+    else if (t.type === 'choice')
+      inp = `<select data-tk="${t.key}">
+        <option value=""${cur == null ? ' selected' : ''}>engine default</option>`
+        + (t.choices || []).map(c => `<option${c === cur ? ' selected' : ''}>${esc(c)}</option>`).join('')
+        + `</select>`;
+    else
+      inp = `<input data-tk="${t.key}" type="number"${t.type === 'float' ? ' step="any"' : ''}
+        value="${cur == null ? '' : cur}" placeholder="engine default" style="width:110px"
+        ${t.min != null ? `min="${t.min}"` : ''} ${t.max != null ? `max="${t.max}"` : ''}>`;
+    const rec = t.recommended == null ? ''
+      : `<button class="toolbtn" style="font-size:11px;padding:1px 7px"
+           title="${esc(t.why || 'apply the recommended value')}"
+           onclick="svTuneRec('${t.key}', '${esc(String(t.recommended))}')">rec: ${esc(String(t.recommended))}</button>`;
+    const applies = t.applies === 'supervisor'
+      ? ` <span style="color:var(--warn,#b45309);font-size:11px">needs supervisor restart</span>` : '';
+    return `<tr><td style="white-space:nowrap"><b style="font-size:13px">${esc(t.label)}</b><br>
+        <code style="font-size:11px;opacity:.55">${t.key}</code></td>
+      <td style="white-space:nowrap">${inp} ${rec}</td>
+      <td style="font-size:12px;opacity:.8">${esc(t.help)}${applies}</td></tr>`;
+  }).join('');
+  box.innerHTML = `<div class="cfg-group" style="margin-top:12px">
+    <div style="display:flex;gap:8px;align-items:center;margin-bottom:4px">
+      <b>Tune llm-${esc(name)}</b>
+      <span style="opacity:.6;font-size:12px">${esc(m.model)} · ${esc(m.engine)}</span>
+      <span style="flex:1"></span>
+      ${svBtn('Save', `svTuneSave('${esc(name)}')`, 'font-weight:600')}
+      ${svBtn('Close', `svTuneClose()`)}
+    </div>
+    <div style="opacity:.6;font-size:12px;margin-bottom:8px">Empty = the engine's own default
+      (the key is removed from config.toml). Save edits this entry in place; <b>Restart the
+      service</b> (or swap it in) to apply. Rows marked
+      <span style="color:var(--warn,#b45309)">needs supervisor restart</span> change the swap
+      topology — apply with <code>./vinur.sh restart</code>. Watch the Stats tab (waiting queue,
+      KV-cache %) to see what a knob actually did.</div>
+    <table><tr><th>knob</th><th>value</th><th>what it does</th></tr>${rows}</table></div>`;
+}
+function svTuneClose() { const b = $('#svtune'); if (b) b.innerHTML = ''; }
+function svTuneRec(key, val) {
+  const el = document.querySelector(`#svtune [data-tk="${key}"]`);
+  if (!el) return;
+  if (el.type === 'checkbox') el.checked = val === 'true';
+  else if (el.tagName === 'SELECT' && (val === 'true' || val === 'false')) el.value = val;
+  else el.value = val;
+}
+async function svTuneSave(name) {
+  const m = SVLLMS.find(x => x.name === name) || { tuning: {} };
+  const updates = {};
+  document.querySelectorAll('#svtune [data-tk]').forEach(el => {
+    const key = el.dataset.tk;
+    const t = SVSCHEMA.find(x => x.key === key) || {};
+    const cur = (m.tuning || {})[key];
+    let v;
+    if (el.type === 'checkbox') v = el.checked;
+    else if (el.value === '') v = null;
+    else if (t.type === 'int') v = parseInt(el.value, 10);
+    else if (t.type === 'float') v = parseFloat(el.value);
+    else if (t.type === 'bool3') v = el.value === 'true';
+    else v = el.value;
+    if (JSON.stringify(v) !== JSON.stringify(cur == null ? (t.type === 'bool' ? false : null) : cur))
+      updates[key] = v;
+  });
+  if (!Object.keys(updates).length) {
+    $('#banner').innerHTML = 'nothing changed';
+    return;
+  }
+  const r = await postJSON('/serving/tune', { name, updates })
+    .catch(e => ({ ok: false, error: netErr(e) }));
+  $('#banner').innerHTML = r.ok ? '✓ ' + esc(r.note || 'saved') : '✗ ' + esc(r.error || 'failed');
+  if (r.ok) { svTuneClose(); pollServing(); }
+}
+
 // Every download as a persistent row — state, %, the pull log's last line —
 // with Pause / Resume / Discard.  Disk truth: any incomplete manifest shows
 // here even if some other process started it.
@@ -1395,6 +1490,7 @@ async function loadServing() {
   // below it does NOT (its search box and results must survive the polls)
   $('#banner').innerHTML = ''; $('#results').className = '';
   $('#results').innerHTML = `<div id="svlive">loading serving state…</div>
+    <div id="svtune"></div>
     <div style="margin-top:16px">${pullFindUI()}</div>`;
   pollServing();
 }
