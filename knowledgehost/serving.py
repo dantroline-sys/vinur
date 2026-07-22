@@ -1003,6 +1003,40 @@ def eligible_models(engine: str, root: Path = ROOT, cfg: dict | None = None) -> 
     return out
 
 
+def _ensure_image(entry: dict) -> None:
+    """Fetch the container image DELIBERATELY — a policy-checked lease plus an
+    audit row — instead of letting `podman run` pull it as an invisible side
+    effect on first start.  B-15's rule applied to images: acquisition is
+    declared egress, execution is offline.  A present image costs one local
+    inspect and touches no network.  The transfer itself is the runtime's
+    (not byte-accounted by the broker) — the audit row says so."""
+    import subprocess
+    image = str(entry.get("image") or "")
+    if not image:
+        return
+    rt = _container_runtime(entry)
+    if subprocess.run([rt, "image", "inspect", image],
+                      capture_output=True).returncode == 0:
+        return
+    from .amiga_net import audit, broker
+    first = image.split("/", 1)[0]
+    registry = first if "." in first else "docker.io"
+    try:
+        with broker.lease(f"container image: {image}", rule_name="container-images"):
+            print(f"image {image} is not on this machine — pulling under the "
+                  "'container-images' rule", flush=True)
+            r = subprocess.run([rt, "pull", image])
+            if r.returncode != 0:
+                raise RuntimeError(f"{rt} pull {image} failed rc={r.returncode}")
+            audit.write("ALLOWED", purpose=f"container image: {image}",
+                        host=registry, port=443, rule="container-images",
+                        detail=f"transfer by {os.path.basename(rt)} "
+                               "(not byte-accounted)")
+    except broker.EgressDenied as e:
+        sys.exit(f"container image '{image}' is not on this machine and the "
+                 f"egress policy refused the fetch: {e}")
+
+
 def adopt_cached(model: str = "", root: Path = ROOT, say=print) -> int:
     """Copy complete legacy hub-cache snapshots into the model store
     (models/<Org--Name>/, exactly what a broker pull produces, manifest
@@ -1210,6 +1244,7 @@ def main(argv: list[str] | None = None) -> None:
             # env went into the argv as -e flags; just guarantee the mounted
             # cache exists so the runtime doesn't invent it with odd labels.
             (ROOT / "var" / "cache" / "huggingface").mkdir(parents=True, exist_ok=True)
+            _ensure_image(entry)               # declared egress, never a side effect
         else:
             # Per-model environment (env = { NVCC_APPEND_FLAGS = "...", ... }):
             # applied here, at exec time, so the supervisor path and a manual

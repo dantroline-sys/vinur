@@ -23,3 +23,15 @@ purpose     = "download the model weights and tokenizer files you asked for (pul
 ttl_seconds = 14400          # one pull operation; a 70 GB model on a slow link fits
 max_uses    = 20000          # files + resume requests within that operation
 auth        = "hf_token"     # attached by the broker; engines never see it
+
+[[rule]]
+name        = "container-images"
+hosts       = ["docker.io", "*.docker.io", "registry-1.docker.io",
+               "quay.io", "*.quay.io", "ghcr.io", "*.ghcr.io"]
+port        = 443
+methods     = ["GET", "HEAD"]
+purpose     = "fetch the vLLM container image an engine=container entry names (first start only)"
+ttl_seconds = 3600           # one image fetch
+max_uses    = 10000          # an OCI image is many layer requests
+# The transfer is podman/docker's own (the broker opens the lease and audits
+# the event, but does not proxy the bytes) — posture reports this honestly.

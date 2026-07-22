@@ -863,6 +863,53 @@ def main():
     ok("add_llm_entry: joins the llms group in place, validates name/engine, "
        "first entry into an empty file works")
 
+    # ── container images: fetched deliberately, under a policy lease ────────
+    from knowledgehost.amiga_net import audit as au10
+    from knowledgehost.amiga_net import policy as po10
+    with tempfile.TemporaryDirectory() as td10:
+        r10 = Path(td10)
+        (r10 / "bin").mkdir()
+        fake = r10 / "bin" / "podman"
+        fake.write_text('#!/bin/bash\necho "$@" >> "$PODLOG"\n'
+                        '[ "$1" = image ] && exit 1\nexit 0\n')
+        fake.chmod(0o755)
+        pol10 = r10 / "egress.toml"
+        pol10.write_text('[[rule]]\nname = "container-images"\n'
+                         'hosts = ["docker.io"]\nport = 443\n'
+                         'methods = ["GET", "HEAD"]\npurpose = "t"\n'
+                         'ttl_seconds = 60\nmax_uses = 5\n')
+        keep10 = (po10.POLICY_PATH, po10.LEASE_DIR, au10.LOG_PATH)
+        po10.POLICY_PATH, po10.LEASE_DIR = pol10, r10 / "run"
+        au10.LOG_PATH = r10 / "egress.jsonl"
+        old10 = {"PODLOG": os.environ.get("PODLOG"), "PATH": os.environ["PATH"]}
+        os.environ["PODLOG"] = str(r10 / "calls.log")
+        os.environ["PATH"] = f"{r10 / 'bin'}:{os.environ['PATH']}"
+        try:
+            ent10 = {"engine": "container", "runtime": str(fake),
+                     "image": "docker.io/vllm/vllm-openai:v1"}
+            sv._ensure_image(ent10)
+            calls = (r10 / "calls.log").read_text()
+            assert "pull docker.io/vllm/vllm-openai:v1" in calls, calls
+            evs = au10.tail(10)
+            assert any(e["verdict"] == "ALLOWED" and e["rule"] == "container-images"
+                       and "not byte-accounted" in e.get("detail", "") for e in evs)
+            assert any(e["verdict"] == "LEASE_OPEN" for e in evs) and \
+                any(e["verdict"] == "LEASE_CLOSE" for e in evs)
+            # a present image costs one inspect and NO egress
+            fake.write_text('#!/bin/bash\necho "$@" >> "$PODLOG"\nexit 0\n')
+            (r10 / "calls.log").write_text("")
+            sv._ensure_image(ent10)
+            assert "pull" not in (r10 / "calls.log").read_text()
+        finally:
+            po10.POLICY_PATH, po10.LEASE_DIR, au10.LOG_PATH = keep10
+            os.environ["PATH"] = old10["PATH"]
+            if old10["PODLOG"] is None:
+                os.environ.pop("PODLOG", None)
+            else:
+                os.environ["PODLOG"] = old10["PODLOG"]
+    ok("container image pull: policy-leased + audited, never a side effect; "
+       "a present image touches no network")
+
     # ── adopt: legacy hub-cache snapshots -> the models/ store ───────────────
     with tempfile.TemporaryDirectory() as td9:
         root9 = Path(td9)
