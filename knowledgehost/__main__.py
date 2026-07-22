@@ -837,7 +837,7 @@ def main(argv=None):
     ap = argparse.ArgumentParser(prog="knowledgehost",
                                  description="Vinur — a local general-knowledge tool host.")
     ap.add_argument("command", nargs="?", default="serve",
-                    choices=["serve", "ingest", "distill", "recard", "dedupe", "find", "pull", "adjudicate", "reconcile",
+                    choices=["serve", "ingest", "distill", "recard", "dedupe", "find", "pull", "adopt", "adjudicate", "reconcile",
                              "link", "refine", "import-conceptnet", "import-atomic",
                              "import-glucose", "import-causenet", "unimport", "embed-nodes", "build-ann",
                              "optimize", "stats", "reset", "bump-version", "migrate-vocab",
@@ -1109,6 +1109,13 @@ def main(argv=None):
             log.error("find failed: %s", e)
         ops_mod.emit_result(False, query=query)
         return 1
+
+    if args.command == "adopt":                # legacy hub cache -> models/ store
+        store.close()
+        from .serving import adopt_cached
+        n = adopt_cached(args.model or "", say=lambda m: log.info("%s", m))
+        ops_mod.emit_result(True, adopted=n)
+        return 0
 
     if args.command == "pull":                 # model weights via the egress broker
         store.close()

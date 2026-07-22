@@ -45,6 +45,9 @@ case "${1:-}" in
         REV=""
         if [ $# -ge 1 ] && [ "${1#--}" = "$1" ]; then REV="$1"; shift; fi
         exec "$PY" -m knowledgehost pull --model "$M" ${REV:+--revision "$REV"} "$@" ;;
+    adopt)  # legacy HF-cache snapshots -> models/ store (no re-download)
+        shift
+        exec "$PY" -m knowledgehost adopt ${1:+--model "$1"} ;;
     net)    # the egress broker's window: policy, live leases, recent activity
         exec "$PY" -m knowledgehost.amiga_net.status ;;
     *) exec "$PY" -m knowledgehost.supervisor "$@" ;;

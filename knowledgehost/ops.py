@@ -38,6 +38,8 @@ COMMANDS: dict = {
     "find":       {"query": "str", "limit": "int"},
     # model weights via the egress broker (policy-checked, audited, resumable)
     "pull":       {"model": "str", "revision": "str", "include": "str"},
+    # legacy hub-cache snapshots -> the models/ store (no network, no re-download)
+    "adopt":      {"model": "str"},
     # External-dataset bulk imports (KB-only; path defaults to <name>_path in config —
     # the option only overrides it).  Long-running; stream their progress to the log.
     "import-conceptnet": {"path": "path", "min_weight": "float", "all": "bool",
@@ -128,6 +130,13 @@ HELP: dict = {
              "revision": "repo revision (default main)",
              "include": "only repo files matching this glob (a single GGUF quant); "
                         "find fills this in automatically for numbered rows"},
+    "adopt": {"_": "Move models out of the legacy Hugging Face cache "
+                   "(var/cache/huggingface) into the models/ store — the one obvious "
+                   "folder, same layout a pull produces. No network, no re-download: "
+                   "hardlinked when possible, copied otherwise; the cache copy is left "
+                   "for you to delete once happy. Adopted models appear in the Serving "
+                   "tab's pickers (the cache is no longer offered there)",
+              "model": "one HF id (org/Name); empty = every complete cached snapshot"},
     "import-conceptnet": {"_": "Bulk-import the ConceptNet commonsense graph",
                           "path": "assertions.csv dump (default from config)",
                           "min_weight": "drop assertions weaker than this",

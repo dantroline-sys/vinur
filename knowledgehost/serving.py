@@ -986,15 +986,10 @@ def eligible_models(engine: str, root: Path = ROOT, cfg: dict | None = None) -> 
             if mid and pull_mod.pulled(root, mid):
                 gb = round(sum(int(v.get("size") or 0) for v in files.values()) / 2**30, 1)
                 add(mid, gb, "store")
-        hub = hf_cache_dir()
-        if hub.is_dir():
-            for d in sorted(hub.glob("models--*")):
-                snaps = d / "snapshots"
-                if snaps.is_dir() and any(
-                        _snapshot_complete(s) and any(s.glob("*.safetensors"))
-                        for s in snaps.iterdir()):
-                    add(d.name[len("models--"):].replace("--", "/", 1),
-                        round(_tree_size(d) / 2**30, 1), "hub cache")
+        # the legacy hub cache is deliberately NOT offered: models/ is the one
+        # obvious folder.  Cached weights still LOAD (resolve_model passes ids
+        # through and the offline env reads the cache) — `adopt` moves them
+        # into the store without re-downloading.
     elif engine == "llama":
         skip = {EMBED_MODEL_FILE,
                 str((cfg or {}).get("rerank_model") or "bge-reranker-v2-m3-Q8_0.gguf")}
@@ -1006,6 +1001,60 @@ def eligible_models(engine: str, root: Path = ROOT, cfg: dict | None = None) -> 
                 continue                      # later split parts aren't loadable alone
             add(str(p.relative_to(root)), round(p.stat().st_size / 2**30, 2), "models/")
     return out
+
+
+def adopt_cached(model: str = "", root: Path = ROOT, say=print) -> int:
+    """Copy complete legacy hub-cache snapshots into the model store
+    (models/<Org--Name>/, exactly what a broker pull produces, manifest
+    included) so the obvious folder is the only folder.  Hardlinks when the
+    filesystem allows — instant, no extra disk — copies otherwise.  The cache
+    is left in place for you to delete once happy.  Returns snapshots adopted."""
+    import shutil as _sh
+    from .amiga_net import pull as pull_mod
+    hub = hf_cache_dir()
+    if not hub.is_dir():
+        say("no legacy hub cache — nothing to adopt")
+        return 0
+    n = 0
+    for d in sorted(hub.glob("models--*")):
+        mid = d.name[len("models--"):].replace("--", "/", 1)
+        if model and model != mid:
+            continue
+        if pull_mod.pulled(root, mid):
+            say(f"{mid}: already in the store — skipped")
+            continue
+        snaps = d / "snapshots"
+        snap = (next((s for s in sorted(snaps.iterdir()) if _snapshot_complete(s)),
+                     None) if snaps.is_dir() else None)
+        if snap is None:
+            say(f"{mid}: no complete snapshot in the cache — skipped "
+                "(pull it through the broker instead)")
+            continue
+        dest = pull_mod.store_dir(root, mid)
+        manifest = {"model": mid, "revision": snap.name, "files": {},
+                    "adopted_from": str(snap), "pulled_at": time.time()}
+        count = 0
+        for p in sorted(snap.rglob("*")):
+            if not p.is_file():
+                continue
+            rel = p.relative_to(snap)
+            out = dest / rel
+            out.parent.mkdir(parents=True, exist_ok=True)
+            src = p.resolve()                 # snapshots are symlinks into blobs/
+            if out.exists():
+                out.unlink()
+            try:
+                os.link(src, out)
+            except OSError:
+                _sh.copy2(src, out)
+            manifest["files"][str(rel)] = {"size": out.stat().st_size, "sha256": ""}
+            count += 1
+        (dest / ".pull.json").write_text(json.dumps(manifest, indent=1))
+        say(f"{mid}: adopted {count} file(s) -> {dest}")
+        n += 1
+    if not n and not model:
+        say("nothing to adopt — every cached model is already in the store")
+    return n
 
 
 def serving_status(cfg: dict) -> dict:

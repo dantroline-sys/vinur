@@ -863,6 +863,41 @@ def main():
     ok("add_llm_entry: joins the llms group in place, validates name/engine, "
        "first entry into an empty file works")
 
+    # ── adopt: legacy hub-cache snapshots -> the models/ store ───────────────
+    with tempfile.TemporaryDirectory() as td9:
+        root9 = Path(td9)
+        hub9 = root9 / "cache" / "hub"
+        blobs = hub9 / "models--org--legacy" / "blobs"
+        snap9 = hub9 / "models--org--legacy" / "snapshots" / "rev1"
+        blobs.mkdir(parents=True)
+        snap9.mkdir(parents=True)
+        (blobs / "b1").write_bytes(b"W" * 128)
+        (snap9 / "config.json").write_text("{}")
+        os.symlink(blobs / "b1", snap9 / "model.safetensors")
+        env_hf = os.environ.get("HF_HOME")
+        os.environ["HF_HOME"] = str(root9 / "cache")
+        try:
+            said9 = []
+            assert sv.adopt_cached(root=root9, say=said9.append) == 1, said9
+            from knowledgehost.amiga_net import pull as pull9
+            got9 = pull9.pulled(root9, "org/legacy")
+            assert got9 and (got9 / "model.safetensors").read_bytes() == b"W" * 128
+            man9 = _json.loads((got9 / ".pull.json").read_text())
+            assert man9["adopted_from"] and \
+                man9["files"]["model.safetensors"]["size"] == 128
+            # the picker offers the STORE copy; the cache is never offered
+            vll9 = sv.eligible_models("vllm", root=root9)
+            assert [c["model"] for c in vll9] == ["org/legacy"], vll9
+            assert all(c["via"] == "store" for c in vll9)
+            assert sv.adopt_cached(root=root9, say=lambda m: None) == 0  # idempotent
+        finally:
+            if env_hf is None:
+                os.environ.pop("HF_HOME", None)
+            else:
+                os.environ["HF_HOME"] = env_hf
+    ok("adopt_cached: cache snapshot -> models/ (links/copies + manifest), "
+       "idempotent; pickers offer the store only")
+
     # ── Settings › Network: the broker's deliberate, REDACTED settings lane ──
     from knowledgehost.config import net_view, set_net_setting
     with tempfile.TemporaryDirectory() as td7:

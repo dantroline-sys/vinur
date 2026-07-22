@@ -1313,15 +1313,18 @@ function svCache(c) {
     ? ` · <span style="color:var(--warn,#b45309)">${c.incomplete_gb} GB in stale
         <code>*.incomplete</code> blobs</span> (leftovers from interrupted fetches — safe to delete)`
     : '';
+  const adopt = c.exists && c.repos > 0
+    ? ` <b>${c.repos} model(s) still live in this legacy cache</b> — <code>./vinur.sh adopt</code>
+      (or Ops › adopt) moves them into <code>models/</code> with no re-download, and the pickers
+      above only offer the <code>models/</code> store.`
+    : '';
   return `<p style="margin-top:14px;font-size:12px;opacity:.75;line-height:1.7">
-    <b>Downloaded weights live here:</b> <code>${esc(c.path)}</code>
-    ${c.exists ? `— ${c.repos} repo(s), ${c.size_gb} GB${stale}` : '— not created yet (nothing downloaded)'}<br>
-    One folder per repo, <code>models--Org--Name/</code>: <code>blobs/</code> holds the actual
-    (content-addressed) files, <code>snapshots/&lt;revision&gt;/</code> is the readable tree of
-    symlinks into them, <code>refs/</code> pins the revision. Set by
-    <code>HF_HOME</code> — currently ${esc(c.env)} — so nothing lands in <code>~/.cache</code>,
-    and the container engine mounts this same folder. A model given as a local directory path
-    instead of a repo id is read from there and never enters this cache.</p>`;
+    <b>Models live in <code>models/</code></b> off the application root — one readable folder
+    per model (<code>models/Org--Name/</code>), filled by pull.${adopt}<br>
+    The folder below is the <i>legacy</i> Hugging Face cache from before the broker:
+    <code>${esc(c.path)}</code>
+    ${c.exists ? `— ${c.repos} repo(s), ${c.size_gb} GB${stale}` : '— empty (good: everything is in models/)'}.
+    Weights already in it still load, but nothing new lands there.</p>`;
 }
 async function loadServing() {
   // scaffold once: #svlive re-renders on every poll, the get-models section
