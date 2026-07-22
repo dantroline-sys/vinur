@@ -48,11 +48,15 @@ class Downloads:
             cmd += ["--include", include]
         if self.config_path:
             cmd += ["-c", self.config_path]
-        proc = subprocess.Popen(cmd, stdout=lf, stderr=subprocess.STDOUT,
-                                stdin=subprocess.DEVNULL, cwd=str(self.root),
-                                start_new_session=True,
-                                env={**os.environ, "PYTHONUNBUFFERED": "1"})
-        self._live[model] = {"proc": proc, "started": time.time(),
+        try:
+            proc = subprocess.Popen(cmd, stdout=lf, stderr=subprocess.STDOUT,
+                                    stdin=subprocess.DEVNULL, cwd=str(self.root),
+                                    start_new_session=True,
+                                    env={**os.environ, "PYTHONUNBUFFERED": "1"})
+        finally:
+            lf.close()                        # the child holds its own copy —
+        self._live[model] = {"proc": proc,    # keeping ours leaks one fd per pull
+                             "started": time.time(),
                              "include": include, "revision": revision}
         self._done.pop(model, None)
 

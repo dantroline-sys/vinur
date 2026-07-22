@@ -528,7 +528,7 @@ function renderUpkeep(kb, relPerNode) {
 
 async function upkeepRun(cmd) {
   const r = await postJSON('/ops/run', { command: cmd, args: {} })
-    .catch(e => ({ ok: false, error: '' + e }));
+    .catch(e => ({ ok: false, error: netErr(e) }));
   $('#banner').innerHTML = `<div class="note">${r.ok
     ? '▶ ' + esc(cmd) + ' started — follow it under Operations; it will appear as an event line on Stats'
     : '✗ ' + esc(r.error || 'failed — auth token?')}</div>`;
@@ -544,7 +544,7 @@ async function upkeepQueue(cmd) {
   }
   const plan = r0.plan || {};
   (plan.steps = plan.steps || []).push({ command: cmd, args: {}, enabled: true });
-  const r = await postJSON('/ops/autopilot', { plan }).catch(e => ({ ok: false, error: '' + e }));
+  const r = await postJSON('/ops/autopilot', { plan }).catch(e => ({ ok: false, error: netErr(e) }));
   $('#banner').innerHTML = `<div class="note">${r.ok
     ? '✓ ' + esc(cmd) + ' queued as a Prioritizer step — reorder or edit it under Settings → Prioritizer'
     : '✗ ' + esc(r.error || 'failed')}</div>`;
@@ -727,7 +727,7 @@ async function dismissGap(i) {
   const q = (GAPROWS[i] || {}).query_text;
   if (!q) return;
   const r = await postJSON('/gaps/close', { query: q, status: 'dismissed' })
-    .catch(e => ({ ok: false, error: '' + e }));
+    .catch(e => ({ ok: false, error: netErr(e) }));
   $('#banner').innerHTML = `<div class="note">${r.ok
     ? '✓ dismissed ' + (r.closed || 0) + ' gap(s)'
     : '✗ ' + esc(r.error || 'failed — auth token?')}</div>`;
@@ -1006,6 +1006,15 @@ function pfNote(html) {
   const el = $('#opstatus') || $('#banner');            // Ops tab or Serving tab
   if (el) el.innerHTML = html;
 }
+// A dropped/refused connection surfaces as a bare TypeError in fetch —
+// translate it into something a human can act on (the server also answers
+// 500-with-reason now instead of dropping the socket, so this should be rare).
+function netErr(e) {
+  const s = '' + e;
+  return (s.includes('NetworkError') || s.includes('Failed to fetch'))
+    ? "the server didn't answer (restarting, or briefly overloaded?) — try again in a moment"
+    : s;
+}
 async function pfPull(i) {
   const x = PFROWS[i]; if (!x) return;
   const me = $('#op_model'), ie = $('#op_include');     // mirror into the args
@@ -1016,7 +1025,7 @@ async function pfPull(i) {
   // swallow a pull, and the Downloads rows persist (a banner doesn't)
   const r = await postJSON('/serving/pull',
     Object.assign({ model: x.id }, x.include ? { include: x.include } : {}))
-    .catch(e => ({ ok: false, error: '' + e }));
+    .catch(e => ({ ok: false, error: netErr(e) }));
   if (!r.ok) { pfNote('✗ ' + esc(r.error || 'failed')); return; }
   pfNote('⬇ ' + esc(r.note || 'download started') + ' — see the Downloads rows on the Serving tab');
   if ($('#svlive')) pollServing();
@@ -1072,14 +1081,14 @@ async function loadOps() {
 async function runOp() {
   const body = gatherArgs();
   $('#opstatus').textContent = 'launching ' + body.command + '…';
-  const r = await postJSON('/ops/run', body).catch(e => ({ ok: false, error: '' + e }));
+  const r = await postJSON('/ops/run', body).catch(e => ({ ok: false, error: netErr(e) }));
   if (!r.ok) { $('#opstatus').textContent = '✗ ' + (r.error || 'failed'); return; }
   pollOps();
 }
 async function stopOp() { await postJSON('/ops/stop').catch(() => {}); pollOps(); }
 async function reloadKB() {
   $('#opstatus').textContent = 'reloading KB caches…';
-  const r = await postJSON('/ops/reload').catch(e => ({ ok: false, error: '' + e }));
+  const r = await postJSON('/ops/reload').catch(e => ({ ok: false, error: netErr(e) }));
   $('#opstatus').textContent = r.ok ? '✓ KB reloaded' : ('✗ ' + (r.error || 'failed'));
 }
 
@@ -1175,7 +1184,7 @@ async function svPickModel(name, model, prev, sel) {
   if (model === prev) return;
   $('#banner').innerHTML = 'switching <b>' + esc(name) + '</b> to <b>' + esc(model) + '</b>…';
   const r = await postJSON('/serving/model', { name, model })
-    .catch(e => ({ ok: false, error: '' + e }));
+    .catch(e => ({ ok: false, error: netErr(e) }));
   if (!r.ok) { $('#banner').innerHTML = '✗ ' + esc(r.error || 'request failed'); if (sel) sel.value = prev; }
   else $('#banner').innerHTML = '✓ ' + esc(r.note || 'saved');
   if (sel) sel.blur();
@@ -1184,7 +1193,7 @@ async function svPickModel(name, model, prev, sel) {
 async function svcAction(svc, action) {
   $('#banner').innerHTML = `${esc(action)} requested for <b>${esc(svc)}</b>…`;
   const r = await postJSON('/serving/control', { service: svc, action })
-    .catch(e => ({ ok: false, error: '' + e }));
+    .catch(e => ({ ok: false, error: netErr(e) }));
   if (!r.ok) $('#banner').innerHTML = '✗ ' + esc(r.error || 'request failed');
   pollServing();
 }
@@ -1215,7 +1224,7 @@ function svLogPanel() {
 }
 async function doSwap(name) {
   $('#banner').innerHTML = `swapping to <b>${esc(name)}</b> — weights load; this can take minutes…`;
-  const r = await postJSON('/serving/swap', { name }).catch(e => ({ ok: false, error: '' + e }));
+  const r = await postJSON('/serving/swap', { name }).catch(e => ({ ok: false, error: netErr(e) }));
   if (!r.ok) $('#banner').innerHTML = '✗ ' + esc(r.error || 'swap request failed');
   pollServing();
 }
@@ -1337,7 +1346,7 @@ async function dlAct(action, model) {
   if (action === 'discard' && !confirm(`Delete the incomplete download of ${model}?`)) return;
   const r = await postJSON(action === 'resume' ? '/serving/pull' : '/serving/download',
     action === 'resume' ? { model } : { action, model })
-    .catch(e => ({ ok: false, error: '' + e }));
+    .catch(e => ({ ok: false, error: netErr(e) }));
   $('#banner').innerHTML = r.ok ? '✓ ' + esc(r.note || 'done') : '✗ ' + esc(r.error || 'failed');
   pollServing();
 }
@@ -1357,7 +1366,7 @@ function svUnserved(un) {
 }
 async function svAddService(model) {
   $('#banner').innerHTML = `adding a service for <b>${esc(model)}</b>…`;
-  const r = await postJSON('/serving/add', { model }).catch(e => ({ ok: false, error: '' + e }));
+  const r = await postJSON('/serving/add', { model }).catch(e => ({ ok: false, error: netErr(e) }));
   $('#banner').innerHTML = r.ok ? '✓ ' + esc(r.note || 'added') : '✗ ' + esc(r.error || 'failed');
 }
 // Downloaded weights are big and invisible — say where they went, in the tab
@@ -1442,7 +1451,7 @@ async function saveLibraryRoot() {
   const root = ($('#libroot') || {}).value || '';
   $('#banner').innerHTML = 'saving root…';
   const r = await postJSON('/library/root', { root: root.trim() })
-    .catch(e => ({ ok: false, error: '' + e }));
+    .catch(e => ({ ok: false, error: netErr(e) }));
   if (!r.ok) { $('#banner').innerHTML = `<span style="color:#c00">✗ ${esc(r.error || 'failed')}</span>`; return; }
   $('#banner').innerHTML = '<span style="color:#0a0">✓ root saved — tick subfolders, then Save + index now</span>';
   loadLibrary();
@@ -1450,11 +1459,11 @@ async function saveLibraryRoot() {
 async function saveLibrarySelection(index) {
   const active = Array.from(document.querySelectorAll('.libchk:checked')).map(c => c.value);
   $('#banner').innerHTML = 'saving…';
-  const r = await postJSON('/library/config', { active }).catch(e => ({ ok: false, error: '' + e }));
+  const r = await postJSON('/library/config', { active }).catch(e => ({ ok: false, error: netErr(e) }));
   if (!r.ok) { $('#banner').innerHTML = `<span style="color:#c00">✗ ${esc(r.error || 'failed')}</span>`; return; }
   if (index) {
     const j = await postJSON('/ops/run', { command: 'ingest-library', args: {} })
-      .catch(e => ({ ok: false, error: '' + e }));
+      .catch(e => ({ ok: false, error: netErr(e) }));
     $('#banner').innerHTML = j.ok
       ? '<span style="color:#0a0">✓ saved — indexing started (watch it in Operations)</span>'
       : `<span style="color:#c00">saved, but indexing did not start: ${esc(j.error || 'failed')}</span>`;
@@ -1532,14 +1541,14 @@ async function loadBundles() {
 async function saveSource(doc) {
   const g = f => document.querySelector(`[data-doc="${CSS.escape(doc)}"][data-f="${f}"]`).value;
   const r = await postJSON('/source', { doc_id: doc, title: g('title'), bundle: g('bundle'),
-    license: g('license'), license_holder: g('license_holder') }).catch(e => ({ ok: false, error: '' + e }));
+    license: g('license'), license_holder: g('license_holder') }).catch(e => ({ ok: false, error: netErr(e) }));
   $('#banner').innerHTML = `<div class="note">${r.ok ? '✓ saved ' + esc(doc) + ' — ' + esc(r.note || '') : '✗ ' + esc(r.error || 'failed')}</div>`;
   if (r.ok) loadBundles();
 }
 async function brainToggle(name, load) {
   $('#banner').innerHTML = `<div class="note">${load ? 'loading' : 'unloading'} '${esc(name)}' — reassembling…</div>`;
   const r = await postJSON('/brain', { action: load ? 'load' : 'unload', brain: name })
-    .catch(e => ({ ok: false, error: '' + e }));
+    .catch(e => ({ ok: false, error: netErr(e) }));
   $('#banner').innerHTML = `<div class="note">${r.ok ? '✓ ' + esc(r.note || 'done')
     + (r.persisted === false ? ' — <b>not persisted</b> (no config file)' : '')
     : '✗ ' + esc(r.error || 'failed')}</div>`;
@@ -1554,7 +1563,7 @@ async function importBrain() {
   if ($('#braintrust').checked) args.trust = 'keep';
   $('#banner').innerHTML = '<div class="note">importing — watch Operations for progress…</div>';
   const r = await postJSON('/ops/run', { command: 'import-bundle', args })
-    .catch(e => ({ ok: false, error: '' + e }));
+    .catch(e => ({ ok: false, error: netErr(e) }));
   $('#banner').innerHTML = `<div class="note">${r.ok
     ? '✓ import started — see Operations; when it finishes, the brain appears here (load it to serve it)'
     : '✗ ' + esc(r.error || 'failed')}</div>`;
@@ -1565,7 +1574,7 @@ async function ejectBundle(name) {
     + `stripped.\n\n(Want counts first? Cancel, then run eject-bundle with dry_run in Operations.)`))
     return;
   const r = await postJSON('/ops/run', { command: 'eject-bundle', args: { bundle: name } })
-    .catch(e => ({ ok: false, error: '' + e }));
+    .catch(e => ({ ok: false, error: netErr(e) }));
   $('#banner').innerHTML = `<div class="note">${r.ok
     ? '✓ eject started — see Operations; reload this tab when it finishes'
     : '✗ ' + esc(r.error || 'failed')}</div>`;
@@ -1573,7 +1582,7 @@ async function ejectBundle(name) {
 async function applyScenario() {
   const name = $('#scensel') ? $('#scensel').value : '';
   $('#banner').innerHTML = `<div class="note">reassembling scenario '${esc(name)}' — this may take a moment…</div>`;
-  const r = await postJSON('/scenario', { scenario: name }).catch(e => ({ ok: false, error: '' + e }));
+  const r = await postJSON('/scenario', { scenario: name }).catch(e => ({ ok: false, error: netErr(e) }));
   $('#banner').innerHTML = `<div class="note">${r.ok
     ? "✓ now serving '" + esc(r.scenario) + "' — " + (r.counts ? JSON.stringify(r.counts) : '')
     : '✗ ' + esc(r.error || 'failed')}</div>`;
@@ -1697,7 +1706,7 @@ function addAutopilotStep() { APLAN = _readAutopilotForm();
   renderAutopilot(APSTATE); }
 async function saveAutopilot() {
   const plan = _readAutopilotForm();
-  const r = await postJSON('/ops/autopilot', { plan }).catch(e => ({ ok: false, error: '' + e }));
+  const r = await postJSON('/ops/autopilot', { plan }).catch(e => ({ ok: false, error: netErr(e) }));
   $('#banner').innerHTML = `<div class="note">${r.ok ? '✓ plan saved' : '✗ ' + esc(r.error || 'failed')}</div>`;
   if (r.ok) loadAutopilot();
 }
@@ -1727,7 +1736,7 @@ async function saveSettings() {
     if (changed) updates[k] = v;
   });
   if (!Object.keys(updates).length) { $('#banner').innerHTML = '<div class="note">no changes</div>'; return; }
-  const r = await postJSON('/config', { updates }).catch(e => ({ ok: false, error: '' + e }));
+  const r = await postJSON('/config', { updates }).catch(e => ({ ok: false, error: netErr(e) }));
   $('#banner').innerHTML = `<div class="note">${r.ok
     ? '✓ saved ' + Object.keys(r.applied || {}).length + ' setting(s) — ' + esc(r.note || '')
     : '✗ ' + esc(r.error || 'failed')}</div>`;
@@ -1772,7 +1781,7 @@ async function savePath(key) {
   const el = document.querySelector(`#results [data-pk="${key}"]`);
   if (!el) return;
   const r = await postJSON('/settings/paths', { key, value: el.value })
-    .catch(e => ({ ok: false, error: '' + e }));
+    .catch(e => ({ ok: false, error: netErr(e) }));
   $('#banner').innerHTML = `<div class="note">${r.ok
     ? '✓ ' + esc(key) + ' saved — ' + esc(r.note || '')
     : '✗ ' + esc(r.error || 'failed')}</div>`;
@@ -1876,7 +1885,7 @@ function netEvents(evs, auditPath) {
 }
 async function netAct(action, rule, enabled) {
   const body = action === 'rule' ? { action, rule, enabled } : { action, rule };
-  const r = await postJSON('/net', body).catch(e => ({ ok: false, error: '' + e }));
+  const r = await postJSON('/net', body).catch(e => ({ ok: false, error: netErr(e) }));
   $('#banner').innerHTML = `<div class="note">${r.ok ? '✓ ' + esc(r.note || 'done') : '✗ ' + esc(r.error || 'failed')}</div>`;
   if (r.ok) loadNetwork();
 }
@@ -1905,14 +1914,14 @@ function netPosture(p) {
 async function saveNet(key) {
   const el = document.querySelector(`#results [data-nk="${key}"]`);
   if (!el) return;
-  const r = await postJSON('/net', { key, value: el.value }).catch(e => ({ ok: false, error: '' + e }));
+  const r = await postJSON('/net', { key, value: el.value }).catch(e => ({ ok: false, error: netErr(e) }));
   $('#banner').innerHTML = `<div class="note">${r.ok
     ? '✓ ' + esc(key) + ' saved — ' + esc(r.note || '')
     : '✗ ' + esc(r.error || 'failed')}</div>`;
   if (r.ok) loadNetwork();
 }
 async function clearHfToken() {
-  const r = await postJSON('/net', { key: 'hf_token', value: '' }).catch(e => ({ ok: false, error: '' + e }));
+  const r = await postJSON('/net', { key: 'hf_token', value: '' }).catch(e => ({ ok: false, error: netErr(e) }));
   $('#banner').innerHTML = `<div class="note">${r.ok ? '✓ hf_token cleared' : '✗ ' + esc(r.error || 'failed')}</div>`;
   if (r.ok) loadNetwork();
 }
@@ -2228,7 +2237,7 @@ async function dropMark() {
   const label = prompt('Mark label — what did you just change?  (e.g. distill_parallel=8)');
   if (!label || !label.trim()) return;
   const r = await postJSON('/metrics/mark', { label: label.trim() })
-    .catch(e => ({ ok: false, error: '' + e }));
+    .catch(e => ({ ok: false, error: netErr(e) }));
   $('#banner').innerHTML = `<div class="note">${r.ok ? '⚑ marked: ' + esc(r.label)
     : '✗ ' + esc(r.error || 'failed — auth token?')}</div>`;
   if (r.ok) loadStatsTab(true);

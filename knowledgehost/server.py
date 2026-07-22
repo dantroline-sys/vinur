@@ -175,7 +175,38 @@ class Handler(BaseHTTPRequestHandler):
             pass
         return h
 
+    # A handler exception must NEVER drop the socket without a response —
+    # the browser then reports only "NetworkError when attempting to fetch
+    # resource", which names nothing.  Answer 500 with the real error and
+    # keep the traceback in the server log.
     def do_GET(self):
+        try:
+            return self._do_GET()
+        except (BrokenPipeError, ConnectionResetError):
+            pass                                   # the client went away — fine
+        except Exception as e:
+            self._crash_reply(e)
+
+    def do_POST(self):
+        try:
+            return self._do_POST()
+        except (BrokenPipeError, ConnectionResetError):
+            pass
+        except Exception as e:
+            self._crash_reply(e)
+
+    def _crash_reply(self, e):
+        import traceback
+        log.error("handler crashed on %s %s:\n%s", self.command, self.path,
+                  traceback.format_exc())
+        try:
+            self._send_json({"ok": False, "error":
+                             f"server error: {type(e).__name__}: {e} "
+                             "(full traceback in the kb log)"}, 500)
+        except Exception:
+            pass                                   # headers already gone — nothing to save
+
+    def _do_GET(self):
         parsed = urlparse(self.path)
         path = parsed.path
         q = parse_qs(parsed.query)
@@ -503,7 +534,7 @@ class Handler(BaseHTTPRequestHandler):
             return self._send_json({"ok": True, **library_status(self.cfg)})
         return self._send_json({"ok": False, "error": "not found"}, 404)
 
-    def do_POST(self):
+    def _do_POST(self):
         path = urlparse(self.path).path
         if path not in ("/call", "/ops/run", "/ops/stop", "/ops/reload", "/config",
                         "/ops/autopilot", "/library/config", "/library/root",
@@ -887,6 +918,11 @@ class Handler(BaseHTTPRequestHandler):
 
 class KnowledgeHostServer(ThreadingHTTPServer):
     daemon_threads = True
+    # The stdlib default accept backlog is FIVE.  A panel polling every 2.5s
+    # (sometimes from several windows) while a status response is slow can
+    # overflow that, and refused loopback connections surface in the browser
+    # as bare "NetworkError" with nothing in any log.
+    request_queue_size = 32
     allow_reuse_address = True
 
     def __init__(self, cfg, store, tools, kb=None):
