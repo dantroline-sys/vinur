@@ -168,67 +168,106 @@ def pick(n: int, root: Path | None = None) -> tuple[str, str] | None:
         return None
 
 
-def find(query: str, root: Path | None = None, limit: int = 8, say=print,
-         budget_bytes: int | None = None, budget_label: str = "") -> int:
-    """Search, size, judge, print, and save the numbered picks.  Returns the
-    number of selectable rows."""
+def gather(query: str, root: Path | None = None, limit: int = 8,
+           budget_bytes: int | None = None, budget_label: str = "",
+           engines: set | None = None, fit_only: bool = False) -> dict:
+    """Search + size + judge, structured — the panel's pick-list and find()'s
+    data.  `engines` (config vocabulary: vllm/container/llama) keeps only rows
+    something in this box's [serving] table can actually run; `fit_only` drops
+    what can't fit the memory budget.  Hidden rows are counted, never silent.
+    Saves the numbered picks, so pull-by-number matches what was shown."""
     root = root or _ROOT
     if budget_bytes is None:
         budget_bytes, budget_label = budget()
+    want_vllm = not engines or bool({"vllm", "container"} & engines)
+    want_llama = not engines or "llama" in engines
     with broker.lease(f"model search: {query}", rule_name="huggingface"):
         cands = search(query, limit=limit)
         for c in cands:
             _sized(c)
-    if not cands:
-        say(f"find '{query}': the hub returned nothing — try fewer words")
-        return 0
 
-    say(f"find '{query}' — judging against {budget_label}:")
-    picks: list[dict] = []
-
-    def row(text: str) -> str:
-        picks.append({})                      # replaced by the caller right after
-        return f"{len(picks):3d}  {text}"
-
+    rows: list[dict] = []
+    hidden = {"engine": 0, "fit": 0}
     for c in cands:
-        pulls = f"{_human(c['downloads'])} pulls"
         hint = _fmt_hint(c)
         # which engine serves this: GGUF files are the llama engine's food,
         # safetensors repos feed the vllm/container engines
         gguf = bool(c.get("quants")) or hint == "gguf"
-        eng = "llama.cpp" if gguf else "vllm"
-        tail = "[" + " · ".join(x for x in (eng, "" if gguf else hint, pulls) if x) + "]"
+        engine = "llama" if gguf else "vllm"
+        if (engine == "llama" and not want_llama) or (engine == "vllm" and not want_vllm):
+            hidden["engine"] += 1
+            continue
+        base = {"id": c["id"], "engine": engine, "downloads": c["downloads"],
+                "format": "" if gguf else hint}
         if c.get("blocked"):
-            say(row(f"{c['id']:<44} gated — accept its licence on "
-                    f"huggingface.co (and set hf_token), then pull  {tail}"))
-            picks[-1] = {"id": c["id"], "include": "",
-                         "engine": "llama" if gguf else "vllm"}
+            rows.append({**base, "include": "", "label": c["id"], "size_gb": None,
+                         "verdict": "gated",
+                         "why": "accept its licence on huggingface.co "
+                                "(and set hf_token), then pull"})
         elif c.get("quants"):
-            say(f"     {c['id']} — GGUF repo, pick a file:  {tail}")
-            shown = [q for q in c["quants"]
-                     if not budget_bytes or fit(q[1], budget_bytes)[0] != "too big"]
-            shown = shown[:4] or c["quants"][-1:]     # nothing fits -> the smallest
+            fitting = [q for q in c["quants"]
+                       if not budget_bytes or fit(q[1], budget_bytes)[0] != "too big"]
+            shown = fitting[:4] if fitting else \
+                ([] if fit_only else c["quants"][-1:])    # nothing fits -> smallest
+            hidden["fit"] += len(c["quants"]) - len(shown)
             for key, size in shown:
                 m = _QUANT.search(Path(key).stem)
-                label = m.group(1) if m else Path(key).stem
                 verdict, why = fit(size, budget_bytes)
-                say(row(f"  {label:<12} {size / GiB:6.1f} GB  {verdict:<8} {why}"))
-                picks[-1] = {"id": c["id"], "include": key[:-len(".gguf")] + "*",
-                             "engine": "llama"}
-            if len(shown) < len(c["quants"]):
-                say(f"       … {len(c['quants']) - len(shown)} more quantisation(s) "
-                    "not shown (won't fit / smaller than needed)")
+                rows.append({**base, "include": key[:-len(".gguf")] + "*",
+                             "label": m.group(1) if m else Path(key).stem,
+                             "size_gb": round(size / GiB, 1),
+                             "verdict": verdict, "why": why})
         else:
             size = int(c.get("bytes") or 0)
             verdict, why = fit(size, budget_bytes)
-            say(row(f"{c['id']:<44} {size / GiB:6.1f} GB  {verdict:<8} {why}  {tail}"))
-            picks[-1] = {"id": c["id"], "include": "", "engine": "vllm"}
+            if fit_only and verdict == "too big":
+                hidden["fit"] += 1
+                continue
+            rows.append({**base, "include": "", "label": c["id"],
+                         "size_gb": round(size / GiB, 1),
+                         "verdict": verdict, "why": why})
 
+    picks = [{"id": r["id"], "include": r["include"], "engine": r["engine"]}
+             for r in rows]
     path = _picks_path(root)
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps({"query": query, "at": time.time(), "picks": picks},
                                indent=1))
+    return {"query": query, "budget_label": budget_label, "rows": rows,
+            "hidden": hidden}
+
+
+def find(query: str, root: Path | None = None, limit: int = 8, say=print,
+         budget_bytes: int | None = None, budget_label: str = "") -> int:
+    """The CLI face of gather(): print the numbered list, return the row
+    count.  No filtering here — the terminal reader sees everything, tagged."""
+    g = gather(query, root=root, limit=limit,
+               budget_bytes=budget_bytes, budget_label=budget_label)
+    rows = g["rows"]
+    if not rows:
+        say(f"find '{query}': the hub returned nothing — try fewer words")
+        return 0
+    say(f"find '{query}' — judging against {g['budget_label']}:")
+    last_repo = None
+    for n, r in enumerate(rows, 1):
+        pulls = f"{_human(r['downloads'])} pulls"
+        eng = "llama.cpp" if r["engine"] == "llama" else "vllm"
+        tail = "[" + " · ".join(x for x in (eng, r["format"], pulls) if x) + "]"
+        if r["include"]:                              # a GGUF quant row
+            if r["id"] != last_repo:
+                say(f"     {r['id']} — GGUF repo, pick a file:  {tail}")
+            say(f"{n:3d}    {r['label']:<12} {r['size_gb']:6.1f} GB  "
+                f"{r['verdict']:<8} {r['why']}")
+        elif r["verdict"] == "gated":
+            say(f"{n:3d}  {r['id']:<44} gated — {r['why']}  {tail}")
+        else:
+            say(f"{n:3d}  {r['id']:<44} {r['size_gb']:6.1f} GB  "
+                f"{r['verdict']:<8} {r['why']}  {tail}")
+        last_repo = r["id"]
+    if g["hidden"]["fit"]:
+        say(f"       … {g['hidden']['fit']} more quantisation(s) "
+            "not shown (won't fit / smaller than needed)")
     say("pull one:  ./vinur.sh pull <row number>     (or ./vinur.sh pull org/Name)")
     say("engine tags: [vllm] = safetensors for the vllm/container engines; "
         "[llama.cpp] = GGUF files for engine = \"llama\" entries")
-    return len(picks)
+    return len(rows)

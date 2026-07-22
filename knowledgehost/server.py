@@ -321,6 +321,36 @@ class Handler(BaseHTTPRequestHandler):
                 return self._send_json({"ok": True, **sv.serving_status(self.cfg)})
             except Exception as e:                 # pragma: no cover - defensive
                 return self._send_json({"ok": False, "error": f"{type(e).__name__}: {e}"}, 500)
+        if path == "/serving/find":                # Ops › pull: hub-search pick-list
+            # Synchronous by design: a search is a few broker calls (one
+            # lease), and the caller wants a table, not a log to tail.  By
+            # default rows are filtered to what THIS box can actually run —
+            # engines declared in [serving] and models that fit its memory —
+            # with the hidden counts reported, never silent.  all=1 lifts it.
+            if not self._authed():
+                return self._send_json({"ok": False, "error": "unauthorized"}, 401)
+            from . import modelfind
+            from . import serving as sv
+            query = (q.get("q") or [""])[0].strip()
+            if not query:
+                return self._send_json({"ok": False, "error": "q required"}, 400)
+            try:
+                limit = min(int((q.get("limit") or ["8"])[0]), 12)
+            except ValueError:
+                limit = 8
+            show_all = (q.get("all") or ["0"])[0] == "1"
+            declared = {str(e.get("engine") or "") for e in self.cfg["serving"]["llms"]}
+            declared.discard("")
+            os.environ.update(sv.proxy_env(self.cfg))
+            try:
+                g = modelfind.gather(query, limit=limit,
+                                     engines=None if show_all or not declared else declared,
+                                     fit_only=not show_all)
+            except Exception as e:
+                return self._send_json(
+                    {"ok": False, "error": f"{type(e).__name__}: {e}"}, 502)
+            return self._send_json({"ok": True, **g,
+                                    "filtered": not show_all and bool(declared)})
         if path == "/serving/log":                 # Serving tab: one service's log tail
             if not self._authed():
                 return self._send_json({"ok": False, "error": "unauthorized"}, 401)

@@ -116,7 +116,9 @@ HELP: dict = {
              "query": "search words, e.g. 'qwen3 32b fp8'",
              "limit": "max candidates to size up (default 8)"},
     "pull": {"_": "Download model weights through the egress broker into the local "
-                  "model store (models/<Org--Name>/). Policy-checked against "
+                  "model store (models/<Org--Name>/). The Search box below finds "
+                  "candidates by name — sized, fit-judged for this machine, and "
+                  "pullable in one click. Policy-checked against "
                   "egress.toml, audited to var/log/egress.jsonl, resumable "
                   "(aria2c-accelerated when installed, wget or a built-in stream "
                   "otherwise), sha256-verified against the hub's published digests. "

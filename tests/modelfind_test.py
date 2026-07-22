@@ -202,5 +202,30 @@ with broker.lease("t", "huggingface"):
 assert [c["id"] for c in cands] == ["org/dense-fp8", "org/dense-huge"]
 ok("search(): honours limit, keeps hub order (most downloaded first)")
 
+# ── gather(): the panel's structured pick-list, filtered but never silent ───
+g = modelfind.gather("tiny", root=TD, budget_bytes=BUDGET, budget_label="test",
+                     engines={"vllm"}, fit_only=True)
+ids = [r["id"] for r in g["rows"]]
+assert "org/tiny-GGUF" not in ids, "no llama entry declared -> GGUF rows hidden"
+assert g["hidden"]["engine"] == 1, g["hidden"]
+assert "org/dense-huge" not in ids and g["hidden"]["fit"] == 1, g["hidden"]
+assert "org/dense-fp8" in ids and "org/locked" in ids
+locked = next(r for r in g["rows"] if r["id"] == "org/locked")
+assert locked["verdict"] == "gated" and locked["size_gb"] is None
+dense = next(r for r in g["rows"] if r["id"] == "org/dense-fp8")
+assert dense == {"id": "org/dense-fp8", "engine": "vllm", "downloads": 3_100_000,
+                 "format": "fp8", "include": "", "label": "org/dense-fp8",
+                 "size_gb": 35.0, "verdict": "fits", "why": dense["why"]}
+ok("gather(): engine + fit filters drop the unusable, hidden counts say so, "
+   "gated rows stay marked")
+
+g2 = modelfind.gather("tiny", root=TD, budget_bytes=BUDGET, budget_label="test",
+                      engines={"llama"}, fit_only=True)
+assert all(r["engine"] == "llama" for r in g2["rows"]) and g2["rows"], g2
+assert g2["hidden"]["engine"] == 3, "dense + gated vllm rows hidden for a llama-only box"
+saved = json.loads((TD / "var/run/find.json").read_text())["picks"]
+assert len(saved) == len(g2["rows"]), "pull-by-number matches the LAST list shown"
+ok("gather(): a llama-only box sees only GGUF rows; picks track the last list")
+
 srv.shutdown()
 print(f"modelfind_test: {OK} checks OK")

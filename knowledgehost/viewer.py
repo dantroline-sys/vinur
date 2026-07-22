@@ -930,7 +930,84 @@ function renderOpOptions(cmd) {
   const summary = (help._ || '');
   return (summary ? `<span style="opacity:.6;font-size:12px">${esc(summary)} — </span>` : '') + fields;
 }
-function onCmdChange() { const c = $('#opcmd'); if (c) $('#opopts').innerHTML = renderOpOptions(c.value); }
+function onCmdChange() {
+  const c = $('#opcmd'); if (!c) return;
+  $('#opopts').innerHTML = renderOpOptions(c.value)
+    + (c.value === 'pull' || c.value === 'find' ? pullFindUI() : '');
+}
+// ── Ops › pull: search the hub right here, pick a row, pull it ──────────────
+// One search box instead of the find-job-then-read-the-log dance.  Results
+// are filtered to what THIS box can actually run: engines declared in
+// [serving], models that fit its memory.  Hidden rows are counted, not silent.
+let PFROWS = [];
+function pullFindUI() {
+  return `<div style="margin-top:10px;padding:10px;border:1px solid #4443;border-radius:6px">
+    <b style="font-size:13px">Search the hub</b>
+    <span style="opacity:.6;font-size:12px"> — sized and judged for this machine, through the egress broker</span><br>
+    <div style="margin-top:6px;display:flex;gap:6px;align-items:center;flex-wrap:wrap">
+      <input id="pfq" style="width:250px" placeholder="e.g. qwen3 32b fp8"
+        onkeydown="if(event.key==='Enter')pfSearch()">
+      <button class="toolbtn" onclick="pfSearch()">Search</button>
+      <label style="font-size:12px;opacity:.8" title="also list models that will not fit this machine's memory, and formats no declared engine can serve">
+        <input type="checkbox" id="pfall"> show unusable too</label>
+    </div>
+    <div id="pfres" style="margin-top:8px;font-size:13px"></div></div>`;
+}
+function pfVerdict(v) {
+  const c = v === 'fits' ? '#22aa66' : v === 'tight' ? '#e0a800'
+    : v === 'gated' ? '#7a7fd0' : '#cc4444';
+  return `<span class="badge" style="background:${c}33;border-color:${c}66">${esc(v)}</span>`;
+}
+function pfPulls(n) {
+  return n >= 1e6 ? (n / 1e6).toFixed(1) + 'M' : n >= 1e3 ? (n / 1e3).toFixed(0) + 'k' : '' + n;
+}
+function pfHidden(r) {
+  const h = r.hidden || {}, bits = [];
+  if (h.fit) bits.push(`${h.fit} won't fit this machine`);
+  if (h.engine) bits.push(`${h.engine} for engines this box doesn't serve`);
+  return bits.length ? ` · hidden: ${bits.join(', ')} — tick "show unusable" to see them` : '';
+}
+async function pfSearch() {
+  const q = $('#pfq').value.trim(); if (!q) return;
+  $('#pfres').innerHTML = '<span style="opacity:.7">searching the hub (through the egress broker)…</span>';
+  let r; try {
+    r = await (await authFetch('/serving/find?q=' + encodeURIComponent(q)
+      + ($('#pfall').checked ? '&all=1' : ''))).json();
+  } catch (e) { $('#pfres').textContent = 'request failed: ' + e; return; }
+  if (!r.ok) { $('#pfres').innerHTML = '✗ ' + esc(r.error || 'search failed'); return; }
+  PFROWS = r.rows || [];
+  if (!PFROWS.length) {
+    $('#pfres').innerHTML = 'nothing usable found' + esc(pfHidden(r)) + ' — try other words';
+    return;
+  }
+  const rows = PFROWS.map((x, i) => `<tr>
+    <td><span class="badge">${x.engine === 'llama' ? 'llama.cpp' : 'vllm'}</span></td>
+    <td>${esc(x.id)}${x.include ? ` <span style="opacity:.6">· ${esc(x.label)}</span>` : ''}</td>
+    <td style="text-align:right;white-space:nowrap">${x.size_gb == null ? '?' : x.size_gb + ' GB'}</td>
+    <td title="${esc(x.why || '')}">${pfVerdict(x.verdict)}</td>
+    <td style="opacity:.6;text-align:right">${pfPulls(x.downloads || 0)}</td>
+    <td>${x.verdict === 'gated'
+      ? `<span style="font-size:12px;opacity:.75" title="${esc(x.why)}">🔒 licence first</span>`
+      : `<button class="toolbtn" style="font-size:12px;padding:2px 10px" onclick="pfPull(${i})">Pull</button>`}
+    </td></tr>`).join('');
+  $('#pfres').innerHTML = `<div style="opacity:.6;font-size:12px;margin-bottom:4px">
+      judged against ${esc(r.budget_label || 'unknown hardware')}${esc(pfHidden(r))}</div>
+    <table><tr><th>engine</th><th>model</th><th>size</th><th>fits?</th><th>pulls</th><th></th></tr>${rows}</table>
+    <div style="opacity:.55;font-size:12px;margin-top:4px">hover a verdict for the arithmetic —
+      Pull streams into the log below; once done the model appears in the Serving tab's picker</div>`;
+}
+async function pfPull(i) {
+  const x = PFROWS[i]; if (!x) return;
+  const me = $('#op_model'), ie = $('#op_include');     // mirror into the args
+  if (me) me.value = x.id;                              // editor so what runs
+  if (ie) ie.value = x.include || '';                   // is what's shown
+  $('#opstatus').textContent = `launching pull ${x.id}…`;
+  const args = Object.assign({ model: x.id }, x.include ? { include: x.include } : {});
+  const r = await postJSON('/ops/run', { command: 'pull', args })
+    .catch(e => ({ ok: false, error: '' + e }));
+  if (!r.ok) { $('#opstatus').textContent = '✗ ' + (r.error || 'failed'); return; }
+  pollOps();
+}
 function gatherArgs() {
   const cmd = $('#opcmd').value, spec = OPSPEC[cmd] || {}, args = {};
   for (const [opt, t] of Object.entries(spec)) {
