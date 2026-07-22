@@ -31,3 +31,8 @@ external/*
 *.swp
 .idea/
 .vscode/
+
+# Pulled model snapshots (egress broker) + prebuilt/in-tree binaries — data,
+# never tracked.  egress.toml (the policy) IS tracked: edit it like a firewall.
+/models/
+/bin/

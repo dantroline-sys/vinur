@@ -153,7 +153,8 @@ PY
   [ "$WITH_LANCE" -eq 1 ] && PKGS+=("lancedb" "pyarrow" "pylance")
   if [ "${#PKGS[@]}" -gt 0 ]; then
     say "installing: ${PKGS[*]}"
-    "$PY" -m pip install --upgrade "${PKGS[@]}"
+    # via uv (A-7: no bare pip) — same resolver and cache as the lockfile sync
+    vk_uv pip install --python "$PY" --upgrade "${PKGS[@]}"
   else
     say "stdlib-only install (no pip packages requested)"
   fi
