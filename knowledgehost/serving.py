@@ -834,6 +834,43 @@ def weights_status(engine: str, model: str) -> dict:
             if local:
                 return {"status": "ready", "path": str(local),
                         "size_gb": round(_tree_size(local) / 2**30, 1)}
+            # a pull mid-flight (or interrupted): the Serving tab must show a
+            # LIVE download, not "missing", while the broker is filling the store
+            sd = pull_mod.store_dir(ROOT, model)
+            if sd.is_dir():
+                parts = sorted(p for p in sd.rglob("*.part") if p.is_file())
+                done = [p for p in sd.rglob("*")
+                        if p.is_file() and not p.name.endswith(".part")
+                        and p.name != ".pull.json"]
+                if parts or done:
+                    out = {"path": str(sd),
+                           "size_gb": round(_tree_size(sd) / 2**30, 1)}
+                    if parts:
+                        try:
+                            age = time.time() - max(f.stat().st_mtime for f in parts)
+                        except (OSError, ValueError):
+                            age = None
+                        out["idle_s"] = round(age) if age is not None else None
+                        if age is not None and age > 120:
+                            out.update(status="stalled",
+                                       detail=f"a pull left {len(parts)} file(s) "
+                                              "mid-download and NOTHING has been written "
+                                              f"for {_ago(age)} — re-run it (Ops › pull); "
+                                              "partial files resume, nothing restarts "
+                                              "from zero")
+                        else:
+                            out.update(status="incomplete",
+                                       detail=f"downloading now — {len(done)} file(s) "
+                                              f"done, {len(parts)} in flight, last "
+                                              "written "
+                                              f"{_ago(age) if age is not None else 'just now'}"
+                                              " ago")
+                    else:
+                        out.update(status="incomplete",
+                                   detail=f"{len(done)} file(s) here but the pull never "
+                                          "finished — re-run it to fetch the rest "
+                                          "(resumable)")
+                    return out
         d = hf_cache_dir() / ("models--" + model.replace("/", "--"))
         if not d.is_dir():
             return {"status": "missing",

@@ -760,6 +760,33 @@ def main():
     ok("eligible_models: complete safetensors stores for vllm; GGUFs for llama "
        "(first split part only, embed model excluded)")
 
+    # ── a broker pull in flight is a LIVE download on the Serving tab ───────
+    with tempfile.TemporaryDirectory() as td6:
+        root6 = Path(td6)
+        sd6 = root6 / "models" / "org--pulling"
+        sd6.mkdir(parents=True)
+        (sd6 / "config.json").write_bytes(b"{}")
+        (sd6 / "model.safetensors.part").write_bytes(b"x" * 2048)
+        root0 = sv.ROOT
+        try:
+            sv.ROOT = root6
+            ws = sv.weights_status("vllm", "org/pulling")
+            assert ws["status"] == "incomplete" and "downloading now" in ws["detail"], ws
+            assert "1 file(s) done, 1 in flight" in ws["detail"], ws
+            old6 = time.time() - 3600
+            os.utime(sd6 / "model.safetensors.part", (old6, old6))
+            ws = sv.weights_status("vllm", "org/pulling")
+            assert ws["status"] == "stalled" and ws["idle_s"] >= 3500, ws
+            assert "re-run it" in ws["detail"], ws
+            (sd6 / "model.safetensors.part").unlink()
+            ws = sv.weights_status("vllm", "org/pulling")
+            assert ws["status"] == "incomplete" and "never finished" in ws["detail"], ws
+            assert sv.weights_status("vllm", "org/absent6")["status"] == "missing"
+        finally:
+            sv.ROOT = root0
+    ok("weights_status: a store pull reads downloading / stalled / interrupted "
+       "live — never 'missing' mid-pull")
+
     # ── update_llm_model: the picker's config.toml rewrite ───────────────────
     from knowledgehost.config import update_llm_model
     with tempfile.TemporaryDirectory() as td5:

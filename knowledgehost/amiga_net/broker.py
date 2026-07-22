@@ -21,6 +21,8 @@ import hashlib
 import os
 import shutil
 import subprocess
+import threading
+import time
 import urllib.error
 import urllib.request
 from pathlib import Path
@@ -138,9 +140,11 @@ def _engine() -> str:
 
 
 def _dl_aria2c(url: str, dest: Path, headers: dict, timeout: float) -> None:
+    # engines run silent (--summary-interval=0, -q): the broker's own watcher
+    # prints ONE progress format whichever engine is doing the work
     cmd = ["aria2c", "-c", "-x4", "-s4", "--file-allocation=none",
            "--auto-file-renaming=false", "--allow-overwrite=true",
-           "--console-log-level=warn", "--summary-interval=15",
+           "--console-log-level=warn", "--summary-interval=0",
            "-d", str(dest.parent), "-o", dest.name, url]
     for k, v in headers.items():
         cmd[1:1] = [f"--header={k}: {v}"]
@@ -148,7 +152,7 @@ def _dl_aria2c(url: str, dest: Path, headers: dict, timeout: float) -> None:
 
 
 def _dl_wget(url: str, dest: Path, headers: dict, timeout: float) -> None:
-    cmd = ["wget", "-c", "-q", "--show-progress", "-O", str(dest), url]
+    cmd = ["wget", "-c", "-q", "-O", str(dest), url]
     for k, v in headers.items():
         cmd[1:1] = [f"--header={k}: {v}"]
     subprocess.run(cmd, check=True, timeout=timeout)
@@ -180,11 +184,33 @@ def _dl_stdlib(url: str, dest: Path, headers: dict, timeout: float) -> None:
             f.write(block)
 
 
+def _left(s: float) -> str:
+    s = int(s)
+    if s >= 3600:
+        return f"{s // 3600}h{(s % 3600) // 60:02d}m"
+    return f"{s // 60}m{s % 60:02d}s" if s >= 60 else f"{s}s"
+
+
+def _progress_line(have: int, total: int, rate: float) -> str:
+    gb = have / 2**30
+    speed = f"{rate / 2**20:.0f} MB/s"
+    if total:
+        eta = f" · ~{_left((total - have) / rate)} left" if rate > 1e5 and have < total else ""
+        return f"      … {gb:.2f} / {total / 2**30:.2f} GB ({100 * have / total:.0f}%) · {speed}{eta}"
+    return f"      … {gb:.2f} GB · {speed}"
+
+
 def download(purpose: str, url: str, dest: Path, *, sha256: str = "",
-             timeout: float = 14400.0, headers: dict | None = None) -> Path:
+             size: int = 0, timeout: float = 14400.0, headers: dict | None = None,
+             progress=None) -> Path:
     """A big allowed transfer: resumable (a .part file survives interruption),
     engine-accelerated when aria2c/wget exist, sha256-verified when the caller
-    knows the digest.  Audited with real byte counts."""
+    knows the digest.  Audited with real byte counts.
+
+    `progress` (a print-like callable) gets one line every AMIGA_PROGRESS_S
+    seconds (default 15) — bytes so far, %, speed, ETA when `size` is known —
+    measured from the .part file itself, so the format is identical whichever
+    engine is transferring."""
     rule = _check(purpose, url, "GET")
     dest = Path(dest)
     dest.parent.mkdir(parents=True, exist_ok=True)
@@ -196,14 +222,41 @@ def download(purpose: str, url: str, dest: Path, *, sha256: str = "",
 
     resumed_from = part.stat().st_size if part.exists() else 0
     eng = _engine()
-    if eng == "aria2c":
-        _dl_aria2c(url, part, hdrs, timeout)
-    elif eng == "wget":
-        _dl_wget(url, part, hdrs, timeout)
-    else:
-        _dl_stdlib(url, part, hdrs, timeout)
+    stop = None
+    if progress is not None:
+        interval = float(os.environ.get("AMIGA_PROGRESS_S", "15") or 15)
+        if interval > 0:
+            stop = threading.Event()
+
+            def _watch(prev=resumed_from, prev_t=time.time()):
+                while not stop.wait(interval):
+                    try:
+                        have = part.stat().st_size if part.exists() else 0
+                    except OSError:
+                        continue
+                    now = time.time()
+                    rate = max(0, have - prev) / max(1e-9, now - prev_t)
+                    prev, prev_t = have, now
+                    try:
+                        progress(_progress_line(have, size, rate))
+                    except Exception:
+                        return                # a dead log sink must not kill the fetch
+
+            threading.Thread(target=_watch, daemon=True).start()
+    try:
+        if eng == "aria2c":
+            _dl_aria2c(url, part, hdrs, timeout)
+        elif eng == "wget":
+            _dl_wget(url, part, hdrs, timeout)
+        else:
+            _dl_stdlib(url, part, hdrs, timeout)
+    finally:
+        if stop is not None:
+            stop.set()
 
     if sha256:
+        if progress is not None and size > (1 << 30):
+            progress(f"      sha256-verifying {dest.name} …")   # ~1 min/30 GB, not a hang
         h = hashlib.sha256()
         with open(part, "rb") as f:
             for block in iter(lambda: f.read(1 << 20), b""):

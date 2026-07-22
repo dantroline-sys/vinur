@@ -10,6 +10,7 @@ import os
 import sys
 import tempfile
 import threading
+import time
 import urllib.error
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -59,6 +60,15 @@ class Hub(BaseHTTPRequestHandler):
             self.send_header("Content-Length", str(len(body)))
             self.end_headers()
             self.wfile.write(body)
+            return
+        if self.path == "/org/tiny/resolve/main/slow.bin":
+            self.send_response(200)            # dribbled out so the watcher ticks
+            self.send_header("Content-Length", str(len(BLOB)))
+            self.end_headers()
+            for i in range(0, len(BLOB), 60_000):
+                self.wfile.write(BLOB[i:i + 60_000])
+                self.wfile.flush()
+                time.sleep(0.08)
             return
         data = {"/org/tiny/resolve/main/config.json": CONFIG,
                 "/org/tiny/resolve/main/model.safetensors": BLOB}.get(self.path)
@@ -220,6 +230,21 @@ with broker.lease("dl-bad", "huggingface"):
         assert "sha256 mismatch" in str(e)
 assert not (TD / "bad.bin").exists() and not (TD / "bad.bin.part").exists()
 ok("a sha256 mismatch discards the file — corrupt data never lands")
+
+# ── progress: one format, engine-agnostic, measured from the .part file ─────
+assert broker._progress_line(10 * 2**30, 20 * 2**30, 50 * 2**20) == \
+    "      … 10.00 / 20.00 GB (50%) · 50 MB/s · ~3m24s left"
+assert broker._progress_line(3 * 2**29, 0, 2**20).endswith("1.50 GB · 1 MB/s")
+os.environ["AMIGA_PROGRESS_S"] = "0.05"
+plines = []
+with broker.lease("slow", "huggingface"):
+    broker.download("slow", f"{BASE}/org/tiny/resolve/main/slow.bin",
+                    TD / "slow.bin", size=len(BLOB), progress=plines.append)
+del os.environ["AMIGA_PROGRESS_S"]
+assert (TD / "slow.bin").read_bytes() == BLOB
+assert plines and all("GB" in ln and "MB/s" in ln for ln in plines), plines
+ok("download progress: periodic '… have / total GB (%) · MB/s · ETA' lines "
+   "from the broker itself — identical for aria2c, wget, and stdlib")
 
 # ── audit hygiene ────────────────────────────────────────────────────────────
 raw = audit.LOG_PATH.read_text()
