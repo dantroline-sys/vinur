@@ -6,9 +6,17 @@ Everything stays inside this repo tree (see `env.sh`): vLLM weights under
 
 ## TL;DR — the recommended 96 GB pair
 
-Nothing to download by hand: put the HF repo ids in `config.toml` and the
-weights fetch themselves on first `./vinur.sh start` (with progress in
-`var/log/llm-<name>.log`). Budget ~60 GB of disk and a while on first run.
+Put the HF repo ids in `config.toml`, then pull each once through the egress
+broker — engines themselves run **offline** and load from the local store:
+
+```bash
+./vinur.sh pull Qwen/Qwen3-32B-FP8
+./vinur.sh pull RedHatAI/Mistral-Small-3.2-24B-Instruct-2506-FP8
+./vinur.sh start
+```
+
+Budget ~60 GB of disk. Pulls are resumable, audited (`./vinur.sh net`), and
+aria2c-accelerated when installed.
 
 ```toml
 [[serving.llms]]
@@ -278,21 +286,28 @@ Picking a repo:
 - Unquantized BF16 repos also work but are ~2× the size for no quality win
   at this scale — only bother when no good quant exists.
 
-Three ways to get them, all equivalent to vLLM:
+How to get them — **engines never download** (they launch offline, with
+`HF_HUB_OFFLINE=1` and usage-stats/telemetry off): model acquisition goes
+through the **egress broker**, which is policy-checked (`egress.toml`),
+audited (`var/log/egress.jsonl`), resumable, and sha256-verified against the
+hub's published digests.  Segmented via `aria2c -c -x4` when installed
+(genuinely faster on HF), `wget -c` second, a built-in stream otherwise — so
+macOS and Windows need nothing extra:
 
-1. **Automatic** (easiest): set `model` to the repo id and start. Downloads
-   go to `var/cache/huggingface/` because `./vinur.sh` sources `env.sh`
-   (`HF_HOME`); nothing lands in `~/.cache`.
-2. **Pre-download** (nicer on a slow link — resumable, shows progress):
+1. **Pull** (the way):
    ```bash
-   source ./env.sh
-   serving/.venv/bin/hf download Qwen/Qwen3-32B-FP8
+   ./vinur.sh pull Qwen/Qwen3-32B-FP8          # or: panel → Ops → pull
    ```
-   Same cache location; the first start then finds everything offline.
-3. **Local directory**: point `model` at a path
-   (`model = "/big/disk/Qwen3-32B-FP8"`) containing the repo snapshot.
-   Use this when weights live on another volume — or symlink the cache:
-   `ln -s /big/disk/hf var/cache/huggingface`.
+   Lands in `models/Qwen--Qwen3-32B-FP8/` — a plain, readable snapshot you can
+   inspect with `ls`.  Keep `model = "Qwen/Qwen3-32B-FP8"` in config.toml; it
+   resolves to the local folder automatically.  Watch the broker's window any
+   time: `./vinur.sh net`.
+2. **Local directory**: point `model` at a path
+   (`model = "/big/disk/Qwen3-32B-FP8"`) containing the repo snapshot —
+   weights on another volume never enter the store.
+3. **Legacy hub cache**: weights already in `var/cache/huggingface` from an
+   earlier install keep working (the offline engine reads a complete cache);
+   new downloads always go through the broker.
 
 ### Where the downloaded weights actually are
 
@@ -342,12 +357,10 @@ like every model on the box going down at once. `./vinur.sh start` warns if
 your shell has a proxy set without that exemption. Credentials embedded in a
 proxy URL are redacted from the `exec:` log line.
 
-If a download fails or hangs only under Xet, set `hf_xet = false` (below) — a
-proxy that inspects TLS often upsets the Xet client's connection reuse.
-
 **Gated repos** (Llama, some Mistral originals): accept the license on
-huggingface.co once, create a read token there, and export it before
-starting: `export HF_TOKEN=hf_...`. The recommended pair above is not gated.
+huggingface.co once, create a read token there, and set `hf_token` in
+config.toml (or export HF_TOKEN) — the BROKER attaches it to pulls; inference
+engines never see it. The recommended pair above is not gated.
 
 ## engine = "llama" — what kind of files
 
@@ -500,20 +513,10 @@ causes, all visible in the log:
 Restarting the service resumes from the partial blobs in every case — nothing
 re-downloads from zero.
 
-**A stall with no error at all** is usually Xet, the hub's chunked transfer
-backend. It uses its own CAS hosts over long-lived connections, so a firewall,
-a TLS-inspecting proxy, or an unreliable link can leave it hanging while
-`huggingface.co` itself answers fine. Turn it off in `config.toml` (or the
-panel's Settings tab — it's a plain on/off):
-
-```toml
-hf_xet = false        # HF_HUB_DISABLE_XET — plain HTTPS through requests
-```
-
-Then Restart that service from the Serving tab. Transfers are slower but
-ordinary, and the partial blobs already on disk are reused. If it now completes,
-the network is interfering with Xet specifically; if it still stalls at the same
-point, suspect the link or the disk instead.
+Downloads run through the egress broker (plain HTTPS — no Xet side-channel,
+which was the usual culprit for silent stalls). A `.part` file that stops
+growing means the link, the disk, or a rate limit: `./vinur.sh net` shows the
+last audited events, and re-running the pull resumes from the partial file.
 
 ### `RuntimeError: Could not find nvcc and default cuda_home='/usr/local/cuda' doesn't exist`
 

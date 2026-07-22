@@ -137,44 +137,39 @@ def _container_runtime(entry: dict) -> str:
         "nvidia-container-toolkit), or set runtime=/path on the entry")
 
 
-def _venv_has(root: Path, pkg: str) -> bool:
-    import glob
-    return bool(glob.glob(str(root / "serving" / ".venv" / "lib" / "python*" /
-                              "site-packages" / (pkg + "*"))))
+_HF_ID = re.compile(r"^[\w.-]+/[\w.-]+$")
+
+
+def resolve_model(entry: dict, root: Path = ROOT) -> dict:
+    """A vllm/container entry whose `model` is a HF id resolves to the local
+    model store (models/<Org--Name>/, filled by `pull`) when the snapshot is
+    completely there — the engine then loads from disk and never needs the
+    hub.  A local-path model, or an id still living in the legacy hub cache,
+    passes through unchanged (the offline env reads the cache fine)."""
+    model = str(entry.get("model") or "")
+    if entry.get("engine") not in ("vllm", "container") or not _HF_ID.match(model):
+        return entry
+    if Path(model).expanduser().exists():
+        return entry
+    from .amiga_net import pull as pull_mod
+    local = pull_mod.pulled(root, model)
+    return {**entry, "model": str(local)} if local else entry
 
 
 def hf_env(cfg: dict, engine: str, root: Path = ROOT) -> dict:
-    """Hugging Face download env for an LLM engine: the auth token (gated
-    models; anonymous requests are also the first to be throttled) and the
-    high-performance transfer flag — the actual fix for snail-pace weight
-    fetches.  Modern huggingface_hub transfers via Xet (HF_XET_HIGH_PERFORMANCE;
-    the old HF_HUB_ENABLE_HF_TRANSFER is deprecated and ignored, and merely
-    setting it draws a FutureWarning).  Containers get the Xet flag outright —
-    an older image without Xet simply ignores the unknown variable.  Bare-metal
-    venvs get whichever backend is actually installed: hf_xet preferred, legacy
-    hf_transfer as fallback, nothing when neither exists (the legacy env with
-    no package makes the hub refuse to download at all).
+    """The OFFLINE block for an inference engine (AMIGA-OPS-01 B-14).
 
-    `hf_xet = false` turns Xet OFF (HF_HUB_DISABLE_XET) and falls back to plain
-    HTTPS through requests.  Xet talks to its own CAS hosts on connections it
-    keeps open for a long time, so a firewall, a TLS-inspecting proxy or a
-    flaky link can leave a Xet transfer hanging while huggingface.co itself is
-    perfectly reachable — a stall with no error is its signature failure."""
-    out: dict = {}
-    tok = str(cfg.get("hf_token") or os.environ.get("HF_TOKEN")
-              or os.environ.get("HUGGING_FACE_HUB_TOKEN") or "").strip()
-    if tok:
-        out["HF_TOKEN"] = out["HUGGING_FACE_HUB_TOKEN"] = tok
-    if not cfg.get("hf_xet", True):
-        # Off means off: the accelerator flags would only fight the fallback.
-        out["HF_HUB_DISABLE_XET"] = "1"
-        return out
-    if cfg.get("hf_transfer", True):
-        if engine == "container" or _venv_has(root, "hf_xet"):
-            out["HF_XET_HIGH_PERFORMANCE"] = "1"
-        elif _venv_has(root, "hf_transfer"):
-            out["HF_HUB_ENABLE_HF_TRANSFER"] = "1"
-    return out
+    Engines no longer download anything: model acquisition happens through the
+    egress broker (`python3 -m knowledgehost pull`) into the local model
+    store, and the engine is handed a filesystem path.  So the engine gets no
+    token (the broker holds it), no transfer-accelerator flags (the broker's
+    engines do that), and an environment that says so out loud — an engine
+    that tries to reach the hub or phone usage stats home fails fast instead
+    of quietly succeeding."""
+    if engine not in ("vllm", "container"):
+        return {}
+    return {"HF_HUB_OFFLINE": "1", "TRANSFORMERS_OFFLINE": "1",
+            "VLLM_NO_USAGE_STATS": "1", "DO_NOT_TRACK": "1"}
 
 
 _PROXY_KEYS = ("http_proxy", "https_proxy", "all_proxy")
@@ -314,13 +309,19 @@ def llm_argv(entry: dict, root: Path = ROOT) -> list[str]:
         argv += ["--ipc=host",
                  "-p", f"{host}:{port}:8000",
                  "-v", f"{hf}:/root/.cache/huggingface:z"]
+        # A model from the local store (resolve_model) is a directory on the
+        # host: mount it read-only and hand the engine the in-container path.
+        model_arg = str(entry["model"])
+        if os.path.isdir(model_arg):
+            argv += ["-v", f"{os.path.abspath(model_arg)}:/model:ro,z"]
+            model_arg = "/model"
         for k, v in (entry.get("env") or {}).items():
             argv += ["-e", f"{k}={v}"]
         # The image's entrypoint IS `vllm serve` — model is positional, the
         # same first-class keys map to the same flags.  The inner server
         # listens on 0.0.0.0:8000; -p above binds it to the host port.
         return (argv + [str(entry.get("image") or DEFAULT_VLLM_IMAGE),
-                        str(entry["model"])]
+                        model_arg]
                 + _mapped_flags(entry, _VLLM_KEYS) + args)
     if engine == "vllm":
         # Bare-metal venv.  On bleeding-edge distros whose gcc/glibc outrun
@@ -364,20 +365,15 @@ def embed_argv(cfg: dict, model_path: str) -> list[str]:
 
 
 def ensure_embed_model(root: Path = ROOT) -> str:
-    """Download the nomic GGUF into models/ once (resumable curl-less stdlib fetch)."""
+    """Fetch the nomic GGUF into models/ once — through the egress broker
+    (policy-checked, audited, resumable), like every other download."""
     dest = root / "models" / EMBED_MODEL_FILE
     if dest.is_file():
         return str(dest)
-    dest.parent.mkdir(parents=True, exist_ok=True)
-    tmp = dest.with_suffix(".part")
+    from .amiga_net import broker
     print(f"downloading {EMBED_MODEL_FILE} (~260 MB) -> {dest}", flush=True)
-    with urllib.request.urlopen(EMBED_MODEL_URL, timeout=60) as r, open(tmp, "wb") as f:
-        while True:
-            chunk = r.read(1 << 20)
-            if not chunk:
-                break
-            f.write(chunk)
-    os.replace(tmp, dest)
+    with broker.lease("embed model (first start)", rule_name="huggingface"):
+        broker.download("embed model (first start)", EMBED_MODEL_URL, dest)
     return str(dest)
 
 
@@ -830,11 +826,22 @@ def weights_status(engine: str, model: str) -> dict:
                         "size_gb": round(_tree_size(mp) / 2**30, 1)}
             return {"status": "incomplete", "path": str(mp),
                     "detail": "local dir has no *.safetensors"}
+        # the model store (broker-pulled snapshots) outranks the legacy hub cache
+        from .amiga_net import pull as pull_mod
+        is_id = bool(_HF_ID.match(model))
+        if is_id:
+            local = pull_mod.pulled(ROOT, model)
+            if local:
+                return {"status": "ready", "path": str(local),
+                        "size_gb": round(_tree_size(local) / 2**30, 1)}
         d = hf_cache_dir() / ("models--" + model.replace("/", "--"))
         if not d.is_dir():
-            return {"status": "missing", "path": str(d),
-                    "detail": ("downloads on first start — or pre-fetch with "
-                               f"serving/.venv/bin/hf download {model}")}
+            return {"status": "missing",
+                    "path": str(pull_mod.store_dir(ROOT, model) if is_id else d),
+                    "detail": ("not downloaded — engines run offline; fetch "
+                               "through the egress broker: python3 -m "
+                               f"knowledgehost pull --model {model} "
+                               "(or the panel: Ops › pull)")}
         blobs = d / "blobs"
         parts = sorted(blobs.glob("*.incomplete")) if blobs.is_dir() else []
         partial = len(parts)
@@ -868,9 +875,7 @@ def weights_status(engine: str, model: str) -> dict:
                            detail=f"{partial} file(s) mid-download but NOTHING has been "
                                   f"written for {_ago(age)} — the fetch is stuck or dead, "
                                   "not slow. Check the log (Log button): rate limit (429), "
-                                  "auth (401/403), disk, or network. A stall with NO error "
-                                  "in the log is usually the Xet transfer backend — set "
-                                  "hf_xet = false in Settings and Restart. Either way the "
+                                  "auth (401/403), disk, or network. Re-run the pull — "
                                   "partial files are reused, nothing restarts from zero.")
             else:
                 out.update(status="incomplete",
@@ -1001,6 +1006,15 @@ def main(argv: list[str] | None = None) -> None:
             sys.exit(f"no serving.llms entry named '{ns.name}' "
                      f"(have: {', '.join(entries) or 'none'})")
         entry = entries[ns.name]
+        entry = resolve_model(entry)           # HF id -> local store path when pulled
+        ws = weights_status(str(entry.get("engine") or ""), str(entry.get("model") or ""))
+        if ws.get("status") == "missing" and entry.get("engine") in ("vllm", "container"):
+            # Engines run OFFLINE now — failing here, with the fix named, beats
+            # letting vLLM discover it can't reach the hub minutes into startup.
+            sys.exit(f"weights for '{entry.get('model')}' are not on this machine "
+                     f"({ws.get('path')}) — download them through the egress broker:\n"
+                     f"    python3 -m knowledgehost pull --model {entry.get('model')}\n"
+                     f"(or the panel: Ops › pull)")
         hf = engine_env(cfg, str(entry.get("engine") or ""))
         if entry.get("engine") == "container":
             # HF auth/transfer + proxy env must ride INTO the container as -e

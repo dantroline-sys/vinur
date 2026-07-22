@@ -143,26 +143,14 @@ embed_max_tokens      = 512   # clip inputs to the server's per-sequence window 
 # Also editable live in the panel's Settings tab.
 distill_parallel = 0
 
-# ── Hugging Face downloads ──────────────────────────────────────────────────
-# Weights are fetched by vLLM (or the container) at start.  `hf_token`
-# authenticates: required for gated repos, and authenticated requests are
-# also the last to be throttled.  It is a SECRET — set it here or export
-# HF_TOKEN; it is never shown in the panel and is redacted from the exec:
-# log line.  `hf_transfer` (default on) enables the high-performance
-# transfer path — the actual fix for snail-pace fetches.  Modern
-# huggingface_hub does this via Xet (HF_XET_HIGH_PERFORMANCE); the legacy
-# hf_transfer env is used only for a bare-metal serving venv that has that
-# package instead (pip install hf_xet — or hf_transfer — into
-# serving/.venv; containers need nothing).
+# ── Hugging Face auth (the egress broker's model pulls) ─────────────────────
+# Weights are fetched by `python3 -m knowledgehost pull --model org/Name`
+# through the egress broker (see egress.toml): policy-checked, audited,
+# resumable, sha256-verified — aria2c-accelerated when installed, wget or a
+# stdlib stream otherwise.  Inference engines run OFFLINE with local paths and
+# never see this token; the broker attaches it (gated repos, and anonymous
+# requests are the first to be throttled).  SECRET: file/env only.
 hf_token    = ""
-hf_transfer = true
-# Xet is the hub's chunked transfer backend (fast, default on modern hubs).
-# Set false to disable it (HF_HUB_DISABLE_XET) and fall back to plain HTTPS
-# through requests.  Reach for this when a download STALLS with no error:
-# Xet uses its own CAS hosts over long-lived connections, so a firewall, a
-# TLS-inspecting proxy or a flaky link can hang it while huggingface.co
-# itself is perfectly reachable.  Applies at the next service start.
-hf_xet      = true
 
 # ── Outbound proxy (only if this box reaches the internet through one) ───────
 # NOTHING in the serving stack reads OS or desktop proxy settings.  vLLM does

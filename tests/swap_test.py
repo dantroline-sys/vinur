@@ -338,7 +338,8 @@ def main():
                 assert by["stuck"]["weights"]["status"] == "incomplete"
                 assert "mid-download" in by["stuck"]["weights"]["detail"]
                 assert by["nowhere"]["weights"]["status"] == "missing"
-                assert "hf download org/absent" in by["nowhere"]["weights"]["detail"]
+                assert "pull --model org/absent" in by["nowhere"]["weights"]["detail"], \
+                    "a missing model names the broker pull, not an engine download"
                 assert by["gg"]["weights"]["status"] == "ready"
                 assert all(m["service"] == "supervisor-down" for m in res["llms"])
                 ok("serving_status: ready / mid-download / missing weights + supervisor-down")
@@ -665,36 +666,22 @@ def main():
         assert p.poll() is not None and not procs2 and time.time() - t0 < sup.GRACE_S
         ok("_stop_one: container svc -> runtime stop even with no client; bare -> killpg")
 
-    # ── HF downloads: token + guarded hf_transfer env; secrets never logged ──
+    # ── engines run OFFLINE: acquisition moved to the egress broker ─────────
     envkeys = ("HF_TOKEN", "HUGGING_FACE_HUB_TOKEN")
     saved_env = {k: os.environ.pop(k, None) for k in envkeys}
     try:
-        hcfg = {"hf_token": "hf_abc123", "hf_transfer": True}
-        e = sv.hf_env(hcfg, "container")
-        assert e["HF_TOKEN"] == "hf_abc123" == e["HUGGING_FACE_HUB_TOKEN"]
-        assert e["HF_XET_HIGH_PERFORMANCE"] == "1", \
-            "containers get the Xet flag (the legacy env is deprecated noise)"
-        assert "HF_HUB_ENABLE_HF_TRANSFER" not in e
-        with tempfile.TemporaryDirectory() as td2:
-            bare = sv.hf_env(hcfg, "vllm", root=Path(td2))
-            assert "HF_XET_HIGH_PERFORMANCE" not in bare \
-                and "HF_HUB_ENABLE_HF_TRANSFER" not in bare, \
-                "bare metal without a transfer package must set NO flag"
-            assert bare["HF_TOKEN"] == "hf_abc123"
-            site = (Path(td2) / "serving" / ".venv" / "lib" / "python3.12"
-                    / "site-packages")
-            (site / "hf_transfer").mkdir(parents=True)
-            assert sv.hf_env(hcfg, "vllm",
-                             root=Path(td2))["HF_HUB_ENABLE_HF_TRANSFER"] == "1"
-            (site / "hf_xet").mkdir()                    # Xet outranks the legacy pkg
-            e2 = sv.hf_env(hcfg, "vllm", root=Path(td2))
-            assert e2["HF_XET_HIGH_PERFORMANCE"] == "1" \
-                and "HF_HUB_ENABLE_HF_TRANSFER" not in e2
-        assert sv.hf_env({"hf_token": "", "hf_transfer": False}, "container") == {}
-        os.environ["HF_TOKEN"] = "hf_fromhost"          # host env passes through
-        assert sv.hf_env({"hf_token": ""}, "container")["HF_TOKEN"] == "hf_fromhost"
-        assert sv.hf_env(hcfg, "container")["HF_TOKEN"] == "hf_abc123", \
-            "config token outranks inherited env"
+        hcfg = {"hf_token": "hf_abc123"}
+        for eng in ("container", "vllm"):
+            e = sv.hf_env(hcfg, eng)
+            assert e["HF_HUB_OFFLINE"] == "1" and e["TRANSFORMERS_OFFLINE"] == "1", e
+            assert e["VLLM_NO_USAGE_STATS"] == "1" and e["DO_NOT_TRACK"] == "1", \
+                "phone-home stats must be off at launch (B-14)"
+            assert "HF_TOKEN" not in e and "HUGGING_FACE_HUB_TOKEN" not in e, \
+                "engines never hold the token — the broker attaches it to pulls"
+        assert sv.hf_env(hcfg, "llama") == {}, "llama engines take local GGUFs only"
+        os.environ["HF_TOKEN"] = "hf_fromhost"
+        assert "HF_TOKEN" not in sv.hf_env({}, "container"), \
+            "a host-env token must not leak into an engine either"
     finally:
         for k, v in saved_env.items():
             os.environ.pop(k, None)
@@ -704,22 +691,42 @@ def main():
                           "-e", "MY_API_KEY=zz", "-e", "FOO=1", "image"])
     assert red[3] == "HF_TOKEN=***" and red[5] == "MY_API_KEY=***" and red[7] == "FOO=1"
     assert "hf_abc123" not in " ".join(red) and "zz" not in red[5]
-    from knowledgehost.config import load_config as _lc, settings_schema as _ss
-    assert "hf_token" not in _ss(), "a secret must never surface in the panel schema"
-    ok("hf_env: cfg token wins, transfer flag guarded by venv; argv redacted")
-
-    # ── hf_xet = false: the escape hatch for a transfer that HANGS ──────────
-    xoff = sv.hf_env({"hf_xet": False, "hf_token": "hf_k"}, "container")
-    assert xoff["HF_HUB_DISABLE_XET"] == "1" and xoff["HF_TOKEN"] == "hf_k", xoff
-    # off means off — no accelerator flag left fighting the plain-HTTPS fallback
-    assert "HF_XET_HIGH_PERFORMANCE" not in xoff, xoff
-    assert "HF_HUB_ENABLE_HF_TRANSFER" not in xoff, xoff
-    assert "HF_HUB_DISABLE_XET" not in sv.hf_env({}, "container")
     from knowledgehost.config import settings_schema
-    assert settings_schema().get("hf_xet", {}).get("type") == "bool"
+    assert "hf_token" not in settings_schema(), \
+        "a secret must never surface in the panel schema"
     # a proxy URL can carry credentials: file/env only, never over HTTP
     assert "http_proxy" not in settings_schema()
-    ok("hf_xet=false disables Xet (panel-editable); proxy keys stay off the panel")
+    ok("hf_env: engines offline + statless, no tokens; secrets stay off panel/logs")
+
+    # ── the model store: resolve_model + container mount ────────────────────
+    with tempfile.TemporaryDirectory() as td3:
+        root3 = Path(td3)
+        stored = root3 / "models" / "org--tiny"
+        stored.mkdir(parents=True)
+        (stored / "config.json").write_text("{}")
+        (stored / "model.safetensors").write_bytes(b"w" * 64)
+        import json as _json
+        (stored / ".pull.json").write_text(_json.dumps(
+            {"model": "org/tiny", "files": {
+                "config.json": {"size": 2}, "model.safetensors": {"size": 64}}}))
+        ent = {"name": "t", "engine": "vllm", "model": "org/tiny", "port": 1}
+        r = sv.resolve_model(ent, root=root3)
+        assert r["model"] == str(stored), r
+        assert sv.resolve_model({**ent, "engine": "llama"}, root=root3)["model"] == "org/tiny"
+        # an incomplete pull must NOT resolve (engine would boot on half a model)
+        (stored / "model.safetensors").write_bytes(b"w" * 10)
+        assert sv.resolve_model(ent, root=root3)["model"] == "org/tiny"
+        (stored / "model.safetensors").write_bytes(b"w" * 64)
+        # container engine: a local-dir model is mounted read-only at /model
+        vdir3 = root3 / "serving" / ".venv" / "bin"; vdir3.mkdir(parents=True)
+        (vdir3 / "vllm").write_text("")
+        centry3 = {"name": "t", "engine": "container", "model": str(stored),
+                   "port": 11438, "runtime": "podman", "image": "img:v1"}
+        argv3 = sv.llm_argv(centry3, root=root3)
+        s3 = " ".join(argv3)
+        assert f"-v {stored}:/model:ro,z" in s3, s3
+        assert argv3[argv3.index("img:v1") + 1] == "/model", argv3
+    ok("resolve_model: pulled store wins, incomplete never resolves; container mounts ro")
 
     # ── proxy: nothing in the stack reads OS proxy settings, so we pass it ───
     pcfg = {"serving": {"llms": [{"name": "a", "host": "10.0.0.5"}]},
@@ -745,10 +752,11 @@ def main():
         # the shell's proxy is inherited by an engine when config doesn't set one
         inherited = sv.proxy_env({"serving": {"llms": []}})
         assert inherited["http_proxy"] == "http://proxy.corp:3128", inherited
-        # …and engine_env is what the exec path applies: HF auth + proxy together,
-        # which is what makes a CONTAINER (no host env) able to download at all
+        # …and engine_env is what the exec path applies: the OFFLINE block +
+        # proxy together (a container gets no host env) — and never the token
         merged = sv.engine_env({"serving": {"llms": []}, "hf_token": "hf_x"}, "container")
-        assert merged["HF_TOKEN"] == "hf_x" and merged["http_proxy"], merged
+        assert merged["HF_HUB_OFFLINE"] == "1" and merged["http_proxy"], merged
+        assert "HF_TOKEN" not in merged
     finally:
         for k, v in env0.items():
             if v is None:

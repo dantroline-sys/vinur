@@ -1,0 +1,25 @@
+# egress.toml — Vinur's outbound network policy (AMIGA-OPS-01 §3.3).
+#
+# DENY BY DEFAULT: code in this repository can reach ONLY what a rule below
+# permits, and every decision — allowed or refused — lands in
+# var/log/egress.jsonl.  Read the current state any time:
+#
+#     python3 -m knowledgehost.amiga_net.status
+#
+# A rule with ttl_seconds/max_uses is a LEASE: it grants nothing on its own.
+# An operation (e.g. `python3 -m knowledgehost pull`) opens the lease, the
+# transfer happens, and the lease closes itself — so an idle Vinur has zero
+# standing permission to leave this machine.
+#
+# This file is data, deliberately language-neutral: the future native snitch
+# reads the same format.  Edit it like you'd edit a firewall: on purpose.
+
+[[rule]]
+name        = "huggingface"
+hosts       = ["huggingface.co", "*.huggingface.co", "*.hf.co"]
+port        = 443
+methods     = ["GET", "HEAD"]
+purpose     = "download the model weights and tokenizer files you asked for (pull / first embed start)"
+ttl_seconds = 14400          # one pull operation; a 70 GB model on a slow link fits
+max_uses    = 20000          # files + resume requests within that operation
+auth        = "hf_token"     # attached by the broker; engines never see it

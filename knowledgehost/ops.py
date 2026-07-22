@@ -34,6 +34,8 @@ COMMANDS: dict = {
     "recard":     {"limit": "int", "bundle": "str"},   # cards-only re-pass (see HELP)
     # janitor: chunks holding text the corpus already has (no LM involved)
     "dedupe":     {"near": "bool", "threshold": "float", "apply": "bool", "bundle": "str"},
+    # model weights via the egress broker (policy-checked, audited, resumable)
+    "pull":       {"model": "str", "revision": "str"},
     # External-dataset bulk imports (KB-only; path defaults to <name>_path in config —
     # the option only overrides it).  Long-running; stream their progress to the log.
     "import-conceptnet": {"path": "path", "min_weight": "float", "all": "bool",
@@ -103,6 +105,15 @@ HELP: dict = {
                "apply": "near mode: actually mark them (default is report only — "
                         "'almost the same' can also mean 'a revision of')",
                "bundle": "ONLY chunks from this provenance bundle; empty = everything"},
+    "pull": {"_": "Download model weights through the egress broker into the local "
+                  "model store (models/<Org--Name>/). Policy-checked against "
+                  "egress.toml, audited to var/log/egress.jsonl, resumable "
+                  "(aria2c-accelerated when installed, wget or a built-in stream "
+                  "otherwise), sha256-verified against the hub's published digests. "
+                  "Inference engines run OFFLINE and load the result from disk — "
+                  "they never download, never hold the token, never phone home",
+             "model": "the HF model id (org/Name)",
+             "revision": "repo revision (default main)"},
     "import-conceptnet": {"_": "Bulk-import the ConceptNet commonsense graph",
                           "path": "assertions.csv dump (default from config)",
                           "min_weight": "drop assertions weaker than this",

@@ -31,5 +31,10 @@ fi
 
 case "${1:-}" in
     -h|--help|help|"") sed -n '2,/^set /p' "$0" | sed -n 's/^#\{1,\} \{0,1\}//p' ;;
+    pull)   # model weights via the egress broker:  ./vinur.sh pull org/Name
+        shift
+        exec "$PY" -m knowledgehost pull --model "${1:?usage: ./vinur.sh pull <org/Name> [revision]}" ${2:+--revision "$2"} ;;
+    net)    # the egress broker's window: policy, live leases, recent activity
+        exec "$PY" -m knowledgehost.amiga_net.status ;;
     *) exec "$PY" -m knowledgehost.supervisor "$@" ;;
 esac

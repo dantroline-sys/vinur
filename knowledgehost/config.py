@@ -162,33 +162,12 @@ DEFAULTS = {
     # Per-request latency grows with the batch: keep distill_timeout_s
     # comfortable (batching raises throughput, not single-request speed).
     "distill_parallel": 0,
-    # Hugging Face downloads (weights fetched by vLLM/the container at start):
-    # `hf_token` authenticates (gated models; anonymous requests are also the
-    # first to be throttled) — a SECRET: file/env only, never surfaced over
-    # HTTP, redacted from the exec: log line.  `hf_transfer` enables the
-    # high-performance transfer path — Xet (HF_XET_HIGH_PERFORMANCE=1) on
-    # modern huggingface_hub, the legacy hf_transfer env only for a bare-metal
-    # venv that ships that package instead (serving.hf_env picks per engine).
+    # Hugging Face auth for the egress broker (amiga_net) — model pulls only.
+    # Gated repos need it; anonymous requests are also the first to be
+    # throttled.  A SECRET: file/env only, never surfaced over HTTP, attached
+    # to requests BY THE BROKER (rule auth = "hf_token" in egress.toml) —
+    # inference engines run offline and never see it.
     "hf_token": "",
-    "hf_transfer": True,
-    # Xet is huggingface_hub's chunked transfer backend (fast, and the default
-    # on modern hubs).  Set false to disable it (HF_HUB_DISABLE_XET) and fall
-    # back to plain HTTPS through requests: Xet uses its own CAS hosts and
-    # long-lived connections, so a firewall, a TLS-inspecting proxy or a flaky
-    # link can leave a transfer HANGING — a download that stalls with no error
-    # is the signature.  Panel-editable (Settings), applies at next start.
-    "hf_xet": True,
-    # Outbound proxy, for a box that reaches the internet through one.  NOTHING
-    # in the stack reads OS/desktop proxy settings — vLLM proxies nothing
-    # itself, huggingface_hub (requests) and the Xet backend (reqwest) read
-    # these environment variables and no more.  Leave empty to inherit the
-    # shell's; set them here when services are started by the supervisor, and
-    # ALWAYS for engine="container" (host env does not cross into a container).
-    # Loopback and the declared serving hosts are added to no_proxy for you —
-    # the host's own LM calls must never go out through a proxy.
-    "http_proxy": "",
-    "https_proxy": "",
-    "no_proxy": "",
     # Chunk zones the distiller SKIPS (zones.classify: document furniture where
     # nothing distillable lives — bibliographies also mint junk concepts).  The
     # text stays in the store and FTS (library search still finds it); removing
@@ -544,8 +523,7 @@ _FLOAT_KEYS = {"min_confidence", "node_sim_high", "node_sim_low", "kb_min_sim",
                "stats_interval_s"}
 _BOOL_KEYS = {"embed_task_prefix", "ocr", "verify", "strict",
               "conceptnet_include_lexical", "ann_search", "ann_mmap", "wiki_semantic",
-              "ask_fit_gate", "use_spacy", "library_dense", "hf_transfer", "hf_xet",
-              "distill_dedupe"}
+              "ask_fit_gate", "use_spacy", "library_dense", "distill_dedupe"}
 _LIST_KEYS = {"sources", "extensions", "distill_urls", "extract_urls", "verify_urls",
               "encrypted_bundles", "library_sources", "stopwords_extra",
               "high_stakes_extra", "ops_regions", "ask_exclude_facets",
@@ -627,9 +605,6 @@ EDITABLE_SETTINGS = frozenset({
     # read-time knowledge mode
     "mode", "strict",
     "distill_dedupe",        # skip chunks whose text the corpus already holds
-    # Hugging Face transfer backends — on/off switches, no credentials (the
-    # token and the proxy URLs stay file/env-only).  Applied at next start.
-    "hf_transfer", "hf_xet",
     # runtime brain toggle (comma-separated bundle names; the /brain endpoint
     # and Bundles panel write it — it's state, but scalar round-tripping through
     # the same writer keeps one persistence path)
