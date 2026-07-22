@@ -1226,13 +1226,13 @@ async function pollServing() {
     live.textContent = (r.error === 'unauthorized')
       ? 'enter the auth token above to view Serving' : ('error: ' + r.error); return; }
   live.className = '';
+  const unHtml = svUnserved(r.unserved || []);
   if (!r.hosting) {
     live.innerHTML = `<p style="opacity:.7">This box hosts <b>no models</b> — the
       <code>[serving]</code> table in config.toml is empty, so the knowledge host only answers
       queries and borrows LMs from the endpoints in Settings (distill/extract/verify URLs).
-      To serve models here, declare them in <code>[serving]</code> and start with
-      <code>./vinur.sh</code> — see <code>serving/README.md</code>. Pull weights below, then
-      add a service for them.</p>`;
+      Pull weights with the search below, then <b>Add service</b> creates the
+      <code>[serving]</code> entry for you.</p>` + unHtml;
     return;
   }
   const sup = r.supervisor || {};
@@ -1282,9 +1282,28 @@ async function pollServing() {
        incomplete weights usually means the fetch died: gated repo token, disk, network).</p>
      <table><tr><th>model</th><th>what</th><th>service</th><th>weights</th><th>note</th><th></th></tr>
      ${rows}${auxRows}</table>`
-    + svLogPanel() + svCache(r.cache);
+    + unHtml + svLogPanel() + svCache(r.cache);
   const pre = $('#svlogpre');
   if (pre) pre.scrollTop = atEnd ? pre.scrollHeight : keep;
+}
+// Pulled weights nothing serves yet: one click drafts the [[serving.llms]]
+// entry (name, port, engine, exclusive-or-not all derived) instead of asking
+// the user to invent a config block by hand.
+function svUnserved(un) {
+  if (!un.length) return '';
+  const rows = un.map(u => `<tr><td>${esc(u.model)}</td>
+    <td style="opacity:.6;font-size:12px">${u.engine === 'llama' ? 'llama.cpp' : 'vllm'}${u.size_gb ? ' · ' + u.size_gb + ' GB' : ''}${u.via === 'hub cache' ? ' · hub cache' : ''}</td>
+    <td><button class="toolbtn" style="font-size:12px;padding:2px 10px"
+      onclick="svAddService('${esc(u.model)}')">Add service</button></td></tr>`).join('');
+  return `<div class="cfg-group" style="margin-top:12px"><b style="font-size:13px">On disk, not served</b>
+    <span style="opacity:.55;font-size:12px"> — pulled weights that no service uses yet;
+    Add service writes the config entry (a commented, minimal block) for you</span>
+    <table style="margin-top:6px">${rows}</table></div>`;
+}
+async function svAddService(model) {
+  $('#banner').innerHTML = `adding a service for <b>${esc(model)}</b>…`;
+  const r = await postJSON('/serving/add', { model }).catch(e => ({ ok: false, error: '' + e }));
+  $('#banner').innerHTML = r.ok ? '✓ ' + esc(r.note || 'added') : '✗ ' + esc(r.error || 'failed');
 }
 // Downloaded weights are big and invisible — say where they went, in the tab
 // that owns them, with enough of the layout to inspect the folder by hand.

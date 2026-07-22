@@ -805,6 +805,53 @@ def update_llm_model(config_path: str, name: str, model: str) -> str:
     raise ValueError(f"no [[serving.llms]] entry named '{name}' in {p.name}")
 
 
+def add_llm_entry(config_path: str, entry: dict) -> str:
+    """Append a new [[serving.llms]] block — the Serving tab's 'Add service'.
+    Inserted right after the last existing llms block so the group reads as
+    one; minimal keys only, commented with its origin.  Tuning keys
+    (max_model_len, gpu_memory_utilization, …) are deliberately left to the
+    file's owner — defaults are the engine's."""
+    import re as _re
+    name = str(entry.get("name") or "")
+    if not _re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_-]{0,40}", name):
+        raise ValueError(f"bad service name: {name!r}")
+    engine = str(entry.get("engine") or "")
+    if engine not in ("vllm", "container", "llama"):
+        raise ValueError(f"bad engine: {engine!r}")
+    model = str(entry.get("model") or "")
+    if not model or '"' in model:
+        raise ValueError("bad model")
+    p = Path(config_path).expanduser()
+    lines = p.read_text().splitlines() if p.exists() else []
+    block = ["", "[[serving.llms]]",
+             "# added via the Serving tab — tune (max_model_len, "
+             "gpu_memory_utilization, ...) as needed",
+             f'name   = "{name}"',
+             f'engine = "{engine}"',
+             f'model  = "{model}"',
+             f"port   = {int(entry['port'])}"]
+    for k in ("image", "runtime"):
+        if entry.get(k):
+            block.append(f'{k} = "{entry[k]}"')
+    if entry.get("exclusive"):
+        block.append("exclusive = true")
+    last_end, in_llms = None, False
+    for i, ln in enumerate(lines):
+        s = ln.strip()
+        if s.startswith("["):
+            if in_llms:
+                last_end = i
+                in_llms = False
+            if s == "[[serving.llms]]":
+                in_llms = True
+    if in_llms:
+        last_end = len(lines)
+    at = last_end if last_end is not None else len(lines)
+    lines[at:at] = block
+    _replace_text(p, "\n".join(lines) + "\n")
+    return name
+
+
 # ── web-managed library folders (sandboxed under library_root) ─────────────────────
 # The Settings firewall keeps path keys out of HTTP; the Library panel carries the
 # deliberate exceptions.  Subfolder toggles are narrow: the web sends bare NAMES,

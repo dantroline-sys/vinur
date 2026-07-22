@@ -342,6 +342,8 @@ def main():
                     "a missing model names the broker pull, not an engine download"
                 assert by["gg"]["weights"]["status"] == "ready"
                 assert all(m["service"] == "supervisor-down" for m in res["llms"])
+                assert isinstance(res.get("unserved"), list), \
+                    "the Add-service list must always be present"
                 ok("serving_status: ready / mid-download / missing weights + supervisor-down")
 
                 # ── stale .incomplete litter must NOT mask a complete snapshot ──
@@ -829,6 +831,37 @@ def main():
             assert "nope" in str(e)
     ok("update_llm_model: rewrites ONE entry's model in place — comments, "
        "spacing, and the other entries untouched")
+
+    # ── add_llm_entry: the Add-service flow's config writer ─────────────────
+    from knowledgehost.config import add_llm_entry
+    with tempfile.TemporaryDirectory() as td8:
+        cp8 = Path(td8) / "config.toml"
+        cp8.write_text('[[serving.llms]]\nname = "a"\nengine = "vllm"\n'
+                       'model = "org/x"\nport = 11438\n'
+                       '[serving.embed]\nenabled = false\n# tail comment\n')
+        add_llm_entry(str(cp8), {"name": "new-one", "engine": "vllm",
+                                 "model": "org/new", "port": 11440,
+                                 "exclusive": True})
+        txt8 = cp8.read_text()
+        assert txt8.index('name   = "new-one"') < txt8.index("[serving.embed]"), \
+            "the new block joins the llms group, not the end of the file"
+        assert "# tail comment" in txt8 and 'name = "a"' in txt8
+        es = load_config(str(cp8))["serving"]["llms"]
+        assert len(es) == 2 and es[1]["name"] == "new-one"
+        assert es[1]["exclusive"] is True and es[1]["port"] == 11440
+        try:
+            add_llm_entry(str(cp8), {"name": "bad name!", "engine": "vllm",
+                                     "model": "m", "port": 2})
+            raise AssertionError("bad name must raise")
+        except ValueError:
+            pass
+        cp9 = Path(td8) / "empty.toml"           # first entry on a fresh box
+        cp9.write_text("")
+        add_llm_entry(str(cp9), {"name": "solo", "engine": "llama",
+                                 "model": "models/x.gguf", "port": 11441})
+        assert 'name   = "solo"' in cp9.read_text()
+    ok("add_llm_entry: joins the llms group in place, validates name/engine, "
+       "first entry into an empty file works")
 
     # ── Settings › Network: the broker's deliberate, REDACTED settings lane ──
     from knowledgehost.config import net_view, set_net_setting

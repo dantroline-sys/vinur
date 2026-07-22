@@ -500,7 +500,7 @@ class Handler(BaseHTTPRequestHandler):
         if path not in ("/call", "/ops/run", "/ops/stop", "/ops/reload", "/config",
                         "/ops/autopilot", "/library/config", "/library/root",
                         "/source", "/scenario", "/brain", "/drop", "/serving/swap",
-                        "/serving/control", "/serving/model", "/net",
+                        "/serving/control", "/serving/model", "/serving/add", "/net",
                         "/metrics/mark", "/gaps/close", "/settings/paths"):
             return self._send_json({"ok": False, "error": "not found"}, 404)
         if not self._authed():
@@ -618,6 +618,73 @@ class Handler(BaseHTTPRequestHandler):
                     if key == "hf_token" else
                     "applies to the next pull / search (jobs read config at launch)")
             return self._send_json({"ok": True, "key": key, "note": note})
+        if path == "/serving/add":                     # create a [[serving.llms]] entry
+            # The fraught part of config.toml is INVENTING an entry — name,
+            # port, engine, exclusive-or-not.  This derives all of it from
+            # the model on disk and the entries that already exist, writes a
+            # minimal commented block, and says what to do next.
+            import re as _re
+            from . import serving as sv
+            from .config import add_llm_entry
+            cp = self.cfg.get("_config_path")
+            if not cp:
+                return self._send_json(
+                    {"ok": False, "error": "server started without -c; no config file to write"}, 400)
+            model = str(req.get("model") or "").strip()
+            if not model:
+                return self._send_json({"ok": False, "error": "model required"}, 400)
+            llms = self.cfg["serving"]["llms"]
+            engine = str(req.get("engine") or "").strip()
+            if not engine:
+                if model.lower().endswith(".gguf"):
+                    engine = "llama"
+                else:                                  # follow the house style for
+                    engine = next((str(e.get("engine")) for e in llms   # safetensors
+                                   if e.get("engine") == "container"), "vllm")
+            if model not in {c["model"] for c in sv.eligible_models(engine, cfg=self.cfg)}:
+                return self._send_json(
+                    {"ok": False, "error": f"'{model}' is not on this disk in a form "
+                     f"{engine} can serve — pull it first (the search below)"}, 400)
+            entry: dict = {"engine": engine, "model": model}
+            if engine == "container":                  # image/runtime copied from a sibling
+                tmpl = next((e for e in llms
+                             if e.get("engine") == "container" and e.get("image")), None)
+                if tmpl is None:
+                    return self._send_json(
+                        {"ok": False, "error": "no existing container entry to copy "
+                         "image/runtime from — add the first one by hand"}, 400)
+                entry["image"] = str(tmpl.get("image"))
+                if tmpl.get("runtime"):
+                    entry["runtime"] = str(tmpl.get("runtime"))
+            raw = str(req.get("name") or "").strip()
+            if not raw:
+                stem = model.rsplit("/", 1)[-1]
+                if stem.lower().endswith(".gguf"):
+                    stem = stem[:-5]
+                raw = _re.sub(r"[^A-Za-z0-9_-]+", "-", stem).strip("-").lower()[:32] or "model"
+            names = {str(e.get("name")) for e in llms}
+            name, i = raw, 2
+            while name in names:
+                name, i = f"{raw}{i}", i + 1
+            entry["name"] = name
+            ports = [int(e.get("port") or 0) for e in llms] + [11439]
+            port = int(req.get("port") or (max(ports) + 1))
+            if any(int(e.get("port") or 0) == port for e in llms):
+                return self._send_json({"ok": False, "error": f"port {port} is taken"}, 400)
+            entry["port"] = port
+            entry["exclusive"] = (bool(req.get("exclusive")) if "exclusive" in req
+                                  else any(e.get("exclusive") for e in llms))
+            try:
+                add_llm_entry(cp, entry)
+            except (ValueError, OSError) as e:
+                return self._send_json({"ok": False, "error": str(e)}, 400)
+            llms.append(entry)                         # the live view stays truthful
+            return self._send_json({"ok": True, "name": name, "port": port,
+                "engine": engine, "exclusive": entry["exclusive"],
+                "note": f"llm-{name} added on :{port} ({engine}, "
+                        f"{'exclusive — swaps with its siblings' if entry['exclusive'] else 'resident'}). "
+                        "Restart the supervisor (./vinur.sh restart) to bring it "
+                        "under management, then Start or Swap it in from the table."})
         if path == "/serving/model":                   # repoint one entry at another model
             # The Serving tab's picker: rewrite the entry's model line in
             # config.toml (the launcher re-reads config on every spawn, so a

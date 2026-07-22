@@ -1095,11 +1095,25 @@ def serving_status(cfg: dict) -> dict:
                                 "detail": "auto-downloads on first start (~600 MB)"})
         reranker.update(svc_state("reranker"))
 
+    # models on disk that NO entry serves — the "Add service" list.  Both
+    # lanes are scanned regardless of what's declared: the first GGUF on a
+    # vLLM-only box (or vice versa) must still show up somewhere.
+    configured = {str(e.get("model") or "") for e in cfg["serving"]["llms"]}
+    unserved = []
+    for lane in ("vllm", "llama"):
+        cands = choices_by_engine.get(lane)
+        if cands is None and lane == "vllm":
+            cands = choices_by_engine.get("container")
+        if cands is None:
+            cands = eligible_models(lane, cfg=cfg)
+        unserved.extend({**c, "engine": lane} for c in cands
+                        if c["model"] not in configured)
+
     return {"hosting": bool(llms or embed["enabled"] or reranker["enabled"]),
             "supervisor": {"running": sup_alive,
                            "pid": st.get("supervisor") if sup_alive else None},
             "swap": swap_state(), "llms": llms, "embed": embed, "reranker": reranker,
-            "cache": hf_cache_status()}
+            "unserved": unserved, "cache": hf_cache_status()}
 
 
 def main(argv: list[str] | None = None) -> None:
