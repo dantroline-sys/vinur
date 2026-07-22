@@ -963,6 +963,102 @@ def _hf_cache_status_now() -> dict:
     return out
 
 
+_WEIGHT_GLOBS = ("*.safetensors", "pytorch_model*.bin", "*.pt", "*.gguf")
+
+
+def _weights_here(d: Path) -> tuple[bool, str]:
+    """Does THIS directory hold a servable set of weights?  The sharded-index
+    json is the honest test when present — it names every shard, so a fetch
+    that died one shard short reads incomplete with the culprit named.
+    Otherwise any weight file counts: vLLM also loads .bin/.pt/.gguf."""
+    idx = d / "model.safetensors.index.json"
+    if idx.exists():
+        try:
+            names = set(json.loads(idx.read_text()).get("weight_map", {}).values())
+        except (OSError, ValueError):
+            names = set()
+        missing = sorted(n for n in names if not (d / n).exists())
+        if names and not missing:
+            return True, ""
+        if missing:
+            return False, (f"the shard index names {len(names)} weight file(s) "
+                           f"and {len(missing)} are missing (first: {missing[0]})"
+                           " — the download did not finish")
+    for pat in _WEIGHT_GLOBS:
+        if any(d.glob(pat)):
+            return True, ""
+    return False, ""
+
+
+def _local_dir_status(mp: Path) -> dict:
+    """A [serving.llms] model that is a PATH to a directory, judged by the
+    same evidence the engine uses — whatever the layout: flat snapshot,
+    hub-cache repo root (weights under snapshots/<rev>/), weights nested in a
+    subfolder, sharded-index completeness, .bin/.pt/.gguf formats, or a
+    broker-store folder referenced by path (the manifest knows have/total).
+    The old check was a top-level *.safetensors glob, which called fully
+    downloaded models 'incomplete' for every other layout.  Memoized 10s
+    (the panel polls, and this walks the tree)."""
+    return _memo(("dirweights", str(mp)), 10.0, lambda: _local_dir_status_now(mp))
+
+
+def _local_dir_status_now(mp: Path) -> dict:
+    from .amiga_net import pull as pull_mod
+    size = {"size_gb": round(_tree_size(mp) / 2**30, 1)}
+    # a broker-store folder: the manifest is the truth about have/total
+    pr = pull_mod.progress(mp)
+    if pr and pr["total"] and pr["have"] < pr["total"]:
+        pct = round(100 * pr["have"] / pr["total"])
+        return {"status": "incomplete", "path": str(mp), **size,
+                "detail": (f"{round(pr['have'] / 2**30, 2)} of "
+                           f"{round(pr['total'] / 2**30, 2)} GB ({pct}%) — the "
+                           "pull never finished (resumable: Ops › pull)")}
+    # a hub-cache repo root given by path: what loads is the snapshot inside
+    snaps = mp / "snapshots"
+    if mp.name.startswith("models--") and snaps.is_dir():
+        best = next((s for s in sorted(snaps.iterdir())
+                     if _snapshot_complete(s)), None)
+        if best:
+            return {"status": "ready", "path": str(best), **size,
+                    "detail": "hub-cache layout — the complete snapshot inside "
+                              "is what loads"}
+        return {"status": "incomplete", "path": str(mp), **size,
+                "detail": "hub-cache layout with no complete snapshot under "
+                          "snapshots/ — the fetch died mid-way (re-pull resumes)"}
+    here, why = _weights_here(mp)
+    if here:
+        return {"status": "ready", "path": str(mp), **size}
+    if why:
+        return {"status": "incomplete", "path": str(mp), **size, "detail": why}
+    # weights deeper down (a nested repo folder, or the entry points one
+    # level too high): find them and say where they are
+    hit = next((p for pat in _WEIGHT_GLOBS for p in sorted(mp.rglob(pat))), None)
+    if hit:
+        sub, why2 = _weights_here(hit.parent)
+        if sub:
+            return {"status": "ready", "path": str(hit.parent), **size,
+                    "detail": f"weights live in {hit.parent.relative_to(mp)}/ — "
+                              "if the engine complains, point the entry there"}
+        return {"status": "incomplete", "path": str(hit.parent), **size,
+                "detail": why2 or "partial weights found deeper in this folder"}
+    parts = [p for p in mp.rglob("*")
+             if p.name.endswith((".part", ".incomplete"))]
+    if parts:
+        return {"status": "incomplete", "path": str(mp), **size,
+                "detail": f"{len(parts)} file(s) still mid-download "
+                          "(.part/.incomplete present) — re-run the pull to "
+                          "finish (resumable)"}
+    try:
+        holds = sorted(p.name + ("/" if p.is_dir() else "") for p in mp.iterdir())
+    except OSError:
+        holds = []
+    inv = ", ".join(holds[:6]) + ("…" if len(holds) > 6 else "")
+    return {"status": "incomplete", "path": str(mp), **size,
+            "detail": ("no weight files (*.safetensors / pytorch_model*.bin / "
+                       f"*.pt / *.gguf) anywhere here — the folder holds: "
+                       f"{inv or 'nothing'}. Is this the right path?")}
+
+
 def weights_status(engine: str, model: str) -> dict:
     """Where the weights for one declared model stand ON DISK:
     ready | incomplete (mid-download or an interrupted/failed fetch) | missing.
@@ -978,12 +1074,8 @@ def weights_status(engine: str, model: str) -> dict:
     if engine in ("vllm", "container"):
         # container mounts the same in-tree HF cache, so one check serves both
         mp = Path(model).expanduser()
-        if mp.is_dir():                                # local snapshot directory
-            if any(mp.glob("*.safetensors")):
-                return {"status": "ready", "path": str(mp),
-                        "size_gb": round(_tree_size(mp) / 2**30, 1)}
-            return {"status": "incomplete", "path": str(mp),
-                    "detail": "local dir has no *.safetensors"}
+        if mp.is_dir():                                # local weights directory
+            return _local_dir_status(mp)
         # the model store (broker-pulled snapshots) outranks the legacy hub cache
         from .amiga_net import pull as pull_mod
         is_id = bool(_HF_ID.match(model))

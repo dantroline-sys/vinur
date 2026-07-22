@@ -1229,6 +1229,84 @@ def main():
     ok("/serving/model deploy: choices offered, file+runtime repointed "
        "(comment kept), running service restarted, off-disk model refused")
 
+    # ── local-dir weights: every layout a real model folder comes in ────────
+    # The old check was a top-level *.safetensors glob — a fully downloaded
+    # model in any other layout read "incomplete: local dir has no
+    # *.safetensors" (Dan hit this on a complete download).
+    with tempfile.TemporaryDirectory() as td13:
+        import json as _json
+        r13 = Path(td13)
+
+        def mk(name):
+            d = r13 / name
+            d.mkdir(parents=True)
+            return d
+
+        flat = mk("flat")                              # flat snapshot: ready
+        (flat / "config.json").write_text("{}")
+        (flat / "model.safetensors").write_bytes(b"w" * 8)
+        assert sv._local_dir_status_now(flat)["status"] == "ready"
+
+        hub = mk("models--org--big")                   # hub-cache repo root
+        snap = hub / "snapshots" / "aaa"
+        snap.mkdir(parents=True)
+        (snap / "config.json").write_text("{}")
+        (snap / "model.safetensors").write_bytes(b"w" * 8)
+        ws = sv._local_dir_status_now(hub)
+        assert ws["status"] == "ready" and ws["path"] == str(snap), ws
+        assert "hub-cache layout" in ws["detail"]
+        (snap / "model.safetensors").unlink()          # gutted snapshot
+        ws = sv._local_dir_status_now(hub)
+        assert ws["status"] == "incomplete" and "no complete snapshot" in ws["detail"]
+
+        nest = mk("nest")                              # weights one level down
+        sub = nest / "w4a16"
+        sub.mkdir()
+        (sub / "model.safetensors").write_bytes(b"w" * 8)
+        ws = sv._local_dir_status_now(nest)
+        assert ws["status"] == "ready" and "weights live in w4a16/" in ws["detail"], ws
+
+        shard = mk("shard")                            # index is the honest test
+        (shard / "model.safetensors.index.json").write_text(_json.dumps(
+            {"weight_map": {"a": "model-00001-of-00002.safetensors",
+                            "b": "model-00002-of-00002.safetensors"}}))
+        (shard / "model-00001-of-00002.safetensors").write_bytes(b"w")
+        ws = sv._local_dir_status_now(shard)
+        assert ws["status"] == "incomplete" and \
+            "model-00002-of-00002.safetensors" in ws["detail"], ws
+        (shard / "model-00002-of-00002.safetensors").write_bytes(b"w")
+        assert sv._local_dir_status_now(shard)["status"] == "ready"
+
+        legacy = mk("legacy")                          # .bin models still serve
+        (legacy / "pytorch_model.bin").write_bytes(b"w" * 8)
+        assert sv._local_dir_status_now(legacy)["status"] == "ready"
+
+        store = mk("store")                            # store dir by PATH: manifest %
+        (store / ".pull.json").write_text(_json.dumps(
+            {"model": "org/s", "files": {"model.safetensors": {"size": 100}}}))
+        (store / "model.safetensors").write_bytes(b"w" * 50)
+        ws = sv._local_dir_status_now(store)
+        assert ws["status"] == "incomplete" and "(50%)" in ws["detail"], ws
+        (store / "model.safetensors").write_bytes(b"w" * 100)
+        assert sv._local_dir_status_now(store)["status"] == "ready"
+
+        mid = mk("mid")                                # nothing but a .part yet
+        (mid / "model.safetensors.part").write_bytes(b"w")
+        ws = sv._local_dir_status_now(mid)
+        assert ws["status"] == "incomplete" and "mid-download" in ws["detail"], ws
+
+        empty = mk("empty")                            # wrong path: say what's here
+        (empty / "config.json").write_text("{}")
+        (empty / "README.md").write_text("x")
+        ws = sv._local_dir_status_now(empty)
+        assert ws["status"] == "incomplete", ws
+        assert "README.md" in ws["detail"] and "right path" in ws["detail"], ws
+
+        # end-to-end wiring: weights_status routes a dir path here
+        assert sv.weights_status("container", str(flat))["status"] == "ready"
+    ok("local-dir weights: flat/hub-root/nested/sharded-index/.bin/store-"
+       "manifest/mid-download all judged honestly; wrong path names contents")
+
     print(f"swap_test: {PASS} checks OK")
 
 
