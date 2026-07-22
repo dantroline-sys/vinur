@@ -39,7 +39,8 @@ def ok(label):
 def excl_cfg(td):
     toml = Path(td) / "c.toml"
     toml.write_text('[[serving.llms]]\nname = "primary"\nengine = "vllm"\n'
-                    'model = "a"\nport = 11438\nexclusive = true\n'
+                    'model = "a"\nserved_model_name = "brain"\n'
+                    'port = 11438\nexclusive = true\n'
                     '[[serving.llms]]\nname = "secondary"\nengine = "vllm"\n'
                     'model = "b"\nport = 11435\nexclusive = true\ndefault = true\n'
                     '[[serving.llms]]\nname = "tiny"\nengine = "llama"\n'
@@ -171,6 +172,16 @@ def main():
             sv.SWAP_REQ.unlink()
             code, res = call("POST", {"name": "tiny"})       # not exclusive
             assert code == 400, (code, res)
+            # aliases a CLIENT knows (Vinkona's auto-swap sends its model name):
+            # the model id and served_model_name resolve to the entry
+            code, res = call("POST", {"name": "b"})
+            assert code == 200 and res["requested"] == "secondary", (code, res)
+            sv.SWAP_REQ.unlink()
+            code, res = call("POST", {"name": "brain"})
+            assert code == 200 and res["requested"] == "primary", (code, res)
+            sv.SWAP_REQ.unlink()
+            code, res = call("POST", {"name": "ghost"})
+            assert code == 400 and "served_model_name" in res["error"], (code, res)
             sv.SWAP_STATE.unlink()
             code, res = call("POST", {"name": "secondary"})  # no supervisor
             assert code == 409, (code, res)

@@ -576,12 +576,22 @@ class Handler(BaseHTTPRequestHandler):
             # DST runs between its primary and secondary passes).
             from . import serving as sv
             name = str(req.get("name") or "")
-            names = [str(e.get("name")) for e in self.cfg["serving"]["llms"]
-                     if e.get("exclusive")]
+            excl = [e for e in self.cfg["serving"]["llms"] if e.get("exclusive")]
+            names = [str(e.get("name")) for e in excl]
             if name not in names:
-                return self._send_json(
-                    {"ok": False, "error": f"'{name}' is not an exclusive serving.llms "
-                     f"entry (have: {', '.join(names) or 'none'})"}, 400)
+                # accept the names a CLIENT knows: the model id or its
+                # served_model_name alias (Vinkona's big_lm.model) — the
+                # caller shouldn't need to learn this box's entry names
+                hit = next((e for e in excl
+                            if name and name in (str(e.get("model") or ""),
+                                                 str(e.get("served_model_name") or ""))),
+                           None)
+                if hit is None:
+                    return self._send_json(
+                        {"ok": False, "error": f"'{name}' matches no exclusive "
+                         "serving.llms entry, model or served_model_name "
+                         f"(have: {', '.join(names) or 'none'})"}, 400)
+                name = str(hit.get("name"))
             if not sv.swap_state():
                 return self._send_json(
                     {"ok": False, "error": "no swap state — supervisor not running"}, 409)
