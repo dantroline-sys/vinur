@@ -141,9 +141,21 @@ def _run_distill(cfg, embedder, log, *, limit=None, watch=False, interval=30, bu
                     log.warning("no distill endpoint up — waiting %ds…", interval)
                     time.sleep(interval)
                     continue
-                log.error("no distill endpoint up (extract=%s verify=%s) — start one first.",
+                ups = []
+                try:                       # never claim "nothing up" while
+                    from .serving import up_llm_urls   # something is serving
+                    ups = up_llm_urls(cfg)
+                except Exception:
+                    pass
+                hint = ("" if not ups else
+                        "  Serving RIGHT NOW: "
+                        + ", ".join(f"{n} at {u}" for n, u in ups)
+                        + " — point extract_urls / verify_urls there "
+                          "(Settings), or swap the expected model back in.")
+                log.error("no distill endpoint up (extract=%s verify=%s) — start one first.%s",
                           ", ".join(cfg.get("extract_urls") or []),
-                          ", ".join(cfg.get("verify_urls") or cfg.get("distill_urls") or []))
+                          ", ".join(cfg.get("verify_urls") or cfg.get("distill_urls") or []),
+                          hint)
                 rc = 1
                 break
             stats = distill_mod.distill_corpus(store, kb, extractors, embedder, cfg,

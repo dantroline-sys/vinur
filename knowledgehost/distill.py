@@ -1886,6 +1886,14 @@ def healthy_endpoints(cfg, urls=None, overrides=None, log=None) -> list:
     to the big-LM list; `overrides` patches the per-tier model/timeout/max_tokens onto
     each client (so the fast extractor and the verifier can differ)."""
     urls = urls if urls is not None else (cfg.get("distill_urls") or [cfg["distill_url"]])
+    try:
+        # exclusive swap: a URL naming a group member means "the big slot" —
+        # follow it to whoever is resident right now, or a Deploy/swap turns
+        # every configured endpoint into a dead port
+        from .serving import resident_url
+        urls = [resident_url(cfg, u) for u in urls]
+    except Exception:
+        pass
     seen, uniq = set(), []
     for u in urls:
         if u and u not in seen:

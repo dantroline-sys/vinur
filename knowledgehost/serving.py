@@ -705,6 +705,53 @@ def exclusive_entry_for_url(cfg: dict, url: str) -> str | None:
     return str(e.get("name")) if e else None
 
 
+def resident_url(cfg: dict, url: str) -> str:
+    """A distill/extract/verify URL that names a member of the EXCLUSIVE group
+    means 'the big slot', not that literal port.  Ports are per-entry under
+    exclusive swap, so a static endpoint list goes dark every time the
+    resident changes (Deploy / swap) — when the named entry is on standby and
+    a sibling holds the GPU, this returns the SIBLING's URL, so 'the
+    verifier' keeps meaning whoever is actually loaded.  (The model-name
+    difference heals itself: the distill client adopts a single-model
+    server's served name on the first 404.)"""
+    try:
+        name = exclusive_entry_for_url(cfg, url)
+        if not name:
+            return url
+        active = str((swap_state() or {}).get("active") or "")
+        if not active or active == name:
+            return url
+        e = next((x for x in cfg["serving"]["llms"]
+                  if str(x.get("name")) == active), None)
+        if not e or not e.get("port"):
+            return url
+        from urllib.parse import urlparse
+        u = urlparse(url)
+        return f"{u.scheme or 'http'}://{u.hostname or '127.0.0.1'}:{int(e['port'])}"
+    except Exception:
+        return url
+
+
+def up_llm_urls(cfg: dict) -> list:
+    """[(name, url)] of declared LLM services whose process is alive right
+    now — what the distill lane names when every CONFIGURED endpoint is down
+    ('nothing up' must not be claimed while something is serving)."""
+    from . import supervisor as sup
+    st = sup.read_state()
+    out = []
+    for e in (cfg.get("serving") or {}).get("llms") or []:
+        pid = (st.get("services") or {}).get(f"llm-{e.get('name')}")
+        try:
+            alive = bool(pid) and sup.alive(int(pid))
+        except (TypeError, ValueError):
+            alive = False
+        if alive and e.get("port"):
+            host = str(e.get("host") or "127.0.0.1")
+            out.append((str(e.get("name")),
+                        f"http://{host}:{int(e['port'])}"))
+    return out
+
+
 # Per-service control (Serving tab's start/stop/restart), one request file per
 # service so two buttons pressed together can't overwrite each other — unlike
 # the swap lane, where a single request file is the point (one GPU, one winner).

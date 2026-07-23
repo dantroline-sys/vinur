@@ -1583,6 +1583,44 @@ def main():
     ok("hand-placed folders join the picker (nested included; half-pulled and "
        "GGUF-only stay out) and Add service no longer demands an image template")
 
+    # ── resident_url: an exclusive member's URL means "the big slot" ────────
+    # Dan's live failure: verify_url named the 122B's port, Gemma was resident
+    # after a Deploy — distill declared "no endpoint up" while one was serving.
+    with tempfile.TemporaryDirectory() as td17:
+        scfg17 = excl_cfg(td17)
+        keep17 = sv.SWAP_STATE
+        try:
+            sv.SWAP_STATE = Path(td17) / "swap.json"
+            sv.SWAP_STATE.write_text(json.dumps(
+                {"active": "secondary", "status": "ready"}))
+            assert sv.resident_url(scfg17, "http://127.0.0.1:11438") == \
+                "http://127.0.0.1:11435"               # follow to the resident
+            assert sv.resident_url(scfg17, "http://127.0.0.1:11435") == \
+                "http://127.0.0.1:11435"               # already the resident
+            assert sv.resident_url(scfg17, "http://127.0.0.1:11441") == \
+                "http://127.0.0.1:11441"               # non-exclusive: untouched
+            sv.SWAP_STATE.write_text(json.dumps(
+                {"active": "primary", "status": "ready"}))
+            assert sv.resident_url(scfg17, "http://127.0.0.1:11438") == \
+                "http://127.0.0.1:11438"
+            sv.SWAP_STATE.unlink()                     # no supervisor: untouched
+            assert sv.resident_url(scfg17, "http://127.0.0.1:11438") == \
+                "http://127.0.0.1:11438"
+        finally:
+            sv.SWAP_STATE = keep17
+        # …and "nothing up" is never claimed silently while something serves
+        from knowledgehost import supervisor as sup17
+        keep_rs = sup17.read_state
+        try:
+            sup17.read_state = lambda: {"services": {"llm-tiny": os.getpid(),
+                                                     "llm-primary": 2 ** 30}}
+            ups = sv.up_llm_urls(scfg17)
+            assert ups == [("tiny", "http://127.0.0.1:11441")], ups
+        finally:
+            sup17.read_state = keep_rs
+    ok("resident_url follows the swap to whoever holds the GPU; up_llm_urls "
+       "names what actually serves")
+
     print(f"swap_test: {PASS} checks OK")
 
 
