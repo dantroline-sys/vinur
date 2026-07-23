@@ -1771,13 +1771,27 @@ class KB:
         return {"annotations": out, "graph_version": self.region_version(),
                 "requested": len(ids), "joined": joined}
 
-    def list_sources(self, limit=200):
-        rows = [dict(r) for r in self.db.execute(
-            "SELECT doc_id,title,source_type,trust_weight,regime,status,"
-            "COALESCE(NULLIF(bundle,''),'base') AS bundle,"
-            "license,license_holder,license_url "
-            "FROM source_registry ORDER BY rowid DESC LIMIT ?", (int(limit),))]
-        return rows
+    def list_sources(self, limit=200, bundle=None):
+        """Newest-first registry rows, optionally one bundle's.  The filter is
+        what keeps a busy bundle honest: the research loop's continuous drops
+        otherwise flood the newest N and older bundles LOOK deleted."""
+        q = ("SELECT doc_id,title,source_type,trust_weight,regime,status,"
+             "COALESCE(NULLIF(bundle,''),'base') AS bundle,"
+             "license,license_holder,license_url FROM source_registry ")
+        args: list = []
+        if bundle:
+            q += "WHERE COALESCE(NULLIF(bundle,''),'base')=? "
+            args.append(str(bundle))
+        q += "ORDER BY rowid DESC LIMIT ?"
+        args.append(int(limit))
+        return [dict(r) for r in self.db.execute(q, args)]
+
+    def source_bundle_counts(self):
+        """{bundle: docs} over the whole registry — the Sources view's proof
+        that nothing vanished when one bundle dominates the newest rows."""
+        return {r["b"]: r["n"] for r in self.db.execute(
+            "SELECT COALESCE(NULLIF(bundle,''),'base') AS b, COUNT(*) AS n "
+            "FROM source_registry GROUP BY b ORDER BY n DESC")}
 
     def list_merge_candidates(self, limit=100):
         out = []

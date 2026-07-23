@@ -508,7 +508,7 @@ def main():
                       "trust_weight": 0.6, "regime": "empirical", "status": "active",
                       "bundle": "base", "license": "", "license_holder": "",
                       "license_url": ""}]
-            httpd.kb = SimpleNamespace(list_sources=lambda n=200: srows)
+            httpd.kb = SimpleNamespace(list_sources=lambda n=200, bundle=None: srows)
             store0, httpd.store = httpd.store, pstore
             scfg["_master_kb_path"] = str(kbfile)
             try:
@@ -530,7 +530,7 @@ def main():
             assert [r0["doc_id"] for r0 in pq["rows"]] == ["new-book.pdf"]
             assert pq["rows"][0]["chunks"] == 2 and pq["rows"][0]["title"] == "Fresh"
             assert pstore.pending_sources(str(Path(td) / "no-such.db"), 5) == {}
-            httpd.kb = SimpleNamespace(list_sources=lambda n=200: srows)
+            httpd.kb = SimpleNamespace(list_sources=lambda n=200, bundle=None: srows)
             store0, httpd.store = httpd.store, pstore
             scfg["_master_kb_path"] = str(kbfile)
             try:
@@ -546,6 +546,32 @@ def main():
             assert p0["doc_id"] == "new-book.pdf" and p0["status"] == "queued"
             assert p0["pct"] == 0 and p0["distilled"] == 0 and p0["file_time"] == ""
             ok("queued sources: counted in totals + listed with status=queued")
+
+            # bundle filter + per-bundle counts: a busy bundle floods the
+            # newest-N registry rows, so the view must prove the others exist
+            httpd.kb = SimpleNamespace(
+                list_sources=lambda n=200, bundle=None:
+                    [r0 for r0 in srows if not bundle or r0["bundle"] == bundle],
+                source_bundle_counts=lambda: {"vinkona": 3000, "base": 463})
+            store0, httpd.store = httpd.store, pstore
+            scfg["_master_kb_path"] = str(kbfile)
+            try:
+                with urllib.request.urlopen(
+                        f"http://127.0.0.1:{port}/browse?kind=sources&bundle=base",
+                        timeout=5) as r:
+                    res = json.loads(r.read())
+                with urllib.request.urlopen(
+                        f"http://127.0.0.1:{port}/browse?kind=sources&bundle=ghost",
+                        timeout=5) as r:
+                    res_g = json.loads(r.read())
+            finally:
+                httpd.kb, httpd.store = None, store0
+                scfg.pop("_master_kb_path", None)
+            assert res["bundle"] == "base" and len(res["rows"]) == 2, res["bundle"]
+            assert res["bundles"] == {"vinkona": 3000, "base": 463}
+            assert res_g["rows"] == [] and res_g["bundles"]["base"] == 463
+            ok("sources view: bundle filter passes through; per-bundle counts "
+               "always ride along")
 
             # the vinkona exporter's client speaks the same lane
             sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent

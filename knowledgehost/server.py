@@ -255,11 +255,12 @@ class Handler(BaseHTTPRequestHandler):
             kb = getattr(self.server, "kb", None)
             kind = (q.get("kind") or ["nodes"])[0]
             n = min(int((q.get("n") or ["50"])[0] or 50), 200)
+            bsel = (q.get("bundle") or [""])[0]
             fn = {
                 "nodes": lambda: kb.sample_nodes(n),
                 "edges": lambda: kb.list_edges(n),
                 "cards": lambda: kb.list_cards(n),
-                "sources": lambda: kb.list_sources(n),
+                "sources": lambda: kb.list_sources(n, bundle=bsel or None),
                 "adjudication": lambda: kb.list_merge_candidates(n),
                 "gaps": lambda: kb.list_gaps(n),
             }.get(kind)
@@ -304,7 +305,11 @@ class Handler(BaseHTTPRequestHandler):
                 if "total_docs" in pq:
                     totals = {"docs": pq["total_docs"], "queued": pq["pending_docs"]}
             return self._send_json({"ok": True, "kind": kind, "rows": rows,
-                                    "pending": pend, "totals": totals})
+                                    "pending": pend, "totals": totals,
+                                    "bundle": bsel,
+                                    "bundles": (kb.source_bundle_counts()
+                                                if hasattr(kb, "source_bundle_counts")
+                                                else {})})
         if path == "/search":                      # viewer: run kb_search (no auth, read-only)
             query = (q.get("q") or [""])[0]
             k = int((q.get("k") or ["8"])[0] or 8)

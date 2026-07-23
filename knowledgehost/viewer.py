@@ -648,12 +648,14 @@ async function load(kind) {
       const res = await (await fetch(`sample?n=25${src ? '&source_type=' + encodeURIComponent(src) : ''}`)).json();
       return renderPassages(res.passages, false);
     }
-    const res = await (await fetch(`browse?kind=${kind}&n=100`)).json();
+    const bq = (kind === 'sources' && SRCBUNDLE) ? '&bundle=' + encodeURIComponent(SRCBUNDLE) : '';
+    const res = await (await fetch(`browse?kind=${kind}&n=100${bq}`)).json();
     const rows = res.rows || [];
     if (kind === 'nodes') return renderNodes(rows);
     if (kind === 'edges') return renderEdges(rows);
     if (kind === 'cards') return renderCards(rows);
-    if (kind === 'sources') return renderSources(rows, res.pending || [], res.totals || {});
+    if (kind === 'sources') return renderSources(rows, res.pending || [], res.totals || {},
+                                                 res.bundles || {});
     if (kind === 'adjudication') return renderTable(rows,
       [['node_a', 'node A'], ['node_b', 'node B'], ['similarity', 'sim'],
        ['reason', 'reason'], ['status', 'status']], 'Adjudication queue empty.');
@@ -663,10 +665,28 @@ async function load(kind) {
 
 // sources get distillation-progress, the file's own date, AND the queue —
 // ingested docs the distiller hasn't reached (invisible to the registry)
-function renderSources(rows, pending, totals) {
-  rows = rows || []; pending = pending || []; totals = totals || {};
+let SRCBUNDLE = '';                    // sources view: the selected bundle filter
+function srcBundlePick(b) { SRCBUNDLE = b; load('sources'); }
+function renderSources(rows, pending, totals, bundles) {
+  rows = rows || []; pending = pending || []; totals = totals || {}; bundles = bundles || {};
+  // per-bundle counts FIRST: the registry lists newest-first with a row cap,
+  // and one busy bundle (the research loop's drops) floods it — the chips
+  // prove the other bundles still exist and filter to them in one click
+  let chips = '';
+  const bnames = Object.keys(bundles);
+  if (bnames.length > 1 || SRCBUNDLE) {
+    const one = b => `<button class="toolbtn" style="font-size:12px;padding:2px 10px;
+        ${SRCBUNDLE === b ? 'font-weight:700;text-decoration:underline;' : ''}"
+        onclick="srcBundlePick('${esc(b)}')">${b ? esc(b) : 'all'}${b ? ' · ' + fmtCompact(bundles[b]) : ''}</button>`;
+    chips = `<div style="margin-bottom:8px;display:flex;gap:6px;flex-wrap:wrap;align-items:center">
+      <span style="opacity:.6;font-size:12px">bundle:</span>${one('')}
+      ${bnames.map(one).join('')}</div>`;
+  }
   if (!rows.length && !pending.length) {
-    return setRows('', 'No sources yet — ingest something (Operations → ingest).');
+    const msg = SRCBUNDLE
+      ? `No sources in bundle '${esc(SRCBUNDLE)}'.`
+      : 'No sources yet — ingest something (Operations → ingest).';
+    return setRows(chips ? chips + `<p style="opacity:.7">${msg}</p>` : '', msg);
   }
   let tot = 0, dist = 0;
   rows.forEach(r => { tot += r.chunks || 0; dist += r.distilled || 0; });
@@ -704,7 +724,7 @@ function renderSources(rows, pending, totals) {
       + `. They enter the registry (trust/regime editable) once their first chunk distils.</td></tr>`;
     body += pending.map(r => row(r, true)).join('');
   }
-  setRows(summary + '<table>' + head + body + '</table>');
+  setRows(chips + summary + '<table>' + head + body + '</table>');
 }
 
 // gaps get a per-row dismiss; rows are index-keyed (query text is untrusted —

@@ -2033,12 +2033,17 @@ def _zone_skip_set(cfg) -> frozenset:
 
 
 def _pending_chunks(store, kb, counter, bundle=None, cfg=None):
-    """counter: [already-done, zone-skipped, duplicate].  Stashes ch['zone'] on
-    every yielded chunk so the prompt lens can adapt (code)."""
+    """counter: [already-done, zone-skipped, duplicate, outside-bundle].
+    Stashes ch['zone'] on every yielded chunk so the prompt lens can adapt
+    (code).  Outside-bundle drops are COUNTED (slot 3, when provided): a
+    bundle-restricted pass that reports only 'skipped' reads as failure when
+    it is actually ignoring the rest of the corpus by design."""
     skip = _zone_skip_set(cfg)
     dedupe_on = (cfg or {}).get("distill_dedupe", True)
     for ch in store.iter_chunks():
         if bundle is not None and _chunk_bundle(ch) != bundle:
+            if len(counter) > 3:
+                counter[3] += 1
             continue
         if kb.is_distilled(ch["id"]):
             counter[0] += 1
@@ -2065,7 +2070,7 @@ def _pending_chunks(store, kb, counter, bundle=None, cfg=None):
 
 def _distill_sequential(store, kb, lm, embedder, cfg, *, limit=None, bundle=None) -> dict:
     done = concepts = relations = cards = 0
-    skipped = [0, 0, 0]
+    skipped = [0, 0, 0, 0]
     every = cfg["ingest_log_every"]
     for chunk in _pending_chunks(store, kb, skipped, bundle=bundle, cfg=cfg):
         reg = regime_for_path(cfg, chunk.get("path_or_url") or chunk.get("id"))
@@ -2085,7 +2090,7 @@ def _distill_sequential(store, kb, lm, embedder, cfg, *, limit=None, bundle=None
             break
     return {"chunks": done, "concepts": concepts, "relations": relations, "cards": cards,
             "skipped": skipped[0], "skipped_zone": skipped[1],
-            "skipped_dupe": skipped[2]}
+            "skipped_dupe": skipped[2], "outside_bundle": skipped[3]}
 
 
 def _distill_parallel(store, kb, lms, embedder, cfg, *, limit=None, bundle=None) -> dict:
@@ -2102,7 +2107,7 @@ def _distill_parallel(store, kb, lms, embedder, cfg, *, limit=None, bundle=None)
     alive = {id(lm) for lm in lms}
     writer_lm = lms[0]                                # used for reconciliation's 5-way
     done = concepts = relations = cards = 0
-    skipped = [0, 0, 0]
+    skipped = [0, 0, 0, 0]
     every = cfg["ingest_log_every"]
 
     def extract_job(chunk, regime):
@@ -2175,7 +2180,7 @@ def _distill_parallel(store, kb, lms, embedder, cfg, *, limit=None, bundle=None)
                     submit_next()
     return {"chunks": done, "concepts": concepts, "relations": relations, "cards": cards,
             "skipped": skipped[0], "skipped_zone": skipped[1],
-            "skipped_dupe": skipped[2]}
+            "skipped_dupe": skipped[2], "outside_bundle": skipped[3]}
 
 
 # ── recard corpus sweep ──────────────────────────────────────────────────────────
@@ -2386,7 +2391,8 @@ def _distill_pipeline(store, kb, extractors, verifiers, embedder, cfg, *, limit=
     verify_done = threading.Event()
     lock = threading.Lock()
     st = {"done": 0, "concepts": 0, "relations": 0, "cards": 0, "skipped": 0,
-          "skipped_zone": 0, "skipped_dupe": 0, "rejected": 0, "adjusted": 0, "vfail": 0,
+          "skipped_zone": 0, "skipped_dupe": 0, "outside_bundle": 0,
+          "rejected": 0, "adjusted": 0, "vfail": 0,
           "extract_alive": len(extractors), "verify_alive": len(verifiers),
           "stop": False}
     every = cfg["ingest_log_every"]
@@ -2399,6 +2405,8 @@ def _distill_pipeline(store, kb, extractors, verifiers, embedder, cfg, *, limit=
                 if st["stop"]:
                     break
                 if bundle is not None and _chunk_bundle(ch) != bundle:
+                    with lock:
+                        st["outside_bundle"] += 1
                     continue
                 if fcon.execute("SELECT 1 FROM distilled_chunks WHERE chunk_id=?",
                                 (ch["id"],)).fetchone():
@@ -2572,5 +2580,5 @@ def _distill_pipeline(store, kb, extractors, verifiers, embedder, cfg, *, limit=
         raise BackendUnavailable("all fast extractor endpoints failed")
     return {"chunks": st["done"], "concepts": st["concepts"], "relations": st["relations"],
             "cards": st["cards"], "skipped": st["skipped"], "skipped_zone": st["skipped_zone"],
-            "skipped_dupe": st["skipped_dupe"],
+            "skipped_dupe": st["skipped_dupe"], "outside_bundle": st["outside_bundle"],
             "rejected": st["rejected"], "adjusted": st["adjusted"], "verify_failed": st["vfail"]}

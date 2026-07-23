@@ -161,6 +161,15 @@ def _run_distill(cfg, embedder, log, *, limit=None, watch=False, interval=30, bu
             stats = distill_mod.distill_corpus(store, kb, extractors, embedder, cfg,
                                                limit=limit, verifiers=verifiers, bundle=bundle)
             log.info("distilled: %s", stats)
+            if not stats.get("chunks"):
+                # a wall of zero-and-skipped stats reads as failure — say the
+                # true thing: this lane has no pending work
+                log.info("nothing to distill%s: %s chunk(s) already done, "
+                         "%s outside the bundle, %s furniture-zone, %s duplicate "
+                         "— this lane is COMPLETE, not failing",
+                         f" in bundle '{bundle}'" if bundle else "",
+                         stats.get("skipped", 0), stats.get("outside_bundle", 0),
+                         stats.get("skipped_zone", 0), stats.get("skipped_dupe", 0))
             log.info("kb: %s", kb.counts())
             ops_mod.emit_result(stats.get("chunks", 0) > 0, **stats)
             if not watch or limit:
