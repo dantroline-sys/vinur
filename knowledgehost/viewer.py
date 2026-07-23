@@ -1151,9 +1151,10 @@ function svModelPicker(m, enabled) {
   const ch = (m.choices || []).slice();
   if (!ch.some(c => c.model === m.model))
     ch.unshift({ model: m.model, size_gb: 0, via: 'configured' });
-  if (ch.length < 2) return esc(m.model);
+  if (ch.length < 2) return m.model ? esc(m.model) : '<i style="opacity:.6">(no model set)</i>';
   const opts = ch.map(c => `<option value="${esc(c.model)}"${c.model === m.model ? ' selected' : ''}>`
-    + esc(c.model + (c.size_gb ? ` — ${c.size_gb} GB` : '')
+    + esc((c.model || '(no model set — pick one)')
+          + (c.size_gb ? ` — ${c.size_gb} GB` : '')
           + (c.via === 'hub cache' ? ' (hub cache)' : ''))
     + `</option>`).join('');
   const tip = `every model on this disk that ${esc(m.engine)} can serve — pick one, then Deploy`;

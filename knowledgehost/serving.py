@@ -1210,6 +1210,13 @@ def weights_status(engine: str, model: str) -> dict:
     ready | incomplete (mid-download or an interrupted/failed fetch) | missing.
     The service can be 'up' while vLLM is still downloading — this is the
     signal that distinguishes 'loading' from 'the fetch died'."""
+    if not str(model or "").strip():
+        # an entry awaiting its first pick — without this guard Path("")
+        # resolves to the repo root and the layout scanner "finds" some
+        # other model's weights there
+        return {"status": "missing", "path": "",
+                "detail": "no model set — pick one from this row's picker "
+                          "(more choices: pull below / Ops › find)"}
     if engine == "llama":
         p = Path(_anchored(model))
         if p.is_file():

@@ -768,48 +768,57 @@ def set_net_setting(config_path: str, key: str, value) -> str:
     return v
 
 
+# The [[serving.llms]] header, as TOML actually allows it: whitespace inside
+# the brackets and a trailing comment are both valid — the READ path (tomllib)
+# always accepted them, so the WRITE path must too, or the panel shows an
+# entry it then claims does not exist.
+import re as _hdr_re
+_LLMS_HDR = _hdr_re.compile(r"^\[\[\s*serving\.llms\s*\]\]\s*(?:#.*)?$")
+
+
+def _llms_entry(text: str, name: str):
+    """The named serving.llms entry as the REAL parser sees `text`, or None.
+    Raises ValueError when the text does not parse — the writers call this on
+    their result BEFORE it replaces the file, so an edit that would corrupt
+    config.toml never lands."""
+    try:
+        data = tomllib.loads(text)
+    except tomllib.TOMLDecodeError as e:
+        raise ValueError(f"refusing to write: the edit would corrupt config.toml ({e})")
+    for e in (data.get("serving") or {}).get("llms") or []:
+        if str(e.get("name")) == name:
+            return e
+    return None
+
+
 def update_llm_model(config_path: str, name: str, model: str) -> str:
-    """Rewrite ONE [[serving.llms]] entry's `model = ...` line in config.toml,
-    in place, preserving comments and everything else — the Serving tab's
-    model picker.  Returns the old value.  ValueError when no entry carries
-    that name (or it has no model line to rewrite)."""
-    import re as _re
+    """Repoint ONE [[serving.llms]] entry's model — the Serving tab's picker.
+    In place, comments preserved; an entry with NO model line yet (added by
+    hand, awaiting its first pick) gains one.  Returns the old value ('' if
+    none was set)."""
     p = Path(config_path).expanduser()
-    lines = p.read_text().splitlines()
-    blocks: list[tuple[int, int]] = []
-    start = None
-    for i, ln in enumerate(lines):
-        s = ln.strip()
-        if s.startswith("["):
-            if start is not None:
-                blocks.append((start, i))
-                start = None
-            if s == "[[serving.llms]]":
-                start = i
-    if start is not None:
-        blocks.append((start, len(lines)))
-    name_re = _re.compile(r"""^\s*name\s*=\s*["'](?P<v>[^"']*)["']""")
-    model_re = _re.compile(r"""^(\s*model\s*=\s*)(["'].*?["'])(\s*(?:#.*)?)$""")
-    for a, b in blocks:
-        if not any((m := name_re.match(lines[j])) and m.group("v") == name
-                   for j in range(a, b)):
-            continue
-        for j in range(a, b):
-            m = model_re.match(lines[j])
-            if m:
-                old = m.group(2)[1:-1]
-                lines[j] = f'{m.group(1)}"{model}"{m.group(3)}'
-                _replace_text(p, "\n".join(lines) + "\n")
-                return old
-        raise ValueError(f"entry '{name}' has no model = \"…\" line to rewrite")
-    raise ValueError(f"no [[serving.llms]] entry named '{name}' in {p.name}")
+    old = ""
+    try:
+        e = _llms_entry(p.read_text(), name)
+        old = str((e or {}).get("model") or "")
+    except (OSError, ValueError):
+        pass
+    update_llm_entry(config_path, name, {"model": model})
+    return old
 
 
 def update_llm_entry(config_path: str, name: str, updates: dict) -> dict:
     """Rewrite / insert / REMOVE scalar keys in ONE [[serving.llms]] block, in
-    place — the Tune editor's writer.  A value of None removes the key, so the
-    engine's own default returns.  Comments (including a rewritten line's
-    trailing comment) and every other line survive.  Returns what applied."""
+    place — the Tune editor's and the model picker's writer.  A value of None
+    removes the key, so the engine's own default returns.  Comments (including
+    a rewritten line's trailing comment) and every other line survive.
+
+    Two honesty guarantees on top of the surgical edit:
+      • lost-block errors say what the REAL parser sees — "no entry named X
+        (have: a, b)" vs "X exists but its block defeats in-place editing";
+      • the result is re-parsed and value-checked BEFORE it replaces the
+        file, so config.toml can never be corrupted or silently unchanged.
+    Returns what applied."""
     import re as _re
     p = Path(config_path).expanduser()
     lines = p.read_text().splitlines()
@@ -823,7 +832,7 @@ def update_llm_entry(config_path: str, name: str, updates: dict) -> dict:
                 if start is not None:
                     blocks.append((start, i))
                     start = None
-                if s == "[[serving.llms]]":
+                if _LLMS_HDR.match(s):
                     start = i
         if start is not None:
             blocks.append((start, len(lines)))
@@ -831,7 +840,20 @@ def update_llm_entry(config_path: str, name: str, updates: dict) -> dict:
             if any((m := name_re.match(lines[j])) and m.group("v") == name
                    for j in range(a, b)):
                 return a, b
-        raise ValueError(f"no [[serving.llms]] entry named '{name}' in {p.name}")
+        # not locatable — let the real parser name the actual problem
+        try:
+            data = tomllib.loads("\n".join(lines))
+            have = [str(e.get("name")) for e in
+                    (data.get("serving") or {}).get("llms") or []]
+        except tomllib.TOMLDecodeError:
+            have = None
+        if have and name in have:
+            raise ValueError(
+                f"entry '{name}' exists but its block defeats in-place editing "
+                "— write it as a [[serving.llms]] block (not an inline "
+                "llms = [...] array) and it becomes editable")
+        raise ValueError(f"no [[serving.llms]] entry named '{name}' in {p.name}"
+                         + (f" (have: {', '.join(have)})" if have else ""))
 
     _block()                                   # existence check before any edit
     applied: dict = {}
@@ -854,7 +876,15 @@ def update_llm_entry(config_path: str, name: str, updates: dict) -> dict:
                 end -= 1                       # any blank gap before the next header
             lines[end:end] = [f"{key} = {_toml_scalar(val)}"]
         applied[key] = val
-    _replace_text(p, "\n".join(lines) + "\n")
+    new_text = "\n".join(lines) + "\n"
+    ent = _llms_entry(new_text, name)          # parses, or raises — nothing written
+    for k, v in applied.items():
+        took = (k not in (ent or {})) if v is None else ((ent or {}).get(k) == v)
+        if not took:
+            raise ValueError(
+                f"the {k} edit did not take — this block's formatting defeats "
+                "the in-place editor; nothing was written")
+    _replace_text(p, new_text)
     return applied
 
 
@@ -895,13 +925,16 @@ def add_llm_entry(config_path: str, entry: dict) -> str:
             if in_llms:
                 last_end = i
                 in_llms = False
-            if s == "[[serving.llms]]":
+            if _LLMS_HDR.match(s):
                 in_llms = True
     if in_llms:
         last_end = len(lines)
     at = last_end if last_end is not None else len(lines)
     lines[at:at] = block
-    _replace_text(p, "\n".join(lines) + "\n")
+    new_text = "\n".join(lines) + "\n"
+    if _llms_entry(new_text, name) is None:    # parses, or raises — nothing written
+        raise ValueError("the new block did not take — please report this")
+    _replace_text(p, new_text)
     return name
 
 

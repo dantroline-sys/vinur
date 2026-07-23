@@ -1463,6 +1463,66 @@ def main():
        "config.toml), slot keys -> entry, required port refused, and Deploy "
        "brings the new model's own tuning")
 
+    # ── the write path must accept everything the READ path accepts ─────────
+    # Dan's live failure: tomllib happily parses '[[ serving.llms ]]  # note'
+    # so the panel SHOWS the entry, but the in-place editors demanded the
+    # header be exactly '[[serving.llms]]' — every Deploy/Tune write then
+    # claimed "no entry named 'secondary'" and the picker reverted.
+    from knowledgehost.config import add_llm_entry, update_llm_entry
+    with tempfile.TemporaryDirectory() as td15:
+        cp15 = Path(td15) / "c.toml"
+        cp15.write_text(
+            "[serving]\n"
+            "[[ serving.llms ]]   # hand-written, spaced header\n"
+            'name = "primary"\nengine = "container"\nmodel = "org/alpha"\n'
+            "port = 11438\nexclusive = true\n"
+            "\n"
+            "[[serving.llms]]  # gemma, no model picked yet\n"
+            'name = "secondary"\nengine = "container"\n'
+            "port = 11439\nexclusive = true\n"
+            "[serving.embed]\nenabled = false\n")
+        # tolerant headers: both entries editable in place
+        old = update_llm_model(str(cp15), "primary", "org/beta")
+        assert old == "org/alpha"
+        assert 'model = "org/beta"' in cp15.read_text()
+        # a block with NO model line gains one (the empty-picker entry)
+        old = update_llm_model(str(cp15), "secondary", "models/Gemma-4-31B")
+        assert old == ""
+        txt = cp15.read_text()
+        blk = txt[txt.index('name = "secondary"'):]
+        assert 'model = "models/Gemma-4-31B"' in blk.split("[serving.embed]")[0]
+        assert load_config(str(cp15))["serving"]["llms"][1]["model"] == \
+            "models/Gemma-4-31B"                       # the real parser agrees
+        # unknown entries name what IS there
+        try:
+            update_llm_entry(str(cp15), "ghost", {"port": 1})
+            raise AssertionError("unknown entry must raise")
+        except ValueError as e:
+            assert "have: primary, secondary" in str(e), e
+        # an inline llms = [...] array: visible to the parser, honestly
+        # refused by the editor (instead of 'no entry named')
+        cp16 = Path(td15) / "inline.toml"
+        cp16.write_text('[serving]\nllms = [{name = "solo", engine = "llama", '
+                        'model = "m.gguf", port = 1}]\n')
+        try:
+            update_llm_entry(str(cp16), "solo", {"ctx_size": 2048})
+            raise AssertionError("inline array must be refused, not mis-reported")
+        except ValueError as e:
+            assert "defeats in-place editing" in str(e), e
+        # add_llm_entry appends after a spaced-header block, and the result parses
+        add_llm_entry(str(cp15), {"name": "tiny", "engine": "llama",
+                                  "model": "m.gguf", "port": 11441})
+        names = [e["name"] for e in load_config(str(cp15))["serving"]["llms"]]
+        assert names == ["primary", "secondary", "tiny"], names
+    ok("config writers accept every header TOML accepts, insert a missing "
+       "model line, verify results with the real parser, and name what "
+       "exists when refusing")
+
+    # an entry with NO model must say so — not scan the repo root
+    ws15 = sv.weights_status("container", "")
+    assert ws15["status"] == "missing" and "no model set" in ws15["detail"], ws15
+    ok("weights_status: empty model -> 'no model set', never a root scan")
+
     print(f"swap_test: {PASS} checks OK")
 
 
