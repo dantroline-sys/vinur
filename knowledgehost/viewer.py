@@ -705,9 +705,26 @@ function renderSources(rows, pending, totals, bundles) {
   const head = '<tr><th>doc</th><th>title</th><th>type</th><th>trust</th><th>regime</th>'
     + '<th>status</th><th>chunks</th><th>distilled</th><th>file date</th></tr>';
   const row = (r, queued) => {
+    // a doc can be COMPLETE below 100%: furniture zones (references/toc/
+    // index) are deliberately never distilled, and shared-text chunks were
+    // distilled under another doc — say so instead of looking stuck
+    const pending = Math.max(0, (r.chunks || 0) - (r.distilled || 0) - (r.zoned || 0));
+    let why = '';
+    if (r.pct != null) {
+      const bits = [];
+      if (pending) bits.push(`${fmtCompact(pending)} pending`);
+      else if (r.pct < 100) bits.push('✓ complete');
+      if (r.zoned) bits.push(`${fmtCompact(r.zoned)} furniture`);
+      if (bits.length)
+        why = ` <span style="opacity:.6;font-size:11px">· ${bits.join(' · ')}</span>`;
+    }
+    const tipbits = [`${r.distilled} / ${r.chunks} chunks distilled`];
+    if (r.dupes) tipbits.push(`${r.dupes} shared-text (distilled under another doc)`);
+    if (r.zoned) tipbits.push(`${r.zoned} furniture-zone (deliberately skipped)`);
+    if (pending) tipbits.push(`${pending} pending`);
     const pcell = r.pct == null ? '—'
-      : `<span class="pbar" title="${esc(r.distilled)} / ${esc(r.chunks)} chunks">`
-        + `<i style="width:${r.pct}%"></i></span> ${r.pct}%`;
+      : `<span class="pbar" title="${esc(tipbits.join(' · '))}">`
+        + `<i style="width:${r.pct}%"></i></span> ${r.pct}%${why}`;
     return `<tr${queued ? ' style="opacity:.65"' : ''}><td>${esc(r.doc_id)}</td>
       <td>${esc(r.title)}</td><td>${esc(r.source_type)}</td>
       <td>${r.trust_weight != null ? esc(r.trust_weight) : '—'}</td>

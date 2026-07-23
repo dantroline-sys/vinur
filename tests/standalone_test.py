@@ -500,6 +500,22 @@ def main():
             assert "ghost" not in prog
             assert pstore.source_progress(str(Path(td) / "no-such-kb.db"),
                                           [str(docfile)]) == {}, "bad kb -> {}"
+            # with the dedupe/zone tables present, progress carries the WHY:
+            # c1 was shared text (distilled under another doc), c2 is furniture
+            # — 3/4 distilled + 1 furniture = COMPLETE, not stuck at 75%
+            kcon = sqlite3.connect(kbfile)
+            kcon.execute("CREATE TABLE chunk_dupes(chunk_id TEXT PRIMARY KEY,"
+                         "of_chunk_id TEXT, text_hash TEXT, kind TEXT,"
+                         "similarity REAL, found_at REAL)")
+            kcon.execute("CREATE TABLE zone_skips(chunk_id TEXT PRIMARY KEY,"
+                         "zone TEXT, at REAL)")
+            kcon.execute("INSERT INTO chunk_dupes VALUES ('c1','other','h','exact',1.0,0)")
+            kcon.execute("INSERT INTO zone_skips VALUES ('c2','references',0)")
+            kcon.commit()
+            kcon.close()
+            prog = pstore.source_progress(str(kbfile), [str(docfile)])
+            assert prog[str(docfile)] == {"chunks": 4, "distilled": 3,
+                                          "dupes": 1, "zoned": 1}, prog
             srows = [{"doc_id": str(docfile), "title": "Book", "source_type": "pdf",
                       "trust_weight": 1.0, "regime": "empirical", "status": "active",
                       "bundle": "base", "license": "", "license_holder": "",
@@ -942,6 +958,9 @@ def main():
 
         def is_distilled(self, cid):
             return cid in self.distilled
+
+        def mark_zone_skipped(self, cid, zone):
+            pass                                        # progress bookkeeping only
 
         def recard_version(self, cid):
             return self.recarded.get(cid, 0)

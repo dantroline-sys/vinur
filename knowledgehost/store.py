@@ -350,6 +350,26 @@ class SqliteStore:
             con.execute("ATTACH ? AS kbdb", (str(kb_path),))
             marks = ",".join("?" * len(docs))
             out = {}
+            try:
+                # the full picture: distilled (incl. shared-text dupes, which
+                # ARE marked distilled), how many of those were dupes, and the
+                # furniture the distiller deliberately walks past — so 40%
+                # with zero pending reads COMPLETE, not stuck
+                for doc, tot, dist, dupe, zoned in con.execute(
+                        f"SELECT path_or_url, COUNT(*), "
+                        f"SUM(EXISTS(SELECT 1 FROM kbdb.distilled_chunks d "
+                        f"           WHERE d.chunk_id = chunks.id)), "
+                        f"SUM(EXISTS(SELECT 1 FROM kbdb.chunk_dupes cd "
+                        f"           WHERE cd.chunk_id = chunks.id)), "
+                        f"SUM(EXISTS(SELECT 1 FROM kbdb.zone_skips z "
+                        f"           WHERE z.chunk_id = chunks.id)) "
+                        f"FROM chunks WHERE path_or_url IN ({marks}) "
+                        f"GROUP BY path_or_url", list(docs)):
+                    out[doc] = {"chunks": tot, "distilled": dist or 0,
+                                "dupes": dupe or 0, "zoned": zoned or 0}
+                return out
+            except sqlite3.Error:      # an older kb.db without the new tables
+                pass
             for doc, tot, dist in con.execute(
                     f"SELECT path_or_url, COUNT(*), "
                     f"SUM(EXISTS(SELECT 1 FROM kbdb.distilled_chunks d "

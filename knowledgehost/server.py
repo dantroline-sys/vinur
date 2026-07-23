@@ -289,6 +289,8 @@ class Handler(BaseHTTPRequestHandler):
                     p = prog.get(r["doc_id"]) or {}
                     r["chunks"] = p.get("chunks", 0)
                     r["distilled"] = p.get("distilled", 0)
+                    r["dupes"] = p.get("dupes", 0)
+                    r["zoned"] = p.get("zoned", 0)
                     r["pct"] = (round(r["distilled"] / r["chunks"] * 100)
                                 if r["chunks"] else None)
                     stamp(r)

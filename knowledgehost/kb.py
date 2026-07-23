@@ -290,6 +290,12 @@ class KB:
             chunk_id TEXT PRIMARY KEY, of_chunk_id TEXT, text_hash TEXT,
             kind TEXT DEFAULT 'exact', similarity REAL, found_at REAL);
         CREATE INDEX IF NOT EXISTS chunk_dupes_of ON chunk_dupes(of_chunk_id);
+        -- furniture the distiller deliberately walks past (references/toc/
+        -- index/boilerplate zones).  Recorded so a document's progress can
+        -- SAY "the missing 60% is furniture" instead of looking stuck at 40%.
+        -- A chunk that later distils (zone config changed) leaves this table.
+        CREATE TABLE IF NOT EXISTS zone_skips(
+            chunk_id TEXT PRIMARY KEY, zone TEXT, at REAL);
 
         CREATE TABLE IF NOT EXISTS node_merge_candidates(
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -1202,6 +1208,17 @@ class KB:
         self.db.execute(
             "INSERT OR IGNORE INTO distilled_chunks(chunk_id,distilled_at) VALUES(?,?)",
             (chunk_id, time.time()))
+        # distilled after all (the zone-skip set changed): not furniture anymore
+        self.db.execute("DELETE FROM zone_skips WHERE chunk_id=?", (chunk_id,))
+        self._maybe_commit()
+
+    def mark_zone_skipped(self, chunk_id, zone: str):
+        """Record a furniture skip so per-doc progress can name it — without
+        this a document whose tail is references/index reads 'stuck at 40%'
+        forever and invites bug hunts (it did)."""
+        self.db.execute(
+            "INSERT OR IGNORE INTO zone_skips(chunk_id,zone,at) VALUES(?,?,?)",
+            (chunk_id, str(zone or ""), time.time()))
         self._maybe_commit()
 
     # ── duplicate text (the janitor; see dedupe.py) ──────────────────────────

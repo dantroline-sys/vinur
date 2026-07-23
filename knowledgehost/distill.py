@@ -2051,6 +2051,7 @@ def _pending_chunks(store, kb, counter, bundle=None, cfg=None):
         ch["zone"] = zones.classify(ch.get("section") or "", ch.get("text") or "")
         if ch["zone"] in skip:
             counter[1] += 1
+            kb.mark_zone_skipped(ch["id"], ch["zone"])
             continue
         if dedupe_on:
             # The same text by another route (a re-exported research drop, a
@@ -2416,6 +2417,10 @@ def _distill_pipeline(store, kb, extractors, verifiers, embedder, cfg, *, limit=
                 ch["zone"] = zones.classify(ch.get("section") or "",
                                             ch.get("text") or "")
                 if ch["zone"] in _zone_skip_set(cfg):
+                    fcon.execute("INSERT OR IGNORE INTO zone_skips"
+                                 "(chunk_id,zone,at) VALUES(?,?,?)",
+                                 (ch["id"], ch["zone"], time.time()))
+                    fcon.commit()
                     with lock:
                         st["skipped_zone"] += 1
                     continue
