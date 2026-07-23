@@ -1376,7 +1376,9 @@ def _eligible_models_now(engine: str, root: Path, cfg: dict | None) -> list[dict
 
     store = root / "models"
     if engine in ("vllm", "container"):
+        manifested: set = set()
         for mf in sorted(store.glob("*/.pull.json")):
+            manifested.add(mf.parent)
             try:
                 man = json.loads(mf.read_text())
             except (OSError, ValueError):
@@ -1388,6 +1390,31 @@ def _eligible_models_now(engine: str, root: Path, cfg: dict | None) -> list[dict
             if mid and pull_mod.pulled(root, mid):
                 gb = round(sum(int(v.get("size") or 0) for v in files.values()) / 2**30, 1)
                 add(mid, gb, "store")
+        # hand-placed folders (no broker manifest): weights downloaded by
+        # hand, copied from another box, or unpacked from an archive are just
+        # as servable — offer any models/ dir holding a COMPLETE safetensors/
+        # .bin/.pt set (nested one folder down counts: the weights-holding
+        # dir is what gets offered).  The model string is the dir path
+        # relative to the repo root; resolve_model passes paths through.
+        def _st_dir(d: Path):
+            okd, _ = _weights_here(d)
+            if okd and (any(d.glob("*.safetensors")) or any(d.glob("pytorch_model*.bin"))
+                        or any(d.glob("*.pt"))):
+                return d
+            hit = next((f for pat in ("*.safetensors", "pytorch_model*.bin", "*.pt")
+                        for f in sorted(d.rglob(pat))), None)
+            if hit and _weights_here(hit.parent)[0]:
+                return hit.parent
+            return None
+
+        for d in (sorted(p for p in store.iterdir() if p.is_dir())
+                  if store.is_dir() else []):
+            if d in manifested:
+                continue                      # the manifest lane owns it (and
+            cand = _st_dir(d)                 # half-pulled must NOT appear)
+            if cand is not None:
+                add(str(cand.relative_to(root)), round(_tree_size(cand) / 2**30, 1),
+                    "models/")
         # the legacy hub cache is deliberately NOT offered: models/ is the one
         # obvious folder.  Cached weights still LOAD (resolve_model passes ids
         # through and the offline env reads the cache) — `adopt` moves them
@@ -1650,13 +1677,18 @@ def main(argv: list[str] | None = None) -> None:
                      f"(have: {', '.join(entries) or 'none'})")
         entry = entries[ns.name]
         entry = resolve_model(entry)           # HF id -> local store path when pulled
-        ws = weights_status(str(entry.get("engine") or ""), str(entry.get("model") or ""))
+        model = str(entry.get("model") or "")
+        if not model.strip():
+            # an entry awaiting its first pick — say that, not "pull None"
+            sys.exit(f"entry '{ns.name}' has no model set — pick one in the "
+                     "Serving tab (this row's picker), then Start again")
+        ws = weights_status(str(entry.get("engine") or ""), model)
         if ws.get("status") == "missing" and entry.get("engine") in ("vllm", "container"):
             # Engines run OFFLINE now — failing here, with the fix named, beats
             # letting vLLM discover it can't reach the hub minutes into startup.
-            sys.exit(f"weights for '{entry.get('model')}' are not on this machine "
+            sys.exit(f"weights for '{model}' are not on this machine "
                      f"({ws.get('path')}) — download them through the egress broker:\n"
-                     f"    python3 -m knowledgehost pull --model {entry.get('model')}\n"
+                     f"    python3 -m knowledgehost pull --model {model}\n"
                      f"(or the panel: Ops › pull)")
         hf = engine_env(cfg, str(entry.get("engine") or ""))
         if entry.get("engine") == "container":

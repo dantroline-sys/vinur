@@ -1490,7 +1490,7 @@ async function dlAct(action, model) {
   const r = await postJSON(action === 'resume' ? '/serving/pull' : '/serving/download',
     action === 'resume' ? { model } : { action, model })
     .catch(e => ({ ok: false, error: netErr(e) }));
-  $('#banner').innerHTML = r.ok ? '✓ ' + esc(r.note || 'done') : '✗ ' + esc(r.error || 'failed');
+  svNote((r.ok ? '✓ ' : '✗ ') + esc(r.ok ? (r.note || 'done') : (r.error || 'failed')), 30);
   pollServing();
 }
 // Pulled weights nothing serves yet: one click drafts the [[serving.llms]]
@@ -1510,7 +1510,9 @@ function svUnserved(un) {
 async function svAddService(model) {
   $('#banner').innerHTML = `adding a service for <b>${esc(model)}</b>…`;
   const r = await postJSON('/serving/add', { model }).catch(e => ({ ok: false, error: netErr(e) }));
-  $('#banner').innerHTML = r.ok ? '✓ ' + esc(r.note || 'added') : '✗ ' + esc(r.error || 'failed');
+  // sticky: the 2.5s poll must not wipe the verdict before it can be read
+  svNote((r.ok ? '✓ ' : '✗ ') + esc(r.ok ? (r.note || 'added') : (r.error || 'failed')), 30);
+  pollServing();
 }
 // Downloaded weights are big and invisible — say where they went, in the tab
 // that owns them, with enough of the layout to inspect the folder by hand.

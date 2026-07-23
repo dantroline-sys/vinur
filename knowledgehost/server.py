@@ -789,15 +789,16 @@ class Handler(BaseHTTPRequestHandler):
                     {"ok": False, "error": f"'{model}' is not on this disk in a form "
                      f"{engine} can serve — pull it first (the search below)"}, 400)
             entry: dict = {"engine": engine, "model": model}
-            if engine == "container":                  # image/runtime copied from a sibling
+            if engine == "container":
+                # image/runtime copied from a sibling when one declares them;
+                # otherwise the entry simply runs the built-in default image
+                # (llm_argv fills it in) — a sibling running the default is a
+                # working template too, so refusing here helped nobody
                 tmpl = next((e for e in llms
                              if e.get("engine") == "container" and e.get("image")), None)
-                if tmpl is None:
-                    return self._send_json(
-                        {"ok": False, "error": "no existing container entry to copy "
-                         "image/runtime from — add the first one by hand"}, 400)
-                entry["image"] = str(tmpl.get("image"))
-                if tmpl.get("runtime"):
+                if tmpl is not None:
+                    entry["image"] = str(tmpl.get("image"))
+                if tmpl is not None and tmpl.get("runtime"):
                     entry["runtime"] = str(tmpl.get("runtime"))
             raw = str(req.get("name") or "").strip()
             if not raw:

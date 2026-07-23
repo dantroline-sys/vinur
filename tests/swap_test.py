@@ -1523,6 +1523,66 @@ def main():
     assert ws15["status"] == "missing" and "no model set" in ws15["detail"], ws15
     ok("weights_status: empty model -> 'no model set', never a root scan")
 
+    # ── hand-placed model folders: eligible without a broker manifest ───────
+    # Dan's shape: Gemma downloaded by hand into models/ — servable, but the
+    # picker only offered manifest-complete broker pulls, so it sat empty.
+    with tempfile.TemporaryDirectory() as td16:
+        import json as _json
+        r16 = Path(td16)
+        m16 = r16 / "models"
+        flat16 = m16 / "Gemma-4-31B"
+        flat16.mkdir(parents=True)
+        (flat16 / "config.json").write_text("{}")
+        (flat16 / "model.safetensors").write_bytes(b"w" * 32)
+        nest16 = m16 / "Pack"                  # weights one folder down
+        (nest16 / "w4").mkdir(parents=True)
+        (nest16 / "w4" / "model.safetensors").write_bytes(b"w" * 8)
+        half16 = m16 / "org--half"             # manifested + incomplete: hidden
+        half16.mkdir()
+        (half16 / "model.safetensors").write_bytes(b"w")
+        (half16 / ".pull.json").write_text(_json.dumps(
+            {"model": "org/half", "files": {"model.safetensors": {"size": 999}}}))
+        gg16 = m16 / "ggufs"                   # GGUF-only dir: llama's lane
+        gg16.mkdir()
+        (gg16 / "x-Q4.gguf").write_bytes(b"g")
+        got = [c["model"] for c in sv.eligible_models("container", root=r16)]
+        assert "models/Gemma-4-31B" in got, got
+        assert "models/Pack/w4" in got, got
+        assert not any("half" in m or "gguf" in m for m in got), got
+
+        # …and Add service on such a folder works with NO image-bearing
+        # sibling: the entry runs the built-in default image
+        toml16 = r16 / "config.toml"
+        toml16.write_text('[[serving.llms]]\nname = "big"\nengine = "container"\n'
+                          'model = "org/other"\nport = 11438\nexclusive = true\n')
+        cfg16 = load_config(str(toml16))
+        cfg16.update({"host": "127.0.0.1", "port": 0, "auth_token": "tk",
+                      "_config_path": str(toml16)})
+        keep16 = (sv.ROOT, sv.eligible_models.__defaults__)
+        try:
+            sv.ROOT = r16
+            sv.eligible_models.__defaults__ = (r16, None)
+            khs16 = KnowledgeHostServer(cfg16, SimpleNamespace(), SimpleNamespace(),
+                                        kb=None)
+            p16 = khs16.server_address[1]
+            threading.Thread(target=khs16.serve_forever, daemon=True).start()
+            req16 = urllib.request.Request(
+                f"http://127.0.0.1:{p16}/serving/add",
+                data=_json.dumps({"model": "models/Gemma-4-31B"}).encode(),
+                headers={"Authorization": "Bearer tk",
+                         "Content-Type": "application/json"}, method="POST")
+            with urllib.request.urlopen(req16, timeout=10) as r:
+                res16 = _json.loads(r.read())
+            assert res16["ok"] and res16["engine"] == "container", res16
+            ent16 = next(e for e in load_config(str(toml16))["serving"]["llms"]
+                         if e["name"] == res16["name"])
+            assert "image" not in ent16        # default image applies at exec
+            khs16.shutdown()
+        finally:
+            sv.ROOT, sv.eligible_models.__defaults__ = keep16
+    ok("hand-placed folders join the picker (nested included; half-pulled and "
+       "GGUF-only stay out) and Add service no longer demands an image template")
+
     print(f"swap_test: {PASS} checks OK")
 
 
