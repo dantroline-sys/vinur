@@ -108,6 +108,13 @@ def _run_distill(cfg, embedder, log, *, limit=None, watch=False, interval=30, bu
     reopens the store each idle cycle so the lance backend sees new commits, and
     re-probes the big-LM endpoints so a 'sometimes available' duplicate is picked
     up (in parallel) when it appears and dropped when it goes."""
+    # Say what THIS process actually read — "which config is it using?" must
+    # be answerable from the log, not by reasoning about launch paths.
+    log.info("config: %s — distill_parallel=%r extract_urls=%s verify_urls=%s",
+             cfg.get("_config_path") or "(defaults + env only)",
+             cfg.get("distill_parallel"),
+             cfg.get("extract_urls") or "(none)",
+             cfg.get("verify_urls") or cfg.get("distill_urls") or "(none)")
     if not embedder.embed_one("warmup", "document"):
         log.error("embed endpoint unreachable — distillation needs vectors.")
         return 1

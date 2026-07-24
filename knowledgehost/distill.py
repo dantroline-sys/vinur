@@ -1889,9 +1889,17 @@ def healthy_endpoints(cfg, urls=None, overrides=None, log=None) -> list:
     try:
         # exclusive swap: a URL naming a group member means "the big slot" —
         # follow it to whoever is resident right now, or a Deploy/swap turns
-        # every configured endpoint into a dead port
+        # every configured endpoint into a dead port.  Substitutions are SAID:
+        # two tiers silently landing on one server must be visible in the log.
         from .serving import resident_url
-        urls = [resident_url(cfg, u) for u in urls]
+        mapped = []
+        for u in urls:
+            m = resident_url(cfg, u)
+            if m != u:
+                logging.getLogger("distill").info(
+                    "endpoint %s follows the exclusive swap -> %s (the resident)", u, m)
+            mapped.append(m)
+        urls = mapped
     except Exception:
         pass
     seen, uniq = set(), []
@@ -1928,29 +1936,44 @@ def verify_endpoints(cfg, log=None) -> list:
         "distill_max_tokens": cfg.get("verify_max_tokens", 1024)})
 
 
-def _endpoint_fanout(cfg, lm) -> int:
-    """How many requests to keep in flight against ONE endpoint.  An explicit
-    `distill_parallel` wins; 0 = auto: an endpoint this box serves with a
-    batching engine ([[serving.llms]] engine = "vllm"/"container") gets 8
-    (capped by the entry's max_num_seqs), because vLLM's continuous batching
-    turns concurrent requests into one GPU batch — most of a big card's
-    throughput lives there.  llama.cpp (single slot by default) and endpoints
-    not in [serving] (remote boxes we can't introspect) stay at 1."""
+def _endpoint_fanout(cfg, lm) -> tuple:
+    """(how many requests to keep in flight against ONE endpoint, WHY).  An
+    explicit `distill_parallel` wins; 0 = auto: an endpoint this box serves
+    with a batching engine ([[serving.llms]] engine = "vllm"/"container")
+    gets 8 (capped by max_num_seqs, read from the entry OR the model's
+    tune.toml), because vLLM's continuous batching turns concurrent requests
+    into one GPU batch — most of a big card's throughput lives there.
+    llama.cpp (single slot by default) and endpoints not in [serving] stay at
+    1.  The WHY is logged by _fan_out for EVERY endpoint — a silent ×1 cost a
+    live box a day of 4-chunks/min head-scratching."""
     n = int(cfg.get("distill_parallel", 0) or 0)
     if n:
-        return max(1, n)
+        return max(1, n), f"distill_parallel={n} — explicit root key in config.toml"
     url = getattr(lm, "url", None)
     if not url:
-        return 1
+        return 1, "endpoint has no url"
     try:
         from .serving import entry_for_url
         e = entry_for_url(cfg, url)
     except Exception:
-        return 1
+        return 1, "serving lookup failed"
     if e and str(e.get("engine")) in ("vllm", "container"):
         cap = int(e.get("max_num_seqs") or 0)
-        return min(8, cap) if cap else 8
-    return 1
+        if not cap:
+            try:                       # the knob may live in the model's tune.toml
+                from .serving import read_model_tuning
+                cap = int((read_model_tuning(e)[0] or {}).get("max_num_seqs") or 0)
+            except Exception:
+                cap = 0
+        n = min(8, cap) if cap else 8
+        return n, (f"auto — entry '{e.get('name')}' ({e.get('engine')}) batches"
+                   + (f"; max_num_seqs={cap} caps it" if cap and cap < 8 else
+                      "; raise distill_parallel in Settings to push past 8"))
+    if e:
+        return 1, (f"auto — entry '{e.get('name')}' runs {e.get('engine')} "
+                   "(single slot); set distill_parallel to override")
+    return 1, ("auto — this url matches no [serving.llms] entry, so the engine "
+               "can't be introspected; set distill_parallel to override")
 
 
 def _fan_out(cfg, lms) -> list:
@@ -1962,13 +1985,10 @@ def _fan_out(cfg, lms) -> list:
     one-request-at-a-time behaviour."""
     out = []
     for lm in lms:
-        n = _endpoint_fanout(cfg, lm)
+        n, why = _endpoint_fanout(cfg, lm)
         out.append(lm)
         out.extend(copy.copy(lm) for _ in range(n - 1))
-        if n > 1:
-            log.info("distill fan-out: %d concurrent requests -> %s "
-                     "(batching engine; distill_parallel=%s)",
-                     n, getattr(lm, "url", "?"), cfg.get("distill_parallel", 0) or "auto")
+        log.info("distill fan-out: %s x%d — %s", getattr(lm, "url", "?"), n, why)
     return out
 
 

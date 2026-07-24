@@ -772,11 +772,14 @@ def main():
         res = D.distill_corpus(None, None, [object()], None, {"verify": False})
         assert res["proc_offered"] == 0
         assert any("offered no procedures/criteria" in m for m in _DGrab.msgs)
-        # cards flowing -> no diagnosis noise
+        # cards flowing -> no DIAGNOSIS noise (the fan-out provenance line is
+        # deliberate: a silent x1 hid a day of 4-chunks/min on the live box)
         _DGrab.msgs.clear()
         D._distill_sequential = lambda *a, **k: {"chunks": 5, "cards": 3}
         D.distill_corpus(None, None, [object()], None, {"verify": False})
-        assert not _DGrab.msgs, _DGrab.msgs
+        noise = [m for m in _DGrab.msgs if "fan-out" not in m]
+        assert not noise, noise
+        assert any("fan-out" in m for m in _DGrab.msgs), "provenance line must log"
     finally:
         D._distill_sequential = seq0
         D.log.removeHandler(dgrab)
@@ -792,17 +795,34 @@ def main():
     lm_l = SimpleNamespace(url="http://127.0.0.1:11441")
     lm_c = SimpleNamespace(url="http://127.0.0.1:11450")
     lm_r = SimpleNamespace(url="http://10.0.0.7:8000")   # remote: engine unknowable
-    assert D._endpoint_fanout(vcfg, lm_v) == 8
-    assert D._endpoint_fanout(vcfg, lm_l) == 1
-    assert D._endpoint_fanout(vcfg, lm_c) == 3, "entry's max_num_seqs caps auto"
-    assert D._endpoint_fanout(vcfg, lm_r) == 1, "foreign endpoint stays sequential"
-    assert D._endpoint_fanout({**vcfg, "distill_parallel": 4}, lm_r) == 4, "knob wins"
-    assert D._endpoint_fanout({**vcfg, "distill_parallel": 1}, lm_v) == 1, "knob forces serial"
+    n_v, why_v = D._endpoint_fanout(vcfg, lm_v)
+    assert n_v == 8 and "primary" in why_v
+    n_l, why_l = D._endpoint_fanout(vcfg, lm_l)
+    assert n_l == 1 and "single slot" in why_l
+    n_c, why_c = D._endpoint_fanout(vcfg, lm_c)
+    assert n_c == 3 and "max_num_seqs=3" in why_c, "entry's max_num_seqs caps auto"
+    n_r, why_r = D._endpoint_fanout(vcfg, lm_r)
+    assert n_r == 1 and "matches no [serving.llms] entry" in why_r
+    n_k, why_k = D._endpoint_fanout({**vcfg, "distill_parallel": 4}, lm_r)
+    assert n_k == 4 and "explicit" in why_k, "knob wins"
+    assert D._endpoint_fanout({**vcfg, "distill_parallel": 1}, lm_v)[0] == 1, \
+        "knob forces serial"
+    # …and the cap follows the knob into the model's tune.toml (post-migration)
+    with tempfile.TemporaryDirectory() as tdf:
+        md = Path(tdf) / "m"
+        md.mkdir()
+        (md / "model.safetensors").write_bytes(b"w")
+        (md / "tune.toml").write_text("max_num_seqs = 2\n")
+        tcfg = {**vcfg, "serving": {"llms": [
+            {"name": "tuned", "engine": "vllm", "port": 11460, "model": str(md)}]}}
+        n_t, why_t = D._endpoint_fanout(tcfg, SimpleNamespace(url="http://127.0.0.1:11460"))
+        assert n_t == 2 and "max_num_seqs=2" in why_t, (n_t, why_t)
     fanned = D._fan_out(vcfg, [lm_v, lm_l])
     assert len(fanned) == 9 and fanned[0] is lm_v
     assert all(f.url == lm_v.url for f in fanned[:8])
     assert len({id(f) for f in fanned[:8]}) == 8, "clones are distinct pool entries"
-    ok("_endpoint_fanout/_fan_out: vLLM->8 (max_num_seqs caps), llama/remote->1, knob overrides")
+    ok("_endpoint_fanout/_fan_out: vLLM->8 (max_num_seqs caps, tune.toml read), "
+       "llama/remote->1 WITH the why, knob overrides")
 
     # dispatch: a single batching endpoint now takes the PARALLEL path
     got = {}
