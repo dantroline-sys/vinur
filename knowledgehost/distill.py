@@ -35,12 +35,22 @@ from . import zones
 from .reconcile import reconcile_edge
 
 _LEASE_POLL_S = 3        # how often a paused pipeline stage re-checks its GPU lease
+_WORKER_MAX_CONSEC = 3   # consecutive transport failures before a worker gives up its slot
+_CHUNK_MAX_ATTEMPTS = 3  # tries per chunk before it is left un-distilled for the next run
+_RETRY_BACKOFF_S = 2.0   # base sleep between a worker's consecutive retries
 
 log = logging.getLogger("knowledgehost.distill")
 
 
 class BackendUnavailable(Exception):
-    """The LM or embed endpoint is unreachable — abort the run (it is resumable)."""
+    """The LM or embed endpoint is unreachable — abort the run (it is resumable).
+
+    `permanent=True` marks a different animal: the server is FINE but rejected
+    THIS request (HTTP 4xx — an oversized prompt, a schema it refuses).  A retry
+    of the same chunk cannot help, on this worker or any other; workers drop the
+    chunk and keep their slot instead of dying over it."""
+
+    permanent = False
 
 
 _VALID_REGIMES = {"empirical", "conventional", "fictional", "interpretive", "historical"}
@@ -799,6 +809,22 @@ class DistillLM:
         }
         try:
             data = self._post(payload)
+        except urllib.error.HTTPError as e:
+            # 4xx = the server VETOED this request (context overflow, refused
+            # schema) — flag it permanent so callers drop the chunk instead of
+            # requeueing it into the next worker (a poison chunk otherwise kills
+            # the whole pool one worker at a time).  408/429 stay transient.
+            body = ""
+            try:
+                body = (e.read() or b"").decode("utf-8", "replace")[:300]
+            except Exception:
+                pass
+            permanent = 400 <= e.code < 500 and e.code not in (408, 425, 429)
+            exc = BackendUnavailable(
+                f"distill LM {'rejected this request (a retry cannot help)' if permanent else 'unreachable'}: "
+                f"{e}{' — ' + body if body else ''}")
+            exc.permanent = permanent
+            raise exc
         except (urllib.error.URLError, OSError, TimeoutError) as e:
             raise BackendUnavailable(f"distill LM unreachable: {e}")
         try:
@@ -1986,6 +2012,19 @@ def _fan_out(cfg, lms) -> list:
     out = []
     for lm in lms:
         n, why = _endpoint_fanout(cfg, lm)
+        # Batching raises throughput, not single-request speed: at depth n a
+        # request WAITS behind its batch-mates, so the per-request timeout must
+        # grow with n or the first full wave times out en masse (each timeout
+        # used to kill a worker — a 96-slot pool decayed to ~1 within minutes
+        # on the live box).  Scale before cloning so every clone inherits it;
+        # an operator's explicitly larger timeout always wins (we only raise).
+        base_to = getattr(lm, "timeout", None)
+        if n > 4 and base_to:
+            scaled = min(3600, int(base_to * n / 4))
+            if scaled > base_to:
+                lm.timeout = scaled
+                why += (f"; per-request timeout {base_to}s -> {scaled}s "
+                        f"({n} requests share the server)")
         out.append(lm)
         out.extend(copy.copy(lm) for _ in range(n - 1))
         log.info("distill fan-out: %s x%d — %s", getattr(lm, "url", "?"), n, why)
@@ -2007,6 +2046,23 @@ def distill_corpus(store, kb, extractors, embedder, cfg, *, limit=None, verifier
     if not extractors:
         raise BackendUnavailable("no distill endpoints available")
     _stage_reset()
+    # Degenerate two-tier: when an exclusive swap leaves ONE resident model,
+    # resident_url() heals both tiers onto the same server and both adopt the
+    # same served name — extract and verify become the SAME LM.  Self-
+    # verification doubles the LM cost of every chunk without an independent
+    # second opinion, so collapse to single-tier and say so.
+    if verifiers and cfg.get("verify", True):
+        ex_ids = {(getattr(e, "url", None), getattr(e, "model", None)) for e in extractors}
+        vf_ids = {(getattr(v, "url", None), getattr(v, "model", None)) for v in verifiers}
+        if ex_ids == vf_ids:
+            log.warning(
+                "extract and verify tiers are the same server+model (%s) — running "
+                "single-tier: self-verification would double the LM cost per chunk "
+                "without an independent second opinion.  (An exclusive swap that "
+                "left one resident model collapses the tiers this way.)",
+                ", ".join(sorted(str(u) for u, _ in ex_ids)))
+            extractors = verifiers      # the big-LM client knobs (timeout, max_tokens)
+            verifiers = None
     extractors = _fan_out(cfg, extractors)
     if verifiers and cfg.get("verify", True):
         res = _distill_pipeline(store, kb, extractors, _fan_out(cfg, verifiers),
@@ -2090,16 +2146,33 @@ def _pending_chunks(store, kb, counter, bundle=None, cfg=None):
 
 
 def _distill_sequential(store, kb, lm, embedder, cfg, *, limit=None, bundle=None) -> dict:
-    done = concepts = relations = cards = 0
+    done = concepts = relations = cards = failed = 0
     skipped = [0, 0, 0, 0]
     every = cfg["ingest_log_every"]
     for chunk in _pending_chunks(store, kb, skipped, bundle=bundle, cfg=cfg):
         reg = regime_for_path(cfg, chunk.get("path_or_url") or chunk.get("id"))
-        with kb.batch():                              # one transaction / fsync per chunk
-            nc, nr, ncard = distill_chunk(kb, lm, embedder, chunk,
-                                          source_regime=reg)  # raises BackendUnavailable
-            kb.mark_distilled(chunk["id"])            # parse-fail counts as done (0) → progress
-            kb.mark_recarded(chunk["id"], RECARD_VERSION)   # families extracted inline
+        tries = 0
+        nc = None
+        while True:
+            try:
+                with kb.batch():                      # one transaction / fsync per chunk
+                    nc, nr, ncard = distill_chunk(kb, lm, embedder, chunk,
+                                                  source_regime=reg)
+                    kb.mark_distilled(chunk["id"])    # parse-fail counts as done (0) → progress
+                    kb.mark_recarded(chunk["id"], RECARD_VERSION)   # families extracted inline
+                break
+            except BackendUnavailable as e:
+                if e.permanent:                       # this chunk is unservable — skip IT,
+                    failed += 1                       # don't abort the whole run over it
+                    log.warning("chunk %s rejected — skipping the chunk: %s",
+                                chunk.get("id"), e)
+                    break
+                tries += 1
+                if tries >= _WORKER_MAX_CONSEC:       # endpoint really is gone — the old
+                    raise                             # resumable abort
+                time.sleep(min(_RETRY_BACKOFF_S * tries, 15.0))
+        if nc is None:
+            continue
         done += 1
         concepts += nc
         relations += nr
@@ -2111,7 +2184,7 @@ def _distill_sequential(store, kb, lm, embedder, cfg, *, limit=None, bundle=None
             break
     return {"chunks": done, "concepts": concepts, "relations": relations, "cards": cards,
             "skipped": skipped[0], "skipped_zone": skipped[1],
-            "skipped_dupe": skipped[2], "outside_bundle": skipped[3]}
+            "skipped_dupe": skipped[2], "outside_bundle": skipped[3], "failed": failed}
 
 
 def _distill_parallel(store, kb, lms, embedder, cfg, *, limit=None, bundle=None) -> dict:
@@ -2132,13 +2205,19 @@ def _distill_parallel(store, kb, lms, embedder, cfg, *, limit=None, bundle=None)
     every = cfg["ingest_log_every"]
 
     def extract_job(chunk, regime):
-        lm = pool.get()                              # one in-flight request per endpoint
+        while True:                                  # one in-flight request per slot
+            try:
+                lm = pool.get(timeout=0.3)
+                break
+            except queue.Empty:
+                if not alive:                        # every slot dropped — don't block
+                    return chunk, None, None, regime, None   # the executor's shutdown
         try:
             gen = lm.extract(chunk, regime)          # SLOW, off the lock, in parallel
             narr = lm.extract_narrative(chunk) if regime == "fictional" else None
-            return chunk, (gen, narr), lm, regime
-        except BackendUnavailable:
-            return chunk, None, lm, regime           # endpoint died — caller drops it
+            return chunk, (gen, narr), lm, regime, None
+        except BackendUnavailable as e:
+            return chunk, None, lm, regime, e        # caller decides: retry vs drop
 
     def regime_of(chunk):
         # Main-thread resolve (same model as the sequential path): a folder mapping
@@ -2153,6 +2232,8 @@ def _distill_parallel(store, kb, lms, embedder, cfg, *, limit=None, bundle=None)
 
     chunks = _pending_chunks(store, kb, skipped, bundle=bundle, cfg=cfg)
     stop = False
+    failed = 0
+    consec = {}                                      # id(lm) → consecutive failures
     with ThreadPoolExecutor(max_workers=len(lms)) as ex:
         futures = set()
 
@@ -2173,13 +2254,43 @@ def _distill_parallel(store, kb, lms, embedder, cfg, *, limit=None, bundle=None)
             finished, _ = wait(futures, return_when=FIRST_COMPLETED)
             for f in finished:
                 futures.discard(f)
-                chunk, payload, lm, regime = f.result()
-                if payload is None:                  # the endpoint failed mid-run
-                    log.warning("distill endpoint failed, dropping it: %s", lm.url)
-                    alive.discard(id(lm))            # don't return it to the pool
-                    if not alive:
-                        raise BackendUnavailable("all distill endpoints failed")
+                chunk, payload, lm, regime, err = f.result()
+                if lm is None:                       # pool already fully dead
+                    continue
+                resubmitted = False
+                if payload is None:
+                    if err is not None and err.permanent:
+                        # The SERVER vetoed this chunk (4xx) — requeueing it would
+                        # fail every slot in turn.  Drop the chunk, keep the slot.
+                        failed += 1
+                        log.warning("chunk %s rejected — dropping the chunk, keeping "
+                                    "the endpoint: %s", chunk.get("id"), err)
+                        pool.put(lm)
+                    else:
+                        consec[id(lm)] = consec.get(id(lm), 0) + 1
+                        attempts = chunk["_attempts"] = chunk.get("_attempts", 0) + 1
+                        if attempts < _CHUNK_MAX_ATTEMPTS and not stop:
+                            futures.add(ex.submit(extract_job, chunk, regime))
+                            resubmitted = True
+                        else:
+                            failed += 1
+                            log.warning("chunk %s failed %d attempt(s) (last: %s) — "
+                                        "left un-distilled for the next run",
+                                        chunk.get("id"), attempts, err)
+                        if consec[id(lm)] >= _WORKER_MAX_CONSEC:
+                            log.warning(
+                                "distill slot on %s: %d consecutive failures (last: "
+                                "%s) — dropping it (%d slot(s) remain).  Timeouts "
+                                "here usually mean overload, not death: raise "
+                                "distill/extract_timeout_s or lower distill_parallel.",
+                                lm.url, consec[id(lm)], err, len(alive) - 1)
+                            alive.discard(id(lm))    # don't return it to the pool
+                            if not alive:
+                                raise BackendUnavailable("all distill endpoints failed")
+                        else:
+                            pool.put(lm)             # transient — back into rotation
                 else:
+                    consec[id(lm)] = 0
                     gen, narr = payload              # generic + (fiction) narrative pass
                     pool.put(lm)                     # healthy — back into rotation
                     with kb_lock, kb.batch():
@@ -2197,11 +2308,11 @@ def _distill_parallel(store, kb, lms, embedder, cfg, *, limit=None, bundle=None)
                                  skipped[0], _stage_line())
                     if limit and done >= limit:
                         stop = True
-                if not stop:
+                if not stop and not resubmitted:
                     submit_next()
     return {"chunks": done, "concepts": concepts, "relations": relations, "cards": cards,
             "skipped": skipped[0], "skipped_zone": skipped[1],
-            "skipped_dupe": skipped[2], "outside_bundle": skipped[3]}
+            "skipped_dupe": skipped[2], "outside_bundle": skipped[3], "failed": failed}
 
 
 # ── recard corpus sweep ──────────────────────────────────────────────────────────
@@ -2284,7 +2395,7 @@ def recard_corpus(store, kb, lms, embedder, cfg, *, limit=None, bundle=None) -> 
     for lm in lms:
         pool.put(lm)
     alive = {id(lm) for lm in lms}
-    done = cards = 0
+    done = cards = failed = 0
     no_menu = [0]
     skipped = [0, 0, 0]
     every = cfg["ingest_log_every"]
@@ -2295,11 +2406,17 @@ def recard_corpus(store, kb, lms, embedder, cfg, *, limit=None, bundle=None) -> 
                      if _FAMILY_VERSION[k] > ch.get("_recard_from", 0))
 
     def job(chunk, regime, families):
-        lm = pool.get()
+        while True:                                   # one in-flight request per slot
+            try:
+                lm = pool.get(timeout=0.3)
+                break
+            except queue.Empty:
+                if not alive:                         # every slot dropped — don't block
+                    return chunk, None, None, regime, families, None
         try:
-            return chunk, lm.extract_extras(chunk, regime, families), lm
-        except BackendUnavailable:
-            return chunk, None, lm                    # endpoint died — caller drops it
+            return chunk, lm.extract_extras(chunk, regime, families), lm, regime, families, None
+        except BackendUnavailable as e:
+            return chunk, None, lm, regime, families, e   # caller decides: retry vs drop
 
     chunks = _pending_recard_chunks(store, kb, skipped, bundle=bundle, cfg=cfg)
     stop = False
@@ -2324,17 +2441,43 @@ def recard_corpus(store, kb, lms, embedder, cfg, *, limit=None, bundle=None) -> 
         for _ in range(len(lms) * 2):                 # bounded in-flight window
             if not submit_next():
                 break
+        consec = {}                                   # id(lm) → consecutive failures
         while futures:
             finished, _ = wait(futures, return_when=FIRST_COMPLETED)
             for f in finished:
                 futures.discard(f)
-                chunk, extras, lm = f.result()
-                if extras is None:                    # the endpoint failed mid-run
-                    log.warning("recard endpoint failed, dropping it: %s", lm.url)
-                    alive.discard(id(lm))
-                    if not alive:
-                        raise BackendUnavailable("all recard endpoints failed")
+                chunk, extras, lm, reg, fams, err = f.result()
+                if lm is None:                        # pool already fully dead
+                    continue
+                resubmitted = False
+                if extras is None:
+                    if err is not None and err.permanent:
+                        failed += 1                   # server vetoed THIS chunk — drop
+                        log.warning("recard: chunk %s rejected — dropping the chunk, "
+                                    "keeping the endpoint: %s", chunk.get("id"), err)
+                        pool.put(lm)
+                    else:
+                        consec[id(lm)] = consec.get(id(lm), 0) + 1
+                        attempts = chunk["_attempts"] = chunk.get("_attempts", 0) + 1
+                        if attempts < _CHUNK_MAX_ATTEMPTS and not stop:
+                            futures.add(ex.submit(job, chunk, reg, fams))
+                            resubmitted = True
+                        else:
+                            failed += 1
+                            log.warning("recard: chunk %s failed %d attempt(s) (last: "
+                                        "%s) — left for the next run", chunk.get("id"),
+                                        attempts, err)
+                        if consec[id(lm)] >= _WORKER_MAX_CONSEC:
+                            log.warning("recard slot on %s: %d consecutive failures — "
+                                        "dropping it (%d slot(s) remain)", lm.url,
+                                        consec[id(lm)], len(alive) - 1)
+                            alive.discard(id(lm))
+                            if not alive:
+                                raise BackendUnavailable("all recard endpoints failed")
+                        else:
+                            pool.put(lm)              # transient — back into rotation
                 else:
+                    consec[id(lm)] = 0
                     pool.put(lm)                      # healthy — back into rotation
                     with kb_lock, kb.batch():
                         cards += _recard_store(kb, embedder, chunk, extras)
@@ -2345,10 +2488,10 @@ def recard_corpus(store, kb, lms, embedder, cfg, *, limit=None, bundle=None) -> 
                                  done, cards, skipped[0], _stage_line())
                     if limit and done >= limit:
                         stop = True
-                if not stop:
+                if not stop and not resubmitted:
                     submit_next()
     res = {"chunks": done, "cards": cards, "no_menu": no_menu[0],
-           "skipped": skipped[0], "skipped_zone": skipped[1]}
+           "skipped": skipped[0], "skipped_zone": skipped[1], "failed": failed}
     res.update(stage_stats())
     if done and not cards:                            # say WHY zero, not just that it was
         if res["extra_offered"]:
@@ -2413,7 +2556,8 @@ def _distill_pipeline(store, kb, extractors, verifiers, embedder, cfg, *, limit=
     lock = threading.Lock()
     st = {"done": 0, "concepts": 0, "relations": 0, "cards": 0, "skipped": 0,
           "skipped_zone": 0, "skipped_dupe": 0, "outside_bundle": 0,
-          "rejected": 0, "adjusted": 0, "vfail": 0,
+          "rejected": 0, "adjusted": 0, "vfail": 0, "failed": 0, "fed": 0,
+          "ex_dropped": 0, "vf_dropped": 0,
           "extract_alive": len(extractors), "verify_alive": len(verifiers),
           "stop": False}
     every = cfg["ingest_log_every"]
@@ -2478,11 +2622,20 @@ def _distill_pipeline(store, kb, extractors, verifiers, embedder, cfg, *, limit=
                 if not _put(chunk_q, (ch, reg),
                             lambda: st["extract_alive"] > 0 and not st["stop"]):
                     return
+                with lock:
+                    st["fed"] += 1
         finally:
             fcon.close()
+            # The scan summary answers "is the feeder starving the pool?" in one
+            # line — a big corpus is mostly skip-scans between rare pending chunks.
+            log.info("chunk feeder: %d queued for extraction — %d already distilled, "
+                     "%d furniture-zoned, %d duplicates, %d outside the bundle",
+                     st["fed"], st["skipped"], st["skipped_zone"],
+                     st["skipped_dupe"], st["outside_bundle"])
             feed_done.set()
 
     def extractor(lm):
+        fails = 0                                    # CONSECUTIVE transport failures
         try:
             while True:
                 while lm_lease.is_held(lm_lease.FAST, cfg) and not st["stop"]:
@@ -2496,10 +2649,43 @@ def _distill_pipeline(store, kb, extractors, verifiers, embedder, cfg, *, limit=
                 try:
                     gen = lm.extract(ch, reg)
                     narr = lm.extract_narrative(ch) if reg == "fictional" else None
-                except BackendUnavailable:
-                    log.warning("fast extractor failed, dropping endpoint: %s", lm.url)
-                    _put(chunk_q, (ch, reg), lambda: False)   # requeue best-effort
-                    return
+                    fails = 0
+                except BackendUnavailable as e:
+                    if e.permanent:
+                        # The server vetoed THIS chunk (4xx: oversized prompt…) —
+                        # requeueing it would fail every worker in turn.  Drop the
+                        # chunk, keep the worker.
+                        with lock:
+                            st["failed"] += 1
+                        log.warning("chunk %s rejected by %s — dropping the chunk, "
+                                    "keeping the worker: %s", ch.get("id"), lm.url, e)
+                        continue
+                    # Transient (timeout / refused / 5xx).  A timeout under a deep
+                    # fan-out means OVERLOAD, not a dead endpoint: retire the worker
+                    # only after several failures IN A ROW — one timeout per worker
+                    # used to erase a 96-slot pool within minutes on the live box.
+                    fails += 1
+                    attempts = ch["_attempts"] = ch.get("_attempts", 0) + 1
+                    if attempts < _CHUNK_MAX_ATTEMPTS:
+                        _put(chunk_q, (ch, reg), lambda: False)   # requeue best-effort
+                    else:
+                        with lock:
+                            st["failed"] += 1
+                        log.warning("chunk %s failed %d attempt(s) (last: %s) — left "
+                                    "un-distilled for the next run", ch.get("id"),
+                                    attempts, e)
+                    if fails >= _WORKER_MAX_CONSEC:
+                        with lock:
+                            st["ex_dropped"] += 1
+                            left = st["extract_alive"] - 1
+                        log.warning("extractor worker on %s: %d consecutive failures "
+                                    "(last: %s) — dropping it, %d worker(s) remain.  "
+                                    "Raise extract/distill_timeout_s or lower "
+                                    "distill_parallel if this recurs.",
+                                    lm.url, fails, e, left)
+                        return
+                    time.sleep(min(_RETRY_BACKOFF_S * fails, 15.0))
+                    continue
                 if not _put(draft_q, (ch, reg, gen, narr),
                             lambda: st["verify_alive"] > 0 and not st["stop"]):
                     return
@@ -2510,6 +2696,7 @@ def _distill_pipeline(store, kb, extractors, verifiers, embedder, cfg, *, limit=
     vbatch = max(1, int(cfg.get("verify_batch", 6)))
 
     def verifier(vlm):
+        fails = 0                                    # CONSECUTIVE transport failures
         try:
             while True:
                 while lm_lease.is_held(lm_lease.BIG, cfg) and not st["stop"]:
@@ -2532,11 +2719,43 @@ def _distill_pipeline(store, kb, extractors, verifiers, embedder, cfg, *, limit=
                                "relations": batch[j][2][1], "procedures": batch[j][2][2]}
                               for j in todo]
                     res = dict(zip(todo, verify_mod.verify_batch(vlm, drafts, cfg)))
-                except BackendUnavailable:
-                    log.warning("verifier failed, dropping endpoint: %s", vlm.url)
-                    for b in batch:                              # requeue the whole batch
-                        _put(draft_q, b, lambda: False)
-                    return
+                    fails = 0
+                except BackendUnavailable as e:
+                    # A draft that can't be verified is still a finished extraction:
+                    # retry transient failures, and when retries run out (or the
+                    # server vetoed the batch — 4xx) pass it through UNVERIFIED,
+                    # the same stance as the lease path (unadjudicated, mergeable
+                    # later).  Never kill the worker on a first timeout.
+                    if not e.permanent:
+                        fails += 1
+                    requeued = 0
+                    for b in batch:
+                        att = b[0]["_vattempts"] = b[0].get("_vattempts", 0) + 1
+                        if (not e.permanent and att < _CHUNK_MAX_ATTEMPTS
+                                and _put(draft_q, b, lambda: False)):
+                            requeued += 1
+                        else:
+                            ch, reg, gen, narr = b
+                            with lock:
+                                st["vfail"] += 1
+                            write_q.put((ch, reg, gen, narr,
+                                         _precompute_node_embeds(embedder, gen)))
+                    log.warning("verifier on %s failed a batch (%s) — requeued %d, "
+                                "passed %d through unverified%s", vlm.url, e, requeued,
+                                len(batch) - requeued,
+                                ".  A 4xx on a batch usually means it overflowed the "
+                                "verifier's context: lower verify_batch or "
+                                "verify_source_chars." if e.permanent else "")
+                    if fails >= _WORKER_MAX_CONSEC:
+                        with lock:
+                            st["vf_dropped"] += 1
+                            left = st["verify_alive"] - 1
+                        log.warning("verifier worker on %s: %d consecutive failures — "
+                                    "dropping it, %d worker(s) remain", vlm.url, fails, left)
+                        return
+                    if not e.permanent:
+                        time.sleep(min(_RETRY_BACKOFF_S * fails, 15.0))
+                    continue
                 for j, b in enumerate(batch):
                     ch, reg, gen, narr = b
                     if j in res:
@@ -2601,9 +2820,17 @@ def _distill_pipeline(store, kb, extractors, verifiers, embedder, cfg, *, limit=
     verify_done.set()
     wr_thread.join()
 
+    if st["ex_dropped"] or st["vf_dropped"]:
+        log.warning("worker pools decayed during the run: %d of %d extractor and %d of "
+                    "%d verifier worker(s) died on repeated failures — the run continued "
+                    "on the survivors.  Raise the timeout knobs or lower distill_parallel "
+                    "if this recurs.", st["ex_dropped"], len(ex_threads),
+                    st["vf_dropped"], len(vf_threads))
     if st["done"] == 0 and st["extract_alive"] <= 0 and st["skipped"] == 0:
         raise BackendUnavailable("all fast extractor endpoints failed")
     return {"chunks": st["done"], "concepts": st["concepts"], "relations": st["relations"],
             "cards": st["cards"], "skipped": st["skipped"], "skipped_zone": st["skipped_zone"],
             "skipped_dupe": st["skipped_dupe"], "outside_bundle": st["outside_bundle"],
-            "rejected": st["rejected"], "adjusted": st["adjusted"], "verify_failed": st["vfail"]}
+            "rejected": st["rejected"], "adjusted": st["adjusted"], "verify_failed": st["vfail"],
+            "failed": st["failed"], "extract_dropped": st["ex_dropped"],
+            "verify_dropped": st["vf_dropped"]}

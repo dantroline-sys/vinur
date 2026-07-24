@@ -159,8 +159,11 @@ DEFAULTS = {
     # on a 96GB card that is most of the distillation throughput.  Set it
     # explicitly for a remote vLLM box this config doesn't serve (auto can't
     # see its engine), or to 1 to force the old sequential behaviour.
-    # Per-request latency grows with the batch: keep distill_timeout_s
-    # comfortable (batching raises throughput, not single-request speed).
+    # Per-request latency grows with the batch (batching raises throughput,
+    # not single-request speed), so at fan-out > 4 the per-request timeout is
+    # scaled up automatically (× n/4, capped at 1h) — an explicitly larger
+    # distill/extract/verify_timeout_s still wins; workers also retry
+    # transient failures instead of dying on the first timeout.
     "distill_parallel": 0,
     # Hugging Face auth for the egress broker (amiga_net) — model pulls only.
     # Gated repos need it; anonymous requests are also the first to be

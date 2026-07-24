@@ -146,6 +146,10 @@ embed_max_tokens      = 512   # clip inputs to the server's per-sequence window 
 # and endpoints not in [serving] stay at 1.  Set it explicitly for a REMOTE
 # vLLM box (auto can't see a foreign engine), or 1 to force sequential.
 # Also editable live in the panel's Settings tab.
+# Deep fan-outs raise per-request LATENCY (batching raises throughput, not
+# single-request speed): above 4 the per-request timeout auto-scales with the
+# fan-out (× n/4, capped at 1h), and workers retry transient failures instead
+# of dying on the first timeout.  An explicitly larger *_timeout_s still wins.
 distill_parallel = 0
 
 # ── Hugging Face auth (the egress broker's model pulls) ─────────────────────

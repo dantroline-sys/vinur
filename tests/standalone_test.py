@@ -846,6 +846,221 @@ def main():
         D._distill_parallel, D._distill_sequential = par0, seq0
     ok("distill_corpus: one vLLM endpoint -> parallel x8; llama endpoint -> sequential")
 
+    # ── fan-out scales the per-request timeout (batching raises latency) ──────
+    lm_t = SimpleNamespace(url="http://10.0.0.9:8000", timeout=90)
+    fanned = D._fan_out({"distill_parallel": 96}, [lm_t])
+    assert len(fanned) == 96 and all(f.timeout == 2160 for f in fanned), \
+        "96 slots -> timeout x24 (n/4), clones inherit"
+    lm_u = SimpleNamespace(url="http://10.0.0.9:8000", timeout=90)
+    D._fan_out({"distill_parallel": 4}, [lm_u])
+    assert lm_u.timeout == 90, "n<=4 leaves the timeout alone"
+    lm_cap = SimpleNamespace(url="http://10.0.0.9:8000", timeout=600)
+    D._fan_out({"distill_parallel": 96}, [lm_cap])
+    assert lm_cap.timeout == 3600, "scaled timeout caps at 1h"
+    D._fan_out({"distill_parallel": 96}, [SimpleNamespace(url="u")])  # no timeout attr: no crash
+    ok("_fan_out: per-request timeout scales with fan-out (x n/4, 1h cap, raise-only)")
+
+    # ── HTTP 4xx is a PERMANENT per-request veto, not a dead endpoint ─────────
+    import io as _io
+    import urllib.error as _ue
+    dl = D.DistillLM({"distill_url": "http://x", "distill_model": "m", "distill_timeout_s": 5})
+    dl._post = lambda payload: (_ for _ in ()).throw(_ue.HTTPError(
+        "http://x", 400, "Bad Request", None, _io.BytesIO(b"maximum context length exceeded")))
+    try:
+        dl._content("s", "u", {}, 10)
+        assert False, "must raise"
+    except D.BackendUnavailable as e:
+        assert e.permanent and "maximum context length" in str(e), e
+    dl._post = lambda payload: (_ for _ in ()).throw(_ue.HTTPError("http://x", 503, "Busy", None, None))
+    try:
+        dl._content("s", "u", {}, 10)
+        assert False, "must raise"
+    except D.BackendUnavailable as e:
+        assert not e.permanent, "5xx stays transient"
+    dl._post = lambda payload: (_ for _ in ()).throw(TimeoutError("read timed out"))
+    try:
+        dl._content("s", "u", {}, 10)
+        assert False, "must raise"
+    except D.BackendUnavailable as e:
+        assert not e.permanent, "timeout stays transient"
+    ok("DistillLM._content: 4xx -> permanent (body in message); 5xx/timeout -> transient")
+
+    # ── degenerate two-tier collapses to single-tier (same server+model) ──────
+    pipe0 = D._distill_pipeline
+
+    def fake_pipe(store, kb, ex, vf, embedder, cfg, **k):
+        got["pipe"] = (list(ex), list(vf))
+        return {"chunks": 0, "cards": 0}
+
+    cgrab = _DGrab()
+    _DGrab.msgs.clear()
+    D.log.addHandler(cgrab)
+    D.log.setLevel(_lg.INFO)
+    try:
+        D._distill_parallel, D._distill_sequential, D._distill_pipeline = \
+            fake_par, fake_seq, fake_pipe
+        same_e = SimpleNamespace(url="http://one:1", model="big", timeout=90)
+        same_v = SimpleNamespace(url="http://one:1", model="big", timeout=120)
+        D.distill_corpus(None, None, [same_e], None, {"verify": True}, verifiers=[same_v])
+        assert got.pop("seq") is same_v, "collapse keeps the VERIFIER's client knobs"
+        assert "pipe" not in got and any("single-tier" in m for m in _DGrab.msgs)
+        # different servers -> the two-tier pipeline still runs
+        _DGrab.msgs.clear()
+        other_v = SimpleNamespace(url="http://two:2", model="big", timeout=120)
+        D.distill_corpus(None, None, [same_e], None, {"verify": True}, verifiers=[other_v])
+        ex_l, vf_l = got.pop("pipe")
+        assert ex_l[0] is same_e and vf_l[0] is other_v
+        assert not any("single-tier" in m for m in _DGrab.msgs)
+    finally:
+        D._distill_parallel, D._distill_sequential, D._distill_pipeline = par0, seq0, pipe0
+        D.log.removeHandler(cgrab)
+        D.log.setLevel(lvl0)
+    ok("distill_corpus: same server+model tiers collapse to single-tier (verifier knobs win)")
+
+    # ── worker resilience: retries survive, poison chunks drop, dead pools raise ──
+    import contextlib as _ctx
+    import sqlite3 as _sq3
+
+    class _PStore:
+        def __init__(self, chunks):
+            self._c = chunks
+
+        def iter_chunks(self):
+            return iter([dict(c) for c in self._c])
+
+    class _PKB:
+        def __init__(self):
+            self.marked = []
+
+        def batch(self):
+            return _ctx.nullcontext()
+
+        def mark_distilled(self, cid):
+            self.marked.append(cid)
+
+        def mark_recarded(self, cid, v):
+            pass
+
+        def is_distilled(self, cid):
+            return False
+
+        def claim_text(self, th, cid):
+            return cid
+
+        def record_dupe(self, *a, **k):
+            pass
+
+        def mark_zone_skipped(self, *a, **k):
+            pass
+
+        def get_source(self, doc):
+            return None
+
+    class _PLM:
+        def __init__(self, url="http://t:1", transient=None, permanent=(), always_fail=False):
+            self.url, self.model, self.timeout = url, "m", 5
+            self.transient = dict(transient or {})    # chunk id -> failures to serve first
+            self.permanent = set(permanent)
+            self.always_fail = always_fail
+
+        def extract(self, ch, reg):
+            if self.always_fail:
+                raise D.BackendUnavailable("timed out")
+            if ch["id"] in self.permanent:
+                e = D.BackendUnavailable("HTTP Error 400: too long")
+                e.permanent = True
+                raise e
+            if self.transient.get(ch["id"], 0) > 0:
+                self.transient[ch["id"]] -= 1
+                raise D.BackendUnavailable("timed out")
+            return (["c"], [], [], [], {})
+
+        def extract_narrative(self, ch):
+            return None
+
+    pchunks = [{"id": f"c{i}", "text": f"wholly unique passage number {i} on subject {i}",
+                "section": "", "path_or_url": f"doc{i}"} for i in range(4)]
+    dc0, pe0, vb0, lh0, bo0 = (D.distill_chunk, D._precompute_node_embeds,
+                               D.verify_mod.verify_batch, D.lm_lease.is_held,
+                               D._RETRY_BACKOFF_S)
+    try:
+        D.distill_chunk = (lambda kb, lm, emb, ch, extraction=None,
+                           source_regime=None, narrative=None: (1, 0, 0))
+        D._precompute_node_embeds = lambda emb, gen: {}
+        D.verify_mod.verify_batch = lambda vlm, drafts, cfg: [
+            (d["concepts"], d["relations"], d["procedures"],
+             {"rejected": 0, "adjusted": 0, "failed": 0}) for d in drafts]
+        D.lm_lease.is_held = lambda *a, **k: False
+        D._RETRY_BACKOFF_S = 0.0
+        with tempfile.TemporaryDirectory() as td:
+            kbp = str(Path(td) / "kb.db")
+            con = _sq3.connect(kbp)
+            con.executescript(
+                "CREATE TABLE distilled_chunks(chunk_id TEXT PRIMARY KEY, distilled_at REAL);"
+                "CREATE TABLE zone_skips(chunk_id TEXT PRIMARY KEY, zone TEXT, at REAL);"
+                "CREATE TABLE chunk_texts(text_hash TEXT PRIMARY KEY, chunk_id TEXT,"
+                " claimed_at REAL);"
+                "CREATE TABLE chunk_dupes(chunk_id TEXT PRIMARY KEY, of_chunk_id TEXT,"
+                " text_hash TEXT, kind TEXT, similarity REAL, found_at REAL);"
+                "CREATE TABLE source_registry(doc_id TEXT PRIMARY KEY, regime TEXT);")
+            con.commit()
+            con.close()
+            pcfg = {"kb_path": kbp, "ingest_log_every": 0, "verify_batch": 2,
+                    "distill_dedupe": True}
+            # (a) a transient failure RETRIES on the same worker — nothing lost
+            kb = _PKB()
+            res = D._distill_pipeline(_PStore(pchunks), kb, [_PLM(transient={"c1": 2})],
+                                      [_PLM()], None, pcfg)
+            assert res["chunks"] == 4 and res["failed"] == 0, res
+            assert res["extract_dropped"] == 0 and len(kb.marked) == 4, res
+            # (b) a 4xx-vetoed chunk drops ALONE; the worker and the rest survive
+            kb = _PKB()
+            res = D._distill_pipeline(_PStore(pchunks), kb, [_PLM(permanent={"c2"})],
+                                      [_PLM()], None, pcfg)
+            assert res["chunks"] == 3 and res["failed"] == 1, res
+            assert res["extract_dropped"] == 0 and "c2" not in kb.marked, res
+            # (c) a permanently failing VERIFIER passes drafts through unverified
+            def _mk_perm():
+                e = D.BackendUnavailable("HTTP Error 400: batch too long")
+                e.permanent = True
+                return e
+            D.verify_mod.verify_batch = \
+                lambda vlm, drafts, cfg: (_ for _ in ()).throw(_mk_perm())
+            kb = _PKB()
+            res = D._distill_pipeline(_PStore(pchunks), kb, [_PLM()], [_PLM()], None, pcfg)
+            assert res["chunks"] == 4 and res["verify_failed"] == 4, res
+            assert res["verify_dropped"] == 0, "permanent batch veto must not kill the worker"
+            D.verify_mod.verify_batch = lambda vlm, drafts, cfg: [
+                (d["concepts"], d["relations"], d["procedures"],
+                 {"rejected": 0, "adjusted": 0, "failed": 0}) for d in drafts]
+            # (d) an endpoint that NEVER answers still aborts (resumable), no hang
+            try:
+                D._distill_pipeline(_PStore(pchunks), _PKB(), [_PLM(always_fail=True)],
+                                    [_PLM()], None, pcfg)
+                assert False, "dead pool must raise"
+            except D.BackendUnavailable:
+                pass
+            # (e) the single-tier parallel path: same retry/poison/abort semantics
+            kb = _PKB()
+            res = D._distill_parallel(_PStore(pchunks), kb, [_PLM(transient={"c0": 1})],
+                                      None, pcfg)
+            assert res["chunks"] == 4 and res["failed"] == 0, res
+            kb = _PKB()
+            res = D._distill_parallel(_PStore(pchunks), kb, [_PLM(permanent={"c1"})],
+                                      None, pcfg)
+            assert res["chunks"] == 3 and res["failed"] == 1, res
+            try:
+                D._distill_parallel(_PStore(pchunks), _PKB(), [_PLM(always_fail=True)],
+                                    None, pcfg)
+                assert False, "dead pool must raise"
+            except D.BackendUnavailable:
+                pass
+    finally:
+        (D.distill_chunk, D._precompute_node_embeds, D.verify_mod.verify_batch,
+         D.lm_lease.is_held, D._RETRY_BACKOFF_S) = dc0, pe0, vb0, lh0, bo0
+    ok("distill workers: transient failures retry, 4xx chunks drop alone, "
+       "unverifiable drafts pass through unverified, dead pools still abort")
+
     # ── conversational card families: cleaners are shape-gated ──────────────
     b = D._clean_branch({"situation": "s", "options": [
         {"when": "cold", "then": "use A", "because": "b"},
