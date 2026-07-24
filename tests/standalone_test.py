@@ -1156,12 +1156,15 @@ def main():
     # ── recard: cards-only schema, prompt menus, fiction short-circuit ──────
     import contextlib
 
-    assert set(D.RECARD_SCHEMA["properties"]) == set(D.EXTRA_CARD_KEYS)
+    assert set(D.RECARD_SCHEMA["properties"]) == set(D.RECARD_FAMILIES)
     assert "concepts" not in D.RECARD_SCHEMA["properties"]
     rsE = D._recard_system({"source_type": "pdf"}, "empirical")
     assert "ALREADY mined" in rsE and "`branches` entry" in rsE
+    assert "- procedures:" in rsE and "- criteria:" in rsE, \
+        "v3: the cards-only sweep re-offers the full pass's card shapes"
     rsH = D._recard_system({}, "historical")
     assert "`misconceptions` entry" in rsH and "`branches` entry" not in rsH
+    assert "- procedures:" in rsH, "every non-fiction regime gets proc/crit"
     assert D._recard_system({}, "fictional") is None
 
     seen_schema = []
@@ -1172,7 +1175,7 @@ def main():
         or json.dumps({"misconceptions": [{"claim": "c", "truth": "t"}]}))
     ex2 = dl2.extract_extras({"text": "x"}, "empirical")
     assert ex2["misconceptions"] and ex2["branches"] == []
-    assert set(seen_schema[0]["properties"]) == set(D.EXTRA_CARD_KEYS)
+    assert set(seen_schema[0]["properties"]) == set(D.RECARD_FAMILIES)
     dl2.extract_extras({"text": "x"}, "empirical", families=("misconceptions",))
     assert set(seen_schema[1]["properties"]) == {"misconceptions"}, \
         "a families subset must narrow the schema too"
@@ -1230,10 +1233,17 @@ def main():
             return ("n:" + lab.lower(), True)
 
         def add_card(self, node_id, **k):
-            self.cards.append((node_id, k["card_type"]))
+            self.cards.append((node_id, k.get("card_type", "procedure")))
             return ("c%d" % len(self.cards), True)
 
         def add_surface_question(self, *a, **k):
+            pass
+
+        # the recard title gate: this fixture holds no prior cards
+        def find_card(self, node_id, ctype, title):
+            return None
+
+        def corroborate_card(self, *a, **k):
             pass
 
     class RecLM:
@@ -1259,7 +1269,7 @@ def main():
     assert rstats["chunks"] == 1 and rstats["cards"] == 1, rstats
     assert rstats["no_menu"] == 1 and rstats["skipped"] == 2, rstats
     assert rstats["extra_offered"] == 1 and rstats["extra_kept"] == 1
-    assert RecLM.calls == [("c1", None, D.EXTRA_CARD_KEYS)]
+    assert RecLM.calls == [("c1", None, D.RECARD_FAMILIES)]
     assert rkb.recarded.get("c1") == D.RECARD_VERSION
     assert rkb.recarded.get("c4") == D.RECARD_VERSION and "c2" not in rkb.recarded
     assert rkb.cards == [("n:x-y link", "misconception")]
@@ -1273,15 +1283,64 @@ def main():
     rkb2 = RecKB(distilled={"c1"}, recarded={"c1": 1}, regimes={})
     rstats3 = D.recard_corpus(RecStore(rc_chunks[:1]), rkb2, [RecLM()], StubEmb(), rcfg)
     assert rstats3["chunks"] == 1, rstats3
-    assert RecLM.calls == [("c1", None, ("enumerations",))], \
+    assert RecLM.calls == [("c1", None, ("enumerations", "procedures", "criteria"))], \
         "a v1-stamped chunk must be asked ONLY for the families added since"
     assert rkb2.recarded["c1"] == D.RECARD_VERSION
     hist = RecKB(distilled={"c1"}, recarded={"c1": 1},
                  regimes={"doc://a": "historical"})
     RecLM.calls = []
     D.recard_corpus(RecStore(rc_chunks[:1]), hist, [RecLM()], StubEmb(), rcfg)
-    assert RecLM.calls and RecLM.calls[0][2] == ("enumerations",)
-    ok("versioned recard: v1 stamp -> enumerations only; stamp advances")
+    assert RecLM.calls and RecLM.calls[0][2] == ("enumerations", "procedures", "criteria")
+    ok("versioned recard: v1 stamp -> only families added since; stamp advances")
+
+    # ── v3 recovery: proc/crit re-open the lot; all_families re-asks EVERYTHING ─
+    RecLM.calls = []
+    rkb3 = RecKB(distilled={"c1"}, recarded={"c1": 2}, regimes={})
+    D.recard_corpus(RecStore(rc_chunks[:1]), rkb3, [RecLM()], StubEmb(), rcfg)
+    assert RecLM.calls[0][2] == ("procedures", "criteria"), \
+        "a v2 stamp re-opens for exactly the truncation-risk shapes"
+    RecLM.calls = []
+    rkb4 = RecKB(distilled={"c1"}, recarded={"c1": 2}, regimes={})
+    D.recard_corpus(RecStore(rc_chunks[:1]), rkb4, [RecLM()], StubEmb(), rcfg,
+                    all_families=True)
+    assert RecLM.calls[0][2] == D.RECARD_FAMILIES, \
+        "all_families ignores stamp AGE (eligibility unchanged) — full re-ask"
+    assert rkb4.recarded["c1"] == D.RECARD_VERSION, "still stamps -> resumable"
+
+    class RecLM2(RecLM):
+        def extract_extras(self, chunk, regime=None, families=None):
+            RecLM.calls.append((chunk["id"], regime, tuple(families or ())))
+            return {"procedures": [{"title": "Sharpen a knife", "concept": "knife care",
+                                    "steps": ["coarse stone", "hone"]}],
+                    "criteria": [{"title": "Dull blade", "concept": "knife care",
+                                  "required": [{"feature": "onset", "value": "gradual"}]}]}
+
+    rkb5 = RecKB(distilled={"c1"}, recarded={"c1": 2}, regimes={})
+    D.recard_corpus(RecStore(rc_chunks[:1]), rkb5, [RecLM2()], StubEmb(), rcfg)
+    assert sorted(t for _, t in rkb5.cards) == ["criteria", "procedure"], rkb5.cards
+    rst = D.stage_stats()
+    assert rst["proc_offered"] == 1 and rst["proc_kept"] == 1, rst
+    assert rst["crit_offered"] == 1 and rst["crit_kept"] == 1, rst
+
+    class GateKB(RecKB):
+        def __init__(self, *a, **k):
+            super().__init__(*a, **k)
+            self.corroborated = []
+
+        def find_card(self, node_id, ctype, title):
+            return "existing-1" if ctype == "procedure" else None
+
+        def corroborate_card(self, cid, doc_id=None, evidence=""):
+            self.corroborated.append(cid)
+
+    gkb = GateKB(distilled={"c1"}, recarded={"c1": 2}, regimes={})
+    D.recard_corpus(RecStore(rc_chunks[:1]), gkb, [RecLM2()], StubEmb(), rcfg)
+    assert gkb.corroborated == ["existing-1"], \
+        "same node+type+title corroborates the existing card"
+    assert [t for _, t in gkb.cards] == ["criteria"], \
+        "the reworded twin is NOT inserted"
+    ok("recard v3: proc/crit harvested + stage-counted, all_families full re-ask, "
+       "title gate corroborates instead of inserting twins")
 
     # ── full distill stamps the recard checkpoint (swept corpus stays swept) ─
     seq_marks = []
@@ -1406,8 +1465,12 @@ def main():
     # ── recard registered end-to-end: ops verb, autopilot step + big-LM lane ─
     from knowledgehost import autopilot as AP_
     from knowledgehost import ops as OPS_
-    assert OPS_.COMMANDS["recard"] == {"limit": "int", "bundle": "str"}
+    assert OPS_.COMMANDS["recard"] == {"limit": "int", "bundle": "str",
+                                       "all_families": "bool"}
     assert OPS_.HELP["recard"]["_"] and "bundle" in OPS_.HELP["recard"]
+    assert "all_families" in OPS_.HELP["recard"]
+    assert OPS_._argv("recard", {"all_families": True}) == ["--all-families"], \
+        "the bool flag must render with the dash"
     assert any(s["command"] == "recard" and not s["enabled"]
                for s in AP_.DEFAULT_PLAN["steps"])
     assert AP_.auto_model({"distill_urls": []}, "recard") is None  # distill lane, no urls

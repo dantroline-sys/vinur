@@ -987,6 +987,30 @@ class KB:
         self._maybe_commit()
         return cid, "insert"
 
+    def find_card(self, node_id, card_type, title):
+        """Active card on this node with this type + title (case/space-blind), or
+        None.  The recard sweep's dedup gate: a re-offered card regenerates with
+        drifted wording (different card_hash) but the same title on the same node
+        — corroborate that instead of inserting a reworded twin."""
+        row = self.db.execute(
+            "SELECT id FROM procedure_cards WHERE node_id=? AND card_type=? "
+            "AND lower(trim(title))=lower(trim(?)) AND status='active'",
+            (node_id, (card_type or "procedure").strip().lower(),
+             title or "")).fetchone()
+        return row["id"] if row else None
+
+    def corroborate_card(self, card_id, doc_id=None, evidence=""):
+        """Merge another sighting into an existing card's support (same shape the
+        card_hash-match path in add_card uses)."""
+        row = self.db.execute("SELECT support FROM procedure_cards WHERE id=?",
+                              (card_id,)).fetchone()
+        if not row or not doc_id:
+            return
+        sup = self._merge_support(row["support"], self._support_entry(doc_id, evidence))
+        self.db.execute("UPDATE procedure_cards SET support=?, updated_at=? WHERE id=?",
+                        (sup, time.time(), card_id))
+        self._maybe_commit()
+
     _CARD_JSON_FIELDS = ("steps", "preconditions", "tools", "materials", "tips",
                          "mistakes", "safety", "red_flags", "discriminators", "escalation")
     _CARD_TEXT_FIELDS = ("title", "goal", "domain")

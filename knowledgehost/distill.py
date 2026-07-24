@@ -391,9 +391,50 @@ EXTRA_CARD_KEYS = ("branches", "troubleshooting", "expectations", "misconception
 # chunk stamped with an older version is RE-OPENED by the recard pass, which
 # then offers ONLY the families newer than its stamp — so adding a family
 # later never re-extracts (and near-duplicates) the ones already harvested.
+# v3 = the truncation-recovery sweep: cards trail concepts in the full pass's
+# constrained JSON, so an output-budget truncation ate procedures/criteria
+# (and the families after them) while the chunk was still marked distilled
+# AND recarded-current — versioning proc/crit re-opens every chunk for them.
 _FAMILY_VERSION = {"branches": 1, "troubleshooting": 1, "expectations": 1,
-                   "misconceptions": 1, "enumerations": 2}
+                   "misconceptions": 1, "enumerations": 2,
+                   "procedures": 3, "criteria": 3}
 RECARD_VERSION = max(_FAMILY_VERSION.values())
+
+# Everything the cards-only sweep can harvest: the conversational families
+# plus the two card shapes the FULL pass owns (recard re-offers them from v3).
+RECARD_FAMILIES = EXTRA_CARD_KEYS + ("procedures", "criteria")
+
+# The procedure/criteria instructions are SHARED between the full pass (_CORE
+# includes them) and the recard sweep (which re-offers them as v3 families, so
+# chunks whose cards were lost to output truncation re-open for exactly them).
+_PROC_PROMPT = (
+    "- procedures: for any how-to the passage conveys (even in passing), a `title`, "
+    "the `concept` it relates to, a `goal`, ordered `steps`, and `evidence`. Also, WHEN "
+    "the passage states them: `red_flags` (danger signs that mean stop / something is "
+    "wrong), `escalation` (what to switch or step up TO when a red flag fires — the "
+    "'would change to'), and `discriminators` ({feature, value} pairs marking WHEN this "
+    "procedure applies versus a sibling — the same field and vocabulary as a relation's "
+    "discriminators, so a query's context can be matched to the right procedure). Omit "
+    "any the passage doesn't support. When the how-to is a GUIDELINE recommendation, add "
+    "`grade` {strength: strong|conditional, evidence_quality: high|moderate|low, "
+    "population} so a graded endorsement is not mistaken for a bare tip.\n"
+)
+
+_CRIT_PROMPT = (
+    "- criteria: for any passage that says how to RECOGNISE, DIAGNOSE, DEFINE, or CLASSIFY "
+    "something by its features (a condition, a syndrome, a category, a stage) — the bulk "
+    "of reference text — emit a `criteria` entry: a `title`, the `concept`, and "
+    "the features split by MODALITY: `required` (must-have — necessary), `supportive` "
+    "(may-have — raise likelihood), `exclusion` (must-NOT-have — rule this out if "
+    "present). Add a `threshold` decision rule when stated ('2 major + 1 minor', "
+    "'>=3 of 5'), the `gold_standard` confirmatory test, and `differentials` "
+    "[{condition, discriminator}] — look-alikes and the feature that tells them apart. "
+    "For a STAGING / SEVERITY scale give ordered `levels` [{level, label, features}] "
+    "instead. Every feature is a {feature, value} pair — REUSE the shared vocabulary "
+    "(" + _vocab_line() + ") so an observed presentation matches the criteria. This is "
+    "how the base answers 'what is this / which fits these findings' — do NOT force it "
+    "into a how-to.\n"
+)
 
 # The prompt is assembled per chunk: a shared CORE (what to extract, how to build
 # REUSABLE hub structure and BRANCHING question coverage) plus a per-text-type LENS
@@ -412,29 +453,7 @@ _CORE = (
     "(causes, prevents, requires, is_a, instance_of, part_of, contrasts_with, "
     "supports, …), a `mechanism` (the why/how), `mechanism_basis`, `polarity`, "
     "optional `conditions`, `discriminators`, a `regime`, and `evidence`.\n"
-    "- procedures: for any how-to the passage conveys (even in passing), a `title`, "
-    "the `concept` it relates to, a `goal`, ordered `steps`, and `evidence`. Also, WHEN "
-    "the passage states them: `red_flags` (danger signs that mean stop / something is "
-    "wrong), `escalation` (what to switch or step up TO when a red flag fires — the "
-    "'would change to'), and `discriminators` ({feature, value} pairs marking WHEN this "
-    "procedure applies versus a sibling — the same field and vocabulary as a relation's "
-    "discriminators, so a query's context can be matched to the right procedure). Omit "
-    "any the passage doesn't support. When the how-to is a GUIDELINE recommendation, add "
-    "`grade` {strength: strong|conditional, evidence_quality: high|moderate|low, "
-    "population} so a graded endorsement is not mistaken for a bare tip.\n"
-    "- criteria: for any passage that says how to RECOGNISE, DIAGNOSE, DEFINE, or CLASSIFY "
-    "something by its features (a condition, a syndrome, a category, a stage) — the bulk "
-    "of reference text — emit a `criteria` entry: a `title`, the `concept`, and "
-    "the features split by MODALITY: `required` (must-have — necessary), `supportive` "
-    "(may-have — raise likelihood), `exclusion` (must-NOT-have — rule this out if "
-    "present). Add a `threshold` decision rule when stated ('2 major + 1 minor', "
-    "'>=3 of 5'), the `gold_standard` confirmatory test, and `differentials` "
-    "[{condition, discriminator}] — look-alikes and the feature that tells them apart. "
-    "For a STAGING / SEVERITY scale give ordered `levels` [{level, label, features}] "
-    "instead. Every feature is a {feature, value} pair — REUSE the shared vocabulary "
-    "(" + _vocab_line() + ") so an observed presentation matches the criteria. This is "
-    "how the base answers 'what is this / which fits these findings' — do NOT force it "
-    "into a how-to.\n"
+) + _PROC_PROMPT + _CRIT_PROMPT + (
     "CAUSAL EDGES are what 'why' and diagnosis depend on — get them precise:\n"
     "- `mechanism` must EXPLAIN, not restate: give the intermediate chain by which the "
     "cause produces the effect (e.g. 'wind accelerates tear-film evaporation, thinning "
@@ -602,7 +621,7 @@ def _system_for(chunk: dict, regime: str | None = None) -> str:
 # original distill did.
 RECARD_SCHEMA = {
     "type": "object",
-    "properties": {k: DISTILL_SCHEMA["properties"][k] for k in EXTRA_CARD_KEYS},
+    "properties": {k: DISTILL_SCHEMA["properties"][k] for k in RECARD_FAMILIES},
 }
 
 
@@ -612,12 +631,21 @@ def _recard_schema(families) -> dict:
     return {"type": "object",
             "properties": {k: DISTILL_SCHEMA["properties"][k] for k in families}}
 
+# The recard menu: each regime's conversational families PLUS procedures and
+# criteria for every non-fiction regime (mirroring the full pass, whose _CORE
+# offers both to all text types).  Fiction stays empty — the §8 narrative pass
+# owns that lane.
+_RECARD_PROMPTS = {**_EXTRA_CARD_PROMPTS,
+                   "procedures": _PROC_PROMPT, "criteria": _CRIT_PROMPT}
+_RECARD_MENU = {r: (m + ("procedures", "criteria") if r != "fictional" else m)
+                for r, m in _EXTRA_MENU.items()}
+
 _RECARD_CORE = (
-    "You are re-reading a passage that was ALREADY mined for concepts, relations, "
-    "procedures and criteria on an earlier pass — do NOT restate any of those.  "
-    "This pass harvests ONLY the conversational card shapes below.  Emit an entry "
-    "only when the passage genuinely has that shape; empty arrays are the normal "
-    "result for most passages.\n"
+    "You are re-reading a passage that was ALREADY mined on an earlier pass — "
+    "do NOT re-emit concepts or relations; they exist and are joined by label.  "
+    "This pass harvests ONLY the card shapes below.  Emit an entry only when "
+    "the passage genuinely has that shape; empty arrays are the normal result "
+    "for most passages.\n"
 )
 
 
@@ -628,12 +656,12 @@ def _recard_system(chunk: dict, regime: str | None = None,
     or none of the requested `families` are in it — so the caller can mark the
     chunk swept without spending an LM call."""
     regime = _format_regime(chunk, regime)
-    menu = _EXTRA_MENU.get(regime, EXTRA_CARD_KEYS)
+    menu = _RECARD_MENU.get(regime, RECARD_FAMILIES)
     fams = tuple(k for k in menu if families is None or k in families)
     if not fams:
         return None
     code = _CODE_LENS if chunk.get("zone") == "code" else ""
-    return _RECARD_CORE + "".join(_EXTRA_CARD_PROMPTS[k] for k in fams) + code + _SECURITY
+    return _RECARD_CORE + "".join(_RECARD_PROMPTS[k] for k in fams) + code + _SECURITY
 
 
 def _user_prompt(chunk: dict) -> str:
@@ -875,11 +903,11 @@ class DistillLM:
     def extract_extras(self, chunk: dict, regime: str | None = None,
                        families=None):
         """Cards-only re-pass (recard): {family: [items]} for the requested
-        conversational `families` (default: all), {} when the passage offers
-        none (or the output didn't parse — the caller still marks progress),
-        or None WITHOUT an LM call when nothing is on offer for this regime.
-        Raises BackendUnavailable if the endpoint is unreachable."""
-        families = tuple(families if families is not None else EXTRA_CARD_KEYS)
+        `families` (default: all, procedures/criteria included), {} when the
+        passage offers none (or the output didn't parse — the caller still
+        marks progress), or None WITHOUT an LM call when nothing is on offer
+        for this regime.  Raises BackendUnavailable if unreachable."""
+        families = tuple(families if families is not None else RECARD_FAMILIES)
         system = _recard_system(chunk, regime, families)
         if system is None:
             return None
@@ -1431,9 +1459,11 @@ def distill_narrative(kb, lm, embedder, narr: dict, doc_id, world, nodemap) -> t
 
 
 def _distil_procedures(kb, embedder, procedures, nodemap, doc_id,
-                       claim_regime, claim_scope) -> int:
+                       claim_regime, claim_scope, title_dedupe=False) -> int:
     """Store how-to gems as procedure cards (the 'how' substrate), attached to a
-    concept node and embedded for retrieval."""
+    concept node and embedded for retrieval.  `title_dedupe` (the recard sweep):
+    a re-offered card regenerates with drifted wording — same node + type +
+    title corroborates the existing card instead of inserting a reworded twin."""
     procs = [p for p in (procedures or [])
              if (p.get("title") or "").strip() and (p.get("steps"))][:10]
     if not procs:
@@ -1457,6 +1487,12 @@ def _distil_procedures(kb, embedder, procedures, nodemap, doc_id,
         node_id = nodemap.get(lab)
         if not node_id:
             continue
+        if title_dedupe:
+            prior = kb.find_card(node_id, "procedure", p["title"].strip())
+            if prior:
+                kb.corroborate_card(prior, doc_id,
+                                    sanitize.clean(p.get("evidence") or "", 200))
+                continue
         creg = claim_regime(p)
         cid, _ = kb.add_card(
             node_id, title=p["title"].strip(), goal=sanitize.clean(p.get("goal") or "", 300),
@@ -1473,7 +1509,7 @@ def _distil_procedures(kb, embedder, procedures, nodemap, doc_id,
 
 
 def _distil_criteria(kb, embedder, criteria, nodemap, doc_id,
-                     claim_regime, claim_scope) -> int:
+                     claim_regime, claim_scope, title_dedupe=False) -> int:
     """Store diagnostic / classification / staging criteria as `criteria` cards — the
     RECOGNITION substrate ('how do I identify/diagnose X by its features'), the shape most
     of a scientific corpus actually takes.  Each is attached to its concept node
@@ -1506,8 +1542,14 @@ def _distil_criteria(kb, embedder, criteria, nodemap, doc_id,
         node_id = nodemap.get(lab)
         if not node_id:
             continue
-        creg = claim_regime(c)
         ctype = "staging" if pay.get("levels") else "criteria"
+        if title_dedupe:
+            prior = kb.find_card(node_id, ctype, c["title"].strip())
+            if prior:
+                kb.corroborate_card(prior, doc_id,
+                                    sanitize.clean(c.get("evidence") or "", 200))
+                continue
+        creg = claim_regime(c)
         cid, _ = kb.add_card(
             node_id, title=c["title"].strip(), card_type=ctype, criteria=pay,
             grade=_clean_grade(c.get("grade")),
@@ -1674,7 +1716,7 @@ _EXTRA_SPECS = {
 
 
 def _distil_extras(kb, embedder, extras, nodemap, doc_id,
-                   claim_regime, claim_scope) -> int:
+                   claim_regime, claim_scope, title_dedupe=False) -> int:
     """Store the conversational card families.  Mirrors _distil_criteria: each
     kept item is attached to its concept node (created if the generic pass
     didn't) and embedded on its identifying text + a retrieval question, and
@@ -1717,6 +1759,12 @@ def _distil_extras(kb, embedder, extras, nodemap, doc_id,
             node_id = nodemap.get(lab)
             if not node_id:
                 continue
+            if title_dedupe:
+                prior = kb.find_card(node_id, ctype, title)
+                if prior:
+                    kb.corroborate_card(prior, doc_id,
+                                        sanitize.clean(it.get("evidence") or "", 200))
+                    continue
             creg = claim_regime(it)
             cid, _ = kb.add_card(
                 node_id, title=title, card_type=ctype, criteria=pay,
@@ -2377,19 +2425,41 @@ def _recard_store(kb, embedder, chunk, extras) -> int:
     def claim_scope(regime):
         return {"world": world} if regime == "fictional" else {}
 
-    _stage_add(extra_offered=sum(len(v or []) for v in (extras or {}).values()))
-    n = _distil_extras(kb, embedder, extras, {}, doc_id, claim_regime, claim_scope)
+    extras = dict(extras or {})
+    procs = extras.pop("procedures", None) or []
+    crits = extras.pop("criteria", None) or []
+    nm = {}                                       # shared label→node map for the chunk
+    _stage_add(extra_offered=sum(len(v or []) for v in extras.values()))
+    n = _distil_extras(kb, embedder, extras, nm, doc_id, claim_regime, claim_scope,
+                       title_dedupe=True)
     _stage_add(extra_kept=n)
+    if procs:
+        _stage_add(proc_offered=len(procs))
+        k = _distil_procedures(kb, embedder, procs, nm, doc_id, claim_regime,
+                               claim_scope, title_dedupe=True)
+        _stage_add(proc_kept=k)
+        n += k
+    if crits:
+        _stage_add(crit_offered=len(crits))
+        k = _distil_criteria(kb, embedder, crits, nm, doc_id, claim_regime,
+                             claim_scope, title_dedupe=True)
+        _stage_add(crit_kept=k)
+        n += k
     return n
 
 
-def recard_corpus(store, kb, lms, embedder, cfg, *, limit=None, bundle=None) -> dict:
-    """Cards-only sweep: run the conversational-families extraction over chunks
-    distilled BEFORE those families existed.  Nothing else is re-emitted — nodes
-    are joined, never re-created, and relations are untouched, so the adjudication
-    queue stays quiet.  Resumable (recarded_chunks is the checkpoint); fanned out
-    like distill, and the shared preamble makes vLLM prefix caching very effective.
-    Raises BackendUnavailable when every endpoint is gone (resumable abort)."""
+def recard_corpus(store, kb, lms, embedder, cfg, *, limit=None, bundle=None,
+                  all_families=False) -> dict:
+    """Cards-only sweep: run the card-families extraction (procedures/criteria
+    included from v3) over chunks stamped before the current RECARD_VERSION.
+    Nothing else is re-emitted — nodes are joined, never re-created, and
+    relations are untouched, so the adjudication queue stays quiet.  Resumable
+    (recarded_chunks is the checkpoint); fanned out like distill, and the shared
+    preamble makes vLLM prefix caching very effective.  `all_families` ignores
+    each stamp's AGE (eligibility is unchanged) so a recovery sweep re-asks
+    EVERY family — for chunks whose cards were lost to output truncation while
+    their stamps said done.  Raises BackendUnavailable when every endpoint is
+    gone (resumable abort)."""
     import queue
     import threading
     from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
@@ -2411,9 +2481,12 @@ def recard_corpus(store, kb, lms, embedder, cfg, *, limit=None, bundle=None) -> 
     every = cfg["ingest_log_every"]
 
     def families_for(ch) -> tuple:
-        # a re-opened chunk (older stamp) is asked ONLY for the newer families
-        return tuple(k for k in EXTRA_CARD_KEYS
-                     if _FAMILY_VERSION[k] > ch.get("_recard_from", 0))
+        # a re-opened chunk (older stamp) is asked ONLY for the newer families;
+        # all_families zeroes the stamp so the recovery sweep re-asks everything
+        # (dedup holds: exact card_hash corroborates, and the title gate folds a
+        # reworded regeneration into the existing card instead of a twin)
+        base = 0 if all_families else ch.get("_recard_from", 0)
+        return tuple(k for k in RECARD_FAMILIES if _FAMILY_VERSION[k] > base)
 
     def job(chunk, regime, families):
         while True:                                   # one in-flight request per slot

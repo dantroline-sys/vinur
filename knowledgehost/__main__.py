@@ -354,13 +354,15 @@ def distill_mod_bundle(ch):
     return distill_mod._chunk_bundle(ch)
 
 
-def _run_recard(cfg, store, embedder, log, *, limit=None, bundle=None) -> int:
-    """Cards-only sweep over already-distilled chunks: harvest the conversational
-    card families (branch/troubleshooting/expectation/misconception) from corpus
-    distilled before those families existed.  Joins existing concept nodes and
-    never re-emits nodes or relations, so the adjudication queue stays quiet.
-    Resumable (the recarded set is the checkpoint); big-LM work, fanned out like
-    distill."""
+def _run_recard(cfg, store, embedder, log, *, limit=None, bundle=None,
+                all_families=False) -> int:
+    """Cards-only sweep over already-distilled chunks: harvest the card families
+    (procedures and criteria included from v3, plus branch/troubleshooting/
+    expectation/misconception/enumeration) from corpus stamped before the current
+    RECARD_VERSION.  --all-families re-asks EVERY family regardless of stamp age
+    (truncation recovery).  Joins existing concept nodes and never re-emits nodes
+    or relations, so the adjudication queue stays quiet.  Resumable (the recarded
+    set is the checkpoint); big-LM work, fanned out like distill."""
     from . import distill as distill_mod
     if not embedder.embed_one("warmup", "document"):
         log.error("embed endpoint unreachable — recard needs vectors for the new cards.")
@@ -370,10 +372,17 @@ def _run_recard(cfg, store, embedder, log, *, limit=None, bundle=None) -> int:
         log.error("no big-LM endpoint up (%s) — start one first.",
                   ", ".join(cfg.get("verify_urls") or cfg.get("distill_urls") or []))
         return 1
+    # verify_endpoints builds clients with the VERDICT budget (verify_max_tokens,
+    # 1024) — this sweep emits procedure/criteria payloads, so re-stamp the
+    # extraction knobs or the recovery pass would truncate its own harvest.
+    for lm in big:
+        lm.max_tokens = cfg.get("distill_max_tokens", 3072)
+        lm.timeout = cfg.get("distill_timeout_s", lm.timeout)
     kb = KB(cfg)
     try:
         stats = distill_mod.recard_corpus(store, kb, big, embedder, cfg,
-                                          limit=limit, bundle=bundle)
+                                          limit=limit, bundle=bundle,
+                                          all_families=all_families)
         log.info("recard: %s", stats)
         log.info("kb: %s", kb.counts())
         ops_mod.emit_result(stats.get("chunks", 0) > 0 or stats.get("no_menu", 0) > 0,
@@ -933,6 +942,10 @@ def main(argv=None):
                     help="source: assign the source to this bundle group | "
                          "distill/recard: only chunks from this provenance bundle (e.g. 'vinkona' — "
                          "distil Vinkona's research drops ahead of the big corpus)")
+    ap.add_argument("--all-families", action="store_true", dest="all_families",
+                    help="recard: re-ask EVERY card family regardless of each chunk's "
+                         "stamp age (truncation recovery — cards lost to a too-small "
+                         "output budget while the chunk was already marked done)")
     ap.add_argument("--near", action="store_true",
                     help="dedupe: also find near-duplicates (same text, different wording)")
     ap.add_argument("--threshold", type=float, default=0.9,
@@ -1114,7 +1127,8 @@ def main(argv=None):
 
     if args.command == "recard":               # raw store + KB + big LM, cards only
         return _run_recard(cfg, store, embedder, log, limit=args.limit,
-                           bundle=getattr(args, "bundle", None))
+                           bundle=getattr(args, "bundle", None),
+                           all_families=getattr(args, "all_families", False))
 
     if args.command == "find":                 # hub search + fits-this-machine verdicts
         store.close()

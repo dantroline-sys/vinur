@@ -31,7 +31,8 @@ COMMANDS: dict = {
     "ingest-library": {"force": "bool"},   # index the search-only document library (library_sources)
     "rebuild-fts": {},                     # reindex FTS with the configured tokenizer (no re-parse)
     "distill":    {"limit": "int", "watch": "bool", "interval": "int", "bundle": "str"},
-    "recard":     {"limit": "int", "bundle": "str"},   # cards-only re-pass (see HELP)
+    "recard":     {"limit": "int", "bundle": "str",    # cards-only re-pass (see HELP)
+                   "all_families": "bool"},
     # janitor: chunks holding text the corpus already has (no LM involved)
     "dedupe":     {"near": "bool", "threshold": "float", "apply": "bool", "bundle": "str"},
     # hub search: candidates sized + judged against this machine's memory
@@ -89,11 +90,16 @@ HELP: dict = {
                 "watch": "keep running as a concurrent ingest adds chunks",
                 "interval": "watch mode: seconds between passes"},
     "recard": {"_": "Cards-only re-pass over already-distilled chunks: harvest the "
-                    "conversational card families (branch/troubleshooting/expectation/"
-                    "misconception) from corpus distilled before those families "
-                    "existed — nodes are joined, never re-created; relations untouched",
+                    "card families — procedures and criteria included — from chunks "
+                    "stamped before the current sweep version.  Nodes are joined, "
+                    "never re-created; relations untouched.  Dedup: an identical "
+                    "re-offer corroborates by hash, a reworded one by same node+"
+                    "type+title",
                "limit": "max chunks this run",
-               "bundle": "ONLY chunks from this provenance bundle; empty = everything"},
+               "bundle": "ONLY chunks from this provenance bundle; empty = everything",
+               "all_families": "re-ask EVERY family regardless of stamp age — the "
+                               "truncation-recovery sweep (cards lost to a too-small "
+                               "output budget while chunks were already marked done)"},
     "dedupe": {"_": "Janitor (no LM): find chunks holding text the corpus already "
                     "has. A chunk id is sha1(path+section+text), so the same text "
                     "arriving by another route — a research drop re-exported under "
