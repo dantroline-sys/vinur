@@ -1199,9 +1199,13 @@ def main():
             self.recarded = dict(recarded)              # chunk_id -> version
             self.regimes, self.cards = regimes, []
             self.texts = {}
+            self.at = {}                                # chunk_id -> distilled_at
 
         def is_distilled(self, cid):
             return cid in self.distilled
+
+        def distilled_at(self, cid):
+            return self.at.get(cid)
 
         def mark_zone_skipped(self, cid, zone):
             pass                                        # progress bookkeeping only
@@ -1342,6 +1346,25 @@ def main():
     ok("recard v3: proc/crit harvested + stage-counted, all_families full re-ask, "
        "title gate corroborates instead of inserting twins")
 
+    # ── before cutoff: chunks distilled AFTER the budget fix are spared ──────
+    RecLM.calls = []
+    tkb = RecKB(distilled={"c1", "c3"}, recarded={"c1": 2, "c3": 2}, regimes={})
+    tkb.at = {"c1": 100.0, "c3": 200.0}
+    rstb = D.recard_corpus(RecStore([rc_chunks[0], rc_chunks[2]]), tkb,
+                           [RecLM()], StubEmb(), rcfg, before=150.0)
+    assert [c[0] for c in RecLM.calls] == ["c1"], "only the pre-cutoff chunk re-asked"
+    assert rstb["chunks"] == 1 and rstb["skipped_recent"] == 1, rstb
+    assert "c3" in tkb.recarded and tkb.recarded["c3"] == 2, \
+        "a spared chunk keeps its old stamp (a later unbounded sweep still sees it)"
+    RecLM.calls = []
+    tkb2 = RecKB(distilled={"c1"}, recarded={"c1": 2}, regimes={})
+    tkb2.at = {}                                        # pre-timestamp row: None = old
+    D.recard_corpus(RecStore(rc_chunks[:1]), tkb2, [RecLM()], StubEmb(), rcfg,
+                    before=150.0)
+    assert [c[0] for c in RecLM.calls] == ["c1"], "no timestamp reads as OLD (eligible)"
+    ok("recard --before: pre-cutoff chunks re-asked, healthy tail spared with its "
+       "stamp intact, timestampless rows stay eligible")
+
     # ── full distill stamps the recard checkpoint (swept corpus stays swept) ─
     seq_marks = []
     kb_seq = SimpleNamespace(
@@ -1466,11 +1489,12 @@ def main():
     from knowledgehost import autopilot as AP_
     from knowledgehost import ops as OPS_
     assert OPS_.COMMANDS["recard"] == {"limit": "int", "bundle": "str",
-                                       "all_families": "bool"}
+                                       "all_families": "bool", "before": "str"}
     assert OPS_.HELP["recard"]["_"] and "bundle" in OPS_.HELP["recard"]
-    assert "all_families" in OPS_.HELP["recard"]
+    assert "all_families" in OPS_.HELP["recard"] and "before" in OPS_.HELP["recard"]
     assert OPS_._argv("recard", {"all_families": True}) == ["--all-families"], \
         "the bool flag must render with the dash"
+    assert OPS_._argv("recard", {"before": "2026-07-24"}) == ["--before", "2026-07-24"]
     assert any(s["command"] == "recard" and not s["enabled"]
                for s in AP_.DEFAULT_PLAN["steps"])
     assert AP_.auto_model({"distill_urls": []}, "recard") is None  # distill lane, no urls

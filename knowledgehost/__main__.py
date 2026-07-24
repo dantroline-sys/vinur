@@ -355,7 +355,7 @@ def distill_mod_bundle(ch):
 
 
 def _run_recard(cfg, store, embedder, log, *, limit=None, bundle=None,
-                all_families=False) -> int:
+                all_families=False, before=None) -> int:
     """Cards-only sweep over already-distilled chunks: harvest the card families
     (procedures and criteria included from v3, plus branch/troubleshooting/
     expectation/misconception/enumeration) from corpus stamped before the current
@@ -364,6 +364,16 @@ def _run_recard(cfg, store, embedder, log, *, limit=None, bundle=None,
     or relations, so the adjudication queue stays quiet.  Resumable (the recarded
     set is the checkpoint); big-LM work, fanned out like distill."""
     from . import distill as distill_mod
+    cutoff = None
+    if before:
+        from datetime import datetime
+        try:
+            cutoff = datetime.fromisoformat(str(before)).timestamp()
+        except ValueError:
+            log.error("--before: %r is not a date/time (YYYY-MM-DD or "
+                      "YYYY-MM-DDTHH:MM).", before)
+            return 1
+        log.info("recard: bounded to chunks distilled before %s", before)
     if not embedder.embed_one("warmup", "document"):
         log.error("embed endpoint unreachable — recard needs vectors for the new cards.")
         return 1
@@ -382,7 +392,7 @@ def _run_recard(cfg, store, embedder, log, *, limit=None, bundle=None,
     try:
         stats = distill_mod.recard_corpus(store, kb, big, embedder, cfg,
                                           limit=limit, bundle=bundle,
-                                          all_families=all_families)
+                                          all_families=all_families, before=cutoff)
         log.info("recard: %s", stats)
         log.info("kb: %s", kb.counts())
         ops_mod.emit_result(stats.get("chunks", 0) > 0 or stats.get("no_menu", 0) > 0,
@@ -946,6 +956,11 @@ def main(argv=None):
                     help="recard: re-ask EVERY card family regardless of each chunk's "
                          "stamp age (truncation recovery — cards lost to a too-small "
                          "output budget while the chunk was already marked done)")
+    ap.add_argument("--before",
+                    help="recard: only chunks DISTILLED before this date/time "
+                         "(YYYY-MM-DD or YYYY-MM-DDTHH:MM, local) — bound the "
+                         "recovery sweep to what predates the budget fix; the "
+                         "healthy tail distilled since is spared")
     ap.add_argument("--near", action="store_true",
                     help="dedupe: also find near-duplicates (same text, different wording)")
     ap.add_argument("--threshold", type=float, default=0.9,
@@ -1128,7 +1143,8 @@ def main(argv=None):
     if args.command == "recard":               # raw store + KB + big LM, cards only
         return _run_recard(cfg, store, embedder, log, limit=args.limit,
                            bundle=getattr(args, "bundle", None),
-                           all_families=getattr(args, "all_families", False))
+                           all_families=getattr(args, "all_families", False),
+                           before=getattr(args, "before", None))
 
     if args.command == "find":                 # hub search + fits-this-machine verdicts
         store.close()

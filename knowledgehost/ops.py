@@ -32,7 +32,7 @@ COMMANDS: dict = {
     "rebuild-fts": {},                     # reindex FTS with the configured tokenizer (no re-parse)
     "distill":    {"limit": "int", "watch": "bool", "interval": "int", "bundle": "str"},
     "recard":     {"limit": "int", "bundle": "str",    # cards-only re-pass (see HELP)
-                   "all_families": "bool"},
+                   "all_families": "bool", "before": "str"},
     # janitor: chunks holding text the corpus already has (no LM involved)
     "dedupe":     {"near": "bool", "threshold": "float", "apply": "bool", "bundle": "str"},
     # hub search: candidates sized + judged against this machine's memory
@@ -99,7 +99,10 @@ HELP: dict = {
                "bundle": "ONLY chunks from this provenance bundle; empty = everything",
                "all_families": "re-ask EVERY family regardless of stamp age — the "
                                "truncation-recovery sweep (cards lost to a too-small "
-                               "output budget while chunks were already marked done)"},
+                               "output budget while chunks were already marked done)",
+               "before": "only chunks DISTILLED before this date/time (YYYY-MM-DD "
+                         "or YYYY-MM-DDTHH:MM) — bound the recovery to what "
+                         "predates the budget fix; the healthy tail is spared"},
     "dedupe": {"_": "Janitor (no LM): find chunks holding text the corpus already "
                     "has. A chunk id is sha1(path+section+text), so the same text "
                     "arriving by another route — a research drop re-exported under "

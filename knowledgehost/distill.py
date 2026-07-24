@@ -2374,14 +2374,17 @@ def _distill_parallel(store, kb, lms, embedder, cfg, *, limit=None, bundle=None)
 
 
 # ── recard corpus sweep ──────────────────────────────────────────────────────────
-def _pending_recard_chunks(store, kb, counter, bundle=None, cfg=None):
-    """Chunks the generic pass already distilled but the conversational-families
-    pass hasn't fully seen: unstamped, OR stamped with an older RECARD_VERSION
-    (new families added since — the sweep re-opens them for ONLY the new
-    families, via ch['_recard_from']).  Not-yet-distilled chunks are NOT
-    offered: the full distill extracts the families inline (and stamps the
-    current version), so recard never double-charges fresh corpus.
-    counter: [ineligible, zone-skipped]."""
+def _pending_recard_chunks(store, kb, counter, bundle=None, cfg=None, before=None):
+    """Chunks the generic pass already distilled but the cards-only pass hasn't
+    fully seen: unstamped, OR stamped with an older RECARD_VERSION (new families
+    added since — the sweep re-opens them for ONLY the new families, via
+    ch['_recard_from']).  Not-yet-distilled chunks are NOT offered: the full
+    distill extracts the families inline (and stamps the current version), so
+    recard never double-charges fresh corpus.  `before` (epoch) bounds the sweep
+    to chunks DISTILLED before that moment — the recovery case: everything
+    distilled after the output-budget fix is already healthy, so a cutoff at
+    the fix date spares the whole clean tail (rows with no timestamp are old
+    and stay eligible).  counter: [ineligible, zone-skipped, after-cutoff]."""
     skip = _zone_skip_set(cfg)
     for ch in store.iter_chunks():
         if bundle is not None and _chunk_bundle(ch) != bundle:
@@ -2390,6 +2393,12 @@ def _pending_recard_chunks(store, kb, counter, bundle=None, cfg=None):
         if not kb.is_distilled(ch["id"]) or v >= RECARD_VERSION:
             counter[0] += 1
             continue
+        if before is not None:
+            at = kb.distilled_at(ch["id"])
+            if at is not None and at >= before:
+                if len(counter) > 2:
+                    counter[2] += 1
+                continue
         ch["zone"] = zones.classify(ch.get("section") or "", ch.get("text") or "")
         if ch["zone"] in skip:
             counter[1] += 1
@@ -2449,7 +2458,7 @@ def _recard_store(kb, embedder, chunk, extras) -> int:
 
 
 def recard_corpus(store, kb, lms, embedder, cfg, *, limit=None, bundle=None,
-                  all_families=False) -> dict:
+                  all_families=False, before=None) -> dict:
     """Cards-only sweep: run the card-families extraction (procedures/criteria
     included from v3) over chunks stamped before the current RECARD_VERSION.
     Nothing else is re-emitted — nodes are joined, never re-created, and
@@ -2501,7 +2510,8 @@ def recard_corpus(store, kb, lms, embedder, cfg, *, limit=None, bundle=None,
         except BackendUnavailable as e:
             return chunk, None, lm, regime, families, e   # caller decides: retry vs drop
 
-    chunks = _pending_recard_chunks(store, kb, skipped, bundle=bundle, cfg=cfg)
+    chunks = _pending_recard_chunks(store, kb, skipped, bundle=bundle, cfg=cfg,
+                                    before=before)
     stop = False
     with ThreadPoolExecutor(max_workers=len(lms)) as ex:
         futures = set()
@@ -2574,7 +2584,8 @@ def recard_corpus(store, kb, lms, embedder, cfg, *, limit=None, bundle=None,
                 if not stop and not resubmitted:
                     submit_next()
     res = {"chunks": done, "cards": cards, "no_menu": no_menu[0],
-           "skipped": skipped[0], "skipped_zone": skipped[1], "failed": failed}
+           "skipped": skipped[0], "skipped_zone": skipped[1],
+           "skipped_recent": skipped[2], "failed": failed}
     res.update(stage_stats())
     if done and not cards:                            # say WHY zero, not just that it was
         if res["extra_offered"]:

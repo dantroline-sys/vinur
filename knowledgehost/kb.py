@@ -1228,6 +1228,14 @@ class KB:
         return self.db.execute("SELECT 1 FROM distilled_chunks WHERE chunk_id=?",
                               (chunk_id,)).fetchone() is not None
 
+    def distilled_at(self, chunk_id):
+        """When this chunk was marked distilled (epoch seconds), or None.  Lets
+        the recard sweep bound itself to chunks distilled BEFORE a fix landed
+        (rows predating the timestamp column read as None = old = eligible)."""
+        row = self.db.execute("SELECT distilled_at FROM distilled_chunks WHERE chunk_id=?",
+                              (chunk_id,)).fetchone()
+        return row["distilled_at"] if row else None
+
     def mark_distilled(self, chunk_id):
         self.db.execute(
             "INSERT OR IGNORE INTO distilled_chunks(chunk_id,distilled_at) VALUES(?,?)",
