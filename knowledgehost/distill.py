@@ -863,8 +863,11 @@ class DistillLM:
             # objects DID complete rather than losing the chunk (rest is lost).
             salvaged = _salvage_concepts(content)
             if salvaged:
-                log.warning("distillation output truncated — salvaged %d concept(s); "
-                            "raise distill_max_tokens if frequent", len(salvaged))
+                log.warning("distillation output truncated at max_tokens=%d — salvaged "
+                            "%d concept(s), any cards after them are LOST (chunk %s of "
+                            "%s); raise distill_max_tokens if frequent",
+                            self.max_tokens, len(salvaged), chunk.get("id"),
+                            chunk.get("path_or_url") or chunk.get("title") or "?")
                 return salvaged, [], [], [], {}
             log.warning("unparseable distillation output — skipping chunk")
             return None, [], [], [], {}
@@ -2061,7 +2064,14 @@ def distill_corpus(store, kb, extractors, embedder, cfg, *, limit=None, verifier
                 "without an independent second opinion.  (An exclusive swap that "
                 "left one resident model collapses the tiers this way.)",
                 ", ".join(sorted(str(u) for u, _ in ex_ids)))
-            extractors = verifiers      # the big-LM client knobs (timeout, max_tokens)
+            # Keep the verifier objects (their URL+model name the resident) but
+            # re-stamp the EXTRACTION knobs: verifier clients are built with
+            # verify_max_tokens (1024 — verdicts are short), which would
+            # truncate every dense chunk's cards if it drove extraction.
+            extractors = verifiers
+            for _lm in extractors:
+                _lm.max_tokens = cfg.get("distill_max_tokens", 3072)
+                _lm.timeout = cfg.get("distill_timeout_s", getattr(_lm, "timeout", None))
             verifiers = None
     extractors = _fan_out(cfg, extractors)
     if verifiers and cfg.get("verify", True):

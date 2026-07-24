@@ -900,9 +900,15 @@ def main():
         D._distill_parallel, D._distill_sequential, D._distill_pipeline = \
             fake_par, fake_seq, fake_pipe
         same_e = SimpleNamespace(url="http://one:1", model="big", timeout=90)
-        same_v = SimpleNamespace(url="http://one:1", model="big", timeout=120)
-        D.distill_corpus(None, None, [same_e], None, {"verify": True}, verifiers=[same_v])
-        assert got.pop("seq") is same_v, "collapse keeps the VERIFIER's client knobs"
+        same_v = SimpleNamespace(url="http://one:1", model="big", timeout=120,
+                                 max_tokens=1024)
+        D.distill_corpus(None, None, [same_e], None,
+                         {"verify": True, "distill_max_tokens": 8192,
+                          "distill_timeout_s": 150}, verifiers=[same_v])
+        assert got.pop("seq") is same_v, "collapse keeps the verifier's URL+model"
+        assert same_v.max_tokens == 8192 and same_v.timeout == 150, \
+            "collapse re-stamps EXTRACTION knobs — the verifier's 1024 budget " \
+            "would truncate every dense chunk's cards"
         assert "pipe" not in got and any("single-tier" in m for m in _DGrab.msgs)
         # different servers -> the two-tier pipeline still runs
         _DGrab.msgs.clear()
