@@ -12,6 +12,8 @@
 #                               #   the supervisor itself (--dry-run previews; uninstall|status)
 #   ./vinur.sh swap <llm>       # exclusive models: load this one in place of the
 #                               #   resident one (waits for /health; minutes for big weights)
+#   ./vinur.sh minimal on|off   # vacate ALL VRAM but keep serving the KB to Vinkona
+#                               #   (stops the LM(s); embed -> CPU or off; kb stays up)
 #   ./vinur.sh logs [svc]       # follow logs (Ctrl-C detaches)
 #   ./vinur.sh find <words>     # search the hub for models — each hit sized and
 #                               #   judged (fits / tight / too big) for THIS machine

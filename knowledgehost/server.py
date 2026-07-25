@@ -547,7 +547,8 @@ class Handler(BaseHTTPRequestHandler):
         if path not in ("/call", "/ops/run", "/ops/stop", "/ops/reload", "/config",
                         "/ops/autopilot", "/library/config", "/library/root",
                         "/source", "/scenario", "/brain", "/drop", "/serving/swap",
-                        "/serving/control", "/serving/model", "/serving/add",
+                        "/serving/control", "/serving/minimal", "/serving/model",
+                        "/serving/add",
                         "/serving/pull", "/serving/download", "/serving/tune", "/net",
                         "/metrics/mark", "/gaps/close", "/settings/paths"):
             return self._send_json({"ok": False, "error": "not found"}, 404)
@@ -631,6 +632,23 @@ class Handler(BaseHTTPRequestHandler):
             except ValueError as e:
                 return self._send_json({"ok": False, "error": str(e)}, 400)
             return self._send_json({"ok": True, "service": name, "action": action,
+                                    "note": "the supervisor acts within a few seconds — "
+                                            "re-poll /serving/status"})
+        if path == "/serving/minimal":                 # vacate/restore VRAM, keep serving KB
+            # Lets a remote (Vinkona) tell the box to release its GPU while still
+            # answering kb_ask/kb_search.  Async, like the swap/control lanes.
+            from . import supervisor as sup
+            st = sup.read_state()
+            if not sup.alive(st.get("supervisor", 0)):
+                return self._send_json(
+                    {"ok": False, "error": "the supervisor is not running "
+                                           "(./vinur.sh start)"}, 409)
+            action = str(req.get("action") or "")
+            if action not in ("on", "off"):
+                return self._send_json(
+                    {"ok": False, "error": "action must be on|off"}, 400)
+            summary = sup.apply_minimal(self.cfg, action)
+            return self._send_json({"ok": True, **summary,
                                     "note": "the supervisor acts within a few seconds — "
                                             "re-poll /serving/status"})
         if path == "/net":                             # broker: setting write OR action

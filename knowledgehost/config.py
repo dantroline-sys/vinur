@@ -60,6 +60,14 @@ DEFAULTS = {
         # into models/ on first start) — pair with embed_url above.
         "embed": {"enabled": False, "port": 11437, "args": []},
         "reranker": {"enabled": False},   # run-reranker.sh on rerank_url's port (CPU)
+        # Minimal mode (./vinur.sh minimal on): vacate ALL VRAM but keep serving
+        # the KB.  Stops the resident LM(s); the kb server + CPU reranker stay up.
+        # embed = "cpu"  -> restart the embedder on CPU (0 VRAM) so SEMANTIC search
+        #                   survives (query embedding is one short input — cheap on CPU).
+        # embed = "off"  -> stop the embedder too; kb_ask/kb_search fall back to
+        #                   lexical BM25/FTS (keyword, not semantic).  Absolute-minimal
+        #                   footprint (no GPU process at all).
+        "minimal": {"embed": "cpu"},
     },
 
     # Extra HIGH-STAKES query patterns (regex, case-insensitive) OR'd into the built-in

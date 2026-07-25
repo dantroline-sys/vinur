@@ -635,9 +635,13 @@ def embed_argv(cfg: dict, model_path: str) -> list[str]:
     host = str(scfg.get("host") or "127.0.0.1")
     port = str(int(scfg.get("port") or 11437))
     args = [str(a) for a in (scfg.get("args") or [])]
+    # Minimal mode (VRAM vacated, KB still served): the embedder drops to CPU so it
+    # holds NO VRAM.  Query embedding is one short input at a time — cheap on CPU — so
+    # semantic search survives.  `args` is appended last, so a user override still wins.
+    ngl = "0" if minimal_state().get("on") else "99"
     return [_llama_server(), "--embedding", "-m", model_path,
             "--host", host, "--port", port,
-            "-ngl", "99", "-c", "2048", "-b", "2048", "-ub", "2048",
+            "-ngl", ngl, "-c", "2048", "-b", "2048", "-ub", "2048",
             "--pooling", "mean"] + args
 
 
@@ -829,6 +833,39 @@ def swap_state() -> dict:
         return json.loads(SWAP_STATE.read_text())
     except (OSError, ValueError):
         return {}
+
+
+# ── minimal mode (vacate VRAM, keep serving the KB) ──────────────────────────
+# One persistent flag file (same var/run idiom as the swap lane).  PERSISTENT on
+# purpose: a box put into minimal because its GPU is needed elsewhere should come
+# back up minimal after a reboot, not seize the GPU again.
+#   minimal.flag  {"on": bool, "embed": "cpu"|"off", "restore": "<excl name>"}
+# Written by the CLI / authed HTTP (supervisor.apply_minimal); READ by the
+# supervisor (startup skip-list + status) and by embed_argv (device).  Absent
+# file == full mode.
+MINIMAL_FLAG = ROOT / "var" / "run" / "minimal.flag"
+
+
+def minimal_state() -> dict:
+    try:
+        d = json.loads(MINIMAL_FLAG.read_text())
+        return d if isinstance(d, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
+def set_minimal(d: dict) -> None:
+    MINIMAL_FLAG.parent.mkdir(parents=True, exist_ok=True)
+    tmp = MINIMAL_FLAG.with_suffix(".tmp")
+    tmp.write_text(json.dumps(d))
+    os.replace(tmp, MINIMAL_FLAG)
+
+
+def clear_minimal() -> None:
+    try:
+        MINIMAL_FLAG.unlink()
+    except OSError:
+        pass
 
 
 def request_swap(name: str) -> None:

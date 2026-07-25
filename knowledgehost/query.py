@@ -214,7 +214,11 @@ def answer(kb, embedder, query: str, *, rigor=None, k=6, mode=None, modes=None,
     # Lexical (BM25) card recall channel (contract §3.1) — the arm dense misses on exact
     # terms (exact names, identifiers, the query→card matching that's currently imprecise).
     # Appended AFTER the dense/walk items so dedup keeps the dense hit when both surface it.
-    if bm25:
+    # `qvec is None` engages it AUTOMATICALLY when the embedder is unavailable (minimal
+    # mode / embed down): without this kb_ask would abstain empty with no GPU, whereas
+    # kb_search already falls back to FTS.  With the embedder UP this is unchanged (the
+    # dense path ran), so read-path behaviour is byte-for-byte as before.
+    if bm25 or qvec is None:
         items.extend(kb.search_cards_bm25(query, pool))
         # spaCy focus (understand.py): also search on the HEAD concept, so the context
         # words ("in a cold-climate greenhouse") don't dilute the card match.  Purely additive

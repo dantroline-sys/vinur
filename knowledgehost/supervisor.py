@@ -5,6 +5,7 @@ LMs (knowledgehost.serving), the embed endpoint, the CPU reranker, and the
 kb server itself — as direct children in their own process groups:
 
     python -m knowledgehost.supervisor start|stop|restart [svc]|status [--json]|swap <llm>|logs [svc]
+    python -m knowledgehost.supervisor minimal on|off|status   # vacate VRAM, keep serving the KB
     python -m knowledgehost.supervisor run              # foreground (systemd/launchd mode)
     python -m knowledgehost.supervisor service install|uninstall|status [--dry-run]
 
@@ -273,6 +274,70 @@ def control_plan(action: str, svc: dict, *, running: bool, active_excl: str | No
     return ops
 
 
+# ── minimal mode: vacate VRAM, keep serving the KB ────────────────────────────
+
+def _default_excl(cfg: dict) -> str:
+    """The exclusive-group boot model (default=true, else the first exclusive)."""
+    excl = [str(e.get("name")) for e in cfg["serving"]["llms"] if e.get("exclusive")]
+    return next((str(e.get("name")) for e in cfg["serving"]["llms"]
+                 if e.get("exclusive") and e.get("default")), excl[0] if excl else "")
+
+
+def plan_minimal(cfg: dict, action: str, *, active: str = "", restore: str = "") -> dict:
+    """Pure: what turning minimal mode on/off means, as request-lane ops — kept
+    out of the loop so the semantics are testable.  Returns
+    {flag, stop:[svc], restart:[svc], start:[svc], swap:name|None}.
+
+      on   stop the VRAM-holding LMs (the ACTIVE exclusive + every non-exclusive
+           entry — standby siblings already hold nothing, so they're left alone);
+           the embedder goes to CPU (restart) or off (stop) per config; write the
+           flag (embed device + the model to restore).  kb + CPU reranker stay up.
+      off  clear the flag, swap the exclusive model back in, start the non-
+           exclusive LMs, and restart the embedder (back on GPU)."""
+    embed_on = bool(cfg["serving"]["embed"].get("enabled"))
+    embed_mode = str(cfg["serving"].get("minimal", {}).get("embed", "cpu"))
+    default = _default_excl(cfg)
+    nonx = [f"llm-{e.get('name')}" for e in cfg["serving"]["llms"]
+            if e.get("name") and not e.get("exclusive")]
+    if action == "on":
+        keep = active or default
+        stop = ([f"llm-{keep}"] if keep else []) + nonx
+        plan = {"flag": {"on": True, "embed": embed_mode, "restore": keep},
+                "stop": stop, "restart": [], "start": [], "swap": None}
+        if embed_on:
+            (plan["restart"] if embed_mode == "cpu" else plan["stop"]).append("embed")
+        return plan
+    tgt = restore or active or default
+    return {"flag": None, "stop": [], "start": list(nonx), "swap": (tgt or None),
+            "restart": (["embed"] if embed_on else [])}
+
+
+def apply_minimal(cfg: dict, action: str) -> dict:
+    """Execute a minimal-mode transition through the same async request lanes the
+    panel/CLI use.  Idempotent-ish: safe to re-issue.  Returns the plan summary."""
+    from . import serving as sv
+    if action not in ("on", "off"):
+        raise ValueError("action must be on|off")
+    active = str((sv.swap_state() or {}).get("active") or "")
+    restore = str((sv.minimal_state() or {}).get("restore") or "")
+    plan = plan_minimal(cfg, action, active=active, restore=restore)
+    # Order: (re)write the flag FIRST so a re-spawned embedder reads the right
+    # device, THEN fire the async service/swap requests.
+    if plan["flag"] is not None:
+        sv.set_minimal(plan["flag"])
+    else:
+        sv.clear_minimal()
+    for name in plan["stop"]:
+        sv.request_service(name, "stop")
+    for name in plan["restart"]:
+        sv.request_service(name, "restart")
+    for name in plan["start"]:
+        sv.request_service(name, "start")
+    if plan.get("swap"):
+        sv.request_swap(plan["swap"])
+    return {"action": action, **plan}
+
+
 def _run(svcs: list[dict], cfg: dict) -> None:
     """The resident loop — runs detached, children in their own groups."""
     from . import serving as sv
@@ -316,8 +381,21 @@ def _run(svcs: list[dict], cfg: dict) -> None:
         if ref and _container_alive(ref):
             print(f"start: stopping orphaned container {ref[1]}", flush=True)
             _stop_container(ref)
+    # Minimal mode persists across a reboot (the GPU may still be wanted
+    # elsewhere): if the flag is set, DON'T autostart the VRAM-holding services —
+    # park them held so status shows them stopped and the watchdog leaves them be.
+    # The embedder still autostarts when embed="cpu" (it reads the flag → -ngl 0).
+    _min = sv.minimal_state()
+    _min_on = bool(_min.get("on"))
+    _embed_off = _min_on and _min.get("embed") == "off"
+    if _min_on:
+        print("start: MINIMAL MODE — GPU services stay down (kb serves the KB)", flush=True)
     for svc in svcs:
         if not svc.get("autostart", True):
+            continue
+        if _min_on and (svc["name"].startswith("llm-")
+                        or (svc["name"] == "embed" and _embed_off)):
+            held.add(svc["name"])                          # minimal: keep VRAM vacated
             continue
         (LOGS / f"{svc['name']}.log").write_bytes(b"")     # truncate, like a fresh tee
         procs[svc["name"]] = spawn(svc)
@@ -612,8 +690,10 @@ def status_data() -> dict:
     try:
         from . import serving as sv
         out["swap"] = sv.swap_state() or {}
+        out["minimal"] = sv.minimal_state() or {}
     except Exception:
         out["swap"] = {}
+        out["minimal"] = {}
     return out
 
 
@@ -627,6 +707,11 @@ def cmd_status(as_json: bool = False) -> int:
                                if d["stale"] else ""))
         return 1
     print(f"supervisor pid={d['supervisor']}")
+    m = d.get("minimal") or {}
+    if m.get("on"):
+        print(f"  ** MINIMAL MODE — VRAM vacated, serving the KB (embed: "
+              f"{m.get('embed', 'cpu')}).  './vinur.sh minimal off' restores "
+              f"{m.get('restore') or 'the default LM'} **")
     for s in d["services"]:
         if s["state"] == "failed":
             print(f"  {s['name']:<12} FAILED  {s['note']}")
@@ -706,6 +791,38 @@ def cmd_swap(target: str | None) -> int:
     return 0
 
 
+def cmd_minimal(action: str | None) -> int:
+    """Vacate all VRAM but keep serving the KB (or restore).  A hot switch: the
+    kb server never goes down, so Vinkona keeps being answered throughout."""
+    from . import serving as sv
+    action = (action or "status").lower()
+    if action == "status":
+        m = sv.minimal_state()
+        if m.get("on"):
+            print(f"minimal mode ON — VRAM vacated (embed: {m.get('embed', 'cpu')}); "
+                  f"restore target: {m.get('restore') or '(default LM)'}")
+        else:
+            print("minimal mode OFF (full serving)")
+        return 0
+    if action not in ("on", "off"):
+        print("usage: ./vinur.sh minimal on|off|status")
+        return 2
+    if not alive(read_state().get("supervisor", 0)):
+        print("not running — './vinur.sh start'")
+        return 1
+    summary = apply_minimal(load_cfg(), action)
+    if action == "on":
+        gone = ", ".join(summary["stop"] + summary["restart"]) or "(nothing resident)"
+        print(f"minimal mode ON — freeing VRAM: {gone}; embed={summary['flag']['embed']}, "
+              f"kb keeps serving.  VRAM frees within ~{CONTAINER_STOP_S}s "
+              f"(container) or seconds (bare-metal); './vinur.sh status' to watch.")
+    else:
+        tgt = summary.get("swap") or "(default LM)"
+        print(f"minimal mode OFF — restoring {tgt} (+ embed on GPU).  Weights load "
+              f"over minutes; the kb server is served throughout.")
+    return 0
+
+
 def cmd_logs(target: str | None) -> int:
     names = [target] if target else list((read_state().get("services") or {}).keys()) or ["kb"]
     files = {n: LOGS / f"{n}.log" for n in names}
@@ -757,6 +874,8 @@ def main(argv: list[str] | None = None) -> int:
         return cmd_restart(args[1] if len(args) > 1 else None)
     if cmd == "swap":
         return cmd_swap(args[1] if len(args) > 1 else None)
+    if cmd == "minimal":
+        return cmd_minimal(args[1] if len(args) > 1 else "status")
     if cmd == "logs":
         return cmd_logs(args[1] if len(args) > 1 else None)
     print(__doc__.split("\n\n")[1])

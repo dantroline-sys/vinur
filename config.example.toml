@@ -129,6 +129,14 @@ auth_token = ""         # if set, /call requires Authorization: Bearer <token>
 # swap_timeout_s = 900 (top-level in [serving]) bounds a swap's weights-load
 # wait.  See serving/README.md for worked 96 GB examples (resident pair and
 # exclusive swap mode).
+#
+# [serving.minimal]               # './vinur.sh minimal on' — vacate ALL VRAM but
+# embed = "cpu"                   #   keep serving the KB.  Stops the LM(s); kb +
+#                                 #   CPU reranker stay up.  embed="cpu" restarts
+#                                 #   the embedder on CPU (0 VRAM) so SEMANTIC
+#                                 #   search survives; embed="off" stops it too and
+#                                 #   kb_ask/kb_search fall back to lexical BM25/FTS.
+#                                 #   The flag persists across a reboot.
 
 # ── embeddings (the nomic endpoint, shared with Vinkona's memory store) ─────────
 embed_url   = "http://127.0.0.1:11437"
