@@ -245,8 +245,58 @@ def read_manifest(conn: sqlite3.Connection) -> dict | None:
         return None
 
 
-def inspect_bundle_file(path: str) -> dict:
-    """What's in a .kdb without importing it — for the panel / CLI preview."""
+def _materialize(path: str, passphrase: str = "") -> tuple:
+    """A readable PLAIN .kdb for `path`, unwrapping encryption (needs the
+    passphrase) and gzip (magic-sniffed) in that order — the §3.2 layering is
+    compress-then-encrypt.  Returns (real_path, cleanup_paths); the caller
+    removes cleanup_paths when done."""
+    import gzip as gz
+    import shutil as sh
+    import tempfile
+    p = Path(path).expanduser()
+    if not p.exists():
+        raise ValueError(f"no such file: {p}")
+    cleanup: list = []
+    if p.name.endswith(".enc"):
+        if not passphrase:
+            raise ValueError(f"{p.name} is an encrypted pack — pass the passphrase "
+                             "(its sidecar .manifest.json is readable without one)")
+        from . import pack as pack_mod
+        td = tempfile.mkdtemp(prefix="kdb-dec-")
+        cleanup.append(td)
+        p = Path(pack_mod.unwrap_encrypted(str(p), passphrase, td))
+    with open(p, "rb") as f:
+        magic = f.read(2)
+    if magic == b"\x1f\x8b":                     # gzip → decompress to a temp .kdb
+        fd, tmp = tempfile.mkstemp(suffix=".kdb")
+        with os.fdopen(fd, "wb") as fo, gz.open(p, "rb") as fi:
+            sh.copyfileobj(fi, fo)
+        cleanup.append(tmp)
+        p = Path(tmp)
+    return str(p), cleanup
+
+
+def _rm_all(paths: list) -> None:
+    import shutil as sh
+    for c in paths:
+        try:
+            (sh.rmtree if os.path.isdir(c) else os.remove)(c)
+        except OSError:
+            pass
+
+
+def inspect_bundle_file(path: str, passphrase: str = "") -> dict:
+    """What's in a .kdb without importing it — for the panel / CLI preview.
+    Accepts .kdb.gz and encrypted packs (with the passphrase); an encrypted
+    file WITHOUT one fails with a named remedy — read its sidecar instead."""
+    real, cleanup = _materialize(path, passphrase)
+    try:
+        return _inspect_plain(real)
+    finally:
+        _rm_all(cleanup)
+
+
+def _inspect_plain(path: str) -> dict:
     p = Path(path).expanduser()
     if not p.exists():
         raise ValueError(f"no such file: {p}")
@@ -289,7 +339,8 @@ def _new_ids(master: sqlite3.Connection, pre: set, table: str,
 
 
 def import_bundle(cfg: dict, path: str, *, name: str | None = None,
-                  trust: str = "low", log_fn=None) -> dict:
+                  trust: str = "low", log_fn=None, passphrase: str = "",
+                  verify: bool = False) -> dict:
     """Absorb a foreign ``.kdb`` into the MASTER under one bundle name.
 
     Content-hash ids make this idempotent: re-importing the same brain is a
@@ -307,10 +358,13 @@ def import_bundle(cfg: dict, path: str, *, name: str | None = None,
     say = log_fn or log.info
     if trust not in ("low", "keep"):
         raise ValueError(f"trust must be 'low' or 'keep', not {trust!r}")
-    info = inspect_bundle_file(path)               # validates the file
+    real, wraps = _materialize(path, passphrase)   # unwrap .enc / .gz if needed
+    info = _inspect_plain(real)                    # validates the file
     src_sources = info["sources"]
     bundle = _slug(name or (info["manifest"] or {}).get("name")
                    or Path(path).stem)
+    _pack_compat_checks(info["manifest"], path=path, real=real,
+                        verify=verify, say=say)
     master_path = str(Path(cfg.get("_master_kb_path")
                            or cfg["kb_path"]).expanduser())
     if not os.path.exists(master_path):
@@ -323,7 +377,7 @@ def import_bundle(cfg: dict, path: str, *, name: str | None = None,
         from .kb import KB as _KB
         _KB({**cfg, "kb_path": master_path, "kb_encrypted": False}).close()
 
-    src = _connect(str(Path(path).expanduser()))
+    src = _connect(real)
     master = _connect(master_path)
     try:
         existing = {s["bundle"] for s in list_sources(master)}
@@ -409,6 +463,64 @@ def import_bundle(cfg: dict, path: str, *, name: str | None = None,
     finally:
         src.close()
         master.close()
+        _rm_all(wraps)
+
+
+def _pack_compat_checks(manifest, *, path: str, real: str, verify: bool, say) -> None:
+    """VINUR-PACK-01 §8.2/§8.3: sidecar/content verification plus the compat
+    decision table.  Hard mismatches refuse with a NAMED remedy; soft ones
+    warn and proceed.  Format-1 files (no pack manifest) pass straight through."""
+    man = manifest or {}
+    if int(man.get("format") or 1) < 2:
+        return
+    comp = man.get("compat") or {}
+    from .kb import SCHEMA_VERSION
+    sv = int(comp.get("schema_version") or 0)
+    if sv > SCHEMA_VERSION:
+        raise ValueError(f"pack needs kb schema {sv}, this host has "
+                         f"{SCHEMA_VERSION} — update vinur")
+    fams = comp.get("card_families") or {}
+    from .distill import _FAMILY_VERSION
+    unknown = sorted(f for f in fams if f not in _FAMILY_VERSION)
+    if unknown:
+        raise ValueError(f"this host doesn't know the card famil"
+                         f"{'y' if len(unknown) == 1 else 'ies'} "
+                         f"{', '.join(unknown)} — update vinur")
+    from . import pack as pack_mod
+    vh = comp.get("vocab_hash")
+    if vh and vh != pack_mod.vocab_hash():
+        say("pack warning: feature vocabularies differ — fit-gating may be "
+            "weaker for this pack's cards")
+    lic = man.get("licensing") or {}
+    if lic.get("shareable") is False:
+        say("pack warning: marked NOT SHAREABLE (unlicensed sources, attested "
+            "by its producer) — private use only")
+    for req in comp.get("requires") or []:
+        say(f"pack warning: requires {req} — import that first (not enforced)")
+    # sidecar agreement (cheap, always when present) + optional deep verify
+    want = ((man.get("content") or {}).get("content_hash") or "")
+    side = Path(str(path) + ".manifest.json")
+    if side.exists():
+        try:
+            side_hash = ((json.loads(side.read_text()).get("content") or {})
+                         .get("content_hash") or "")
+        except (ValueError, OSError):
+            side_hash = ""
+        if want and side_hash and side_hash != want:
+            raise ValueError("artifact does not match its sidecar manifest "
+                             "(content_hash differs) — refusing; re-download "
+                             "or re-export the pack")
+    if verify and want:
+        from . import pack as pack_mod
+        conn = _connect(real)
+        try:
+            got = pack_mod.content_hash(conn)
+        finally:
+            conn.close()
+        if got != want:
+            raise ValueError("artifact does not match its manifest "
+                             f"(content_hash {got[:23]}… != declared "
+                             f"{want[:23]}…) — the file was altered after export")
 
 
 # ── eject: export-then-remove a bundle from the master ──────────────────────

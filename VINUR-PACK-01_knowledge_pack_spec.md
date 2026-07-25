@@ -1,6 +1,8 @@
 # VINUR-PACK-01 — Knowledge Packs (clean-room export / import of shareable distillates)
 
-**Status:** Draft for review · **Doc version:** 1.1 · **Date:** 2026-07-25
+**Status:** v1 IMPLEMENTED (producer `pack` verb, manifest v2, license gate, gzip,
+passphrase encryption, import compat table, consumer bootstrap, Vinkona LocalKB) —
+pending: panel "Build pack…" UI (§9), recipient encryption (App. A) · **Doc version:** 1.2 · **Date:** 2026-07-25
 **Component:** `python3 -m knowledgehost pack` (producer) + `import-brain` extensions (consumer)
 **Builds on:** the `.kdb` bundle machinery (`bundles.py`, manifest format 1) — packs are `.kdb`
 files with a richer manifest and a defined production method; every existing import guarantee
@@ -256,8 +258,11 @@ job. Help entries updated. Nothing else moves.
 8. Manifest v2 survives `inspect` → reserialize with unknown fields intact.
 9. Consumer bootstrap: import into a nonexistent master creates a full-schema kb and lands the
    pack; re-import is the usual no-op; the resulting kb answers read-path queries (lexical tier
-   at minimum) with no other setup.  *(Bootstrap half implemented with this doc revision —
-   `tests/brains_test.py` virgin-box battery.)*
+   at minimum) with no other setup.
+
+Checks 1 and 3–9 are automated in `tests/pack_test.py` (+ the virgin-box battery in
+`tests/brains_test.py` and Vinkona's `test_local_kb.py`); check 2 (mid-distill interrupt
+resume) rides the distill checkpoint machinery and is verified on a live box.
 
 ---
 

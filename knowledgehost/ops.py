@@ -33,6 +33,12 @@ COMMANDS: dict = {
     "distill":    {"limit": "int", "watch": "bool", "interval": "int", "bundle": "str"},
     "recard":     {"limit": "int", "bundle": "str",    # cards-only re-pass (see HELP)
                    "all_families": "bool", "before": "str"},
+    # clean-room pack producer (VINUR-PACK-01 §3); encryption is CLI-only —
+    # a passphrase must never ride argv where `ps` can read it
+    "pack":       {"path": "path", "name": "str", "title": "str", "author": "str",
+                   "pack_version": "str", "describe": "str", "license": "str",
+                   "allow_unlicensed": "bool", "compress": "bool",
+                   "keep_build": "bool", "force": "bool"},
     # janitor: chunks holding text the corpus already has (no LM involved)
     "dedupe":     {"near": "bool", "threshold": "float", "apply": "bool", "bundle": "str"},
     # hub search: candidates sized + judged against this machine's memory
@@ -183,6 +189,25 @@ HELP: dict = {
     "stats": {"_": "Print corpus statistics"},
     "split": {"_": "Export each bundle to its own .kdb brain file",
               "force": "overwrite existing files"},
+    "pack": {"_": "Build a SHAREABLE knowledge pack: clean-room ingest+distill of one "
+                  "file/folder in a scratch kb (the master is never touched), "
+                  "license-gated at export, manifest-stamped (authorship, licensing, "
+                  "compatibility), written to packs/<slug>/<slug>-<version>.kdb with a "
+                  "JSON sidecar.  Resumable: a failed build keeps its scratch.  "
+                  "Encryption is CLI-only (PACK_PASSPHRASE env — never argv).",
+             "path": "the document or folder to distil",
+             "name": "pack slug (default: the input's name)",
+             "title": "human title for the manifest",
+             "author": "producer name for the manifest",
+             "pack_version": "semver for the artifact + manifest (default 1.0.0)",
+             "describe": "one-line description",
+             "license": "SPDX id filled onto sources with NO detected license "
+                        "(recorded as attested — never overrides a detected one)",
+             "allow_unlicensed": "build anyway; the pack is stamped shareable:false "
+                                 "(private use only; import warns)",
+             "compress": "gzip the artifact (import auto-detects)",
+             "keep_build": "keep the scratch workspace after success",
+             "force": "replace an existing same-version artifact"},
     "import-bundle": {"_": "Absorb a shipped .kdb brain into the master",
                       "path": "the .kdb file on this box",
                       "name": "bundle name to import under (default: its manifest name)",

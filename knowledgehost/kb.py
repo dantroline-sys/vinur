@@ -168,6 +168,13 @@ _RESERVED_LEARNED = (("observed_count", "INTEGER DEFAULT 0"),
                      ("anti_pattern_of", "TEXT"))
 
 
+# The kb's migration level — VINUR-PACK-01's compat anchor.  A pack records
+# the level it was written at; import refuses when the pack's exceeds the
+# host's (remedy: update vinur).  Bump when _init_schema / a migration
+# changes what the knowledge tables can carry.
+SCHEMA_VERSION = 1
+
+
 class KB:
     def __init__(self, cfg: dict):
         self.path = cfg["kb_path"]

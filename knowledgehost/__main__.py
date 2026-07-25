@@ -354,6 +354,41 @@ def distill_mod_bundle(ch):
     return distill_mod._chunk_bundle(ch)
 
 
+def _run_pack(cfg, log, args) -> int:
+    """VINUR-PACK-01 §3: clean-room build of a shareable pack from one file or
+    folder.  The master kb is never opened for writing; a failed build keeps
+    its scratch (re-running the same command resumes)."""
+    from . import pack as pack_mod
+    from .distill import BackendUnavailable as _BU
+    path = (args.args[0] if args.args else None) or args.path
+    if not path:
+        log.error("pack needs an input: pack <file|folder> [--name N] "
+                  "[--pack-version 1.0.0] [--license SPDX] [--compress] …")
+        return 1
+    try:
+        res = pack_mod.build_pack(
+            cfg, path, name=args.name, title=args.title or "",
+            author=args.author or "", contact=args.contact or "",
+            version=args.pack_version, describe=args.describe or "",
+            license_override=args.license or "",
+            allow_unlicensed=args.allow_unlicensed,
+            compress=args.compress, encrypt=args.encrypt,
+            passphrase=os.environ.get("PACK_PASSPHRASE", ""),
+            keep_build=args.keep_build, force=args.force, log_fn=log.info)
+    except ValueError as e:
+        log.error("%s", e)
+        ops_mod.emit_result(False, error=str(e))
+        return 1
+    except _BU as e:
+        log.error("aborted (scratch kept — re-run to resume): %s", e)
+        ops_mod.emit_result(False, error=str(e))
+        return 1
+    counts = (res["manifest"].get("content") or {}).get("counts") or {}
+    log.info("pack ready: %s", res["artifact"])
+    ops_mod.emit_result(True, artifact=res["artifact"], **counts)
+    return 0
+
+
 def _run_recard(cfg, store, embedder, log, *, limit=None, bundle=None,
                 all_families=False, before=None) -> int:
     """Cards-only sweep over already-distilled chunks: harvest the card families
@@ -884,7 +919,7 @@ def main(argv=None):
     ap = argparse.ArgumentParser(prog="knowledgehost",
                                  description="Vinur — a local general-knowledge tool host.")
     ap.add_argument("command", nargs="?", default="serve",
-                    choices=["serve", "ingest", "distill", "recard", "dedupe", "find", "pull", "adopt", "adjudicate", "reconcile",
+                    choices=["serve", "ingest", "distill", "recard", "pack", "dedupe", "find", "pull", "adopt", "adjudicate", "reconcile",
                              "link", "refine", "import-conceptnet", "import-atomic",
                              "import-glucose", "import-causenet", "unimport", "embed-nodes", "build-ann",
                              "optimize", "stats", "reset", "bump-version", "migrate-vocab",
@@ -961,6 +996,28 @@ def main(argv=None):
                          "(YYYY-MM-DD or YYYY-MM-DDTHH:MM, local) — bound the "
                          "recovery sweep to what predates the budget fix; the "
                          "healthy tail distilled since is spared")
+    ap.add_argument("--author", help="pack: producer name for the manifest")
+    ap.add_argument("--contact", help="pack: producer contact for the manifest")
+    ap.add_argument("--pack-version", default="1.0.0", dest="pack_version",
+                    help="pack: semver for the artifact name + manifest (default 1.0.0)")
+    ap.add_argument("--describe", help="pack: one-line description for the manifest")
+    ap.add_argument("--allow-unlicensed", action="store_true", dest="allow_unlicensed",
+                    help="pack: build despite unlicensed sources — stamped "
+                         "shareable:false (private use only; import warns)")
+    ap.add_argument("--compress", action="store_true",
+                    help="pack: gzip the artifact (.kdb.gz — import auto-detects)")
+    ap.add_argument("--encrypt", action="store_true",
+                    help="pack: SQLCipher-encrypt the artifact (.enc) with the "
+                         "PACK_PASSPHRASE env var — access control in transit, "
+                         "NOT usage control after import")
+    ap.add_argument("--keep-build", action="store_true", dest="keep_build",
+                    help="pack: keep the scratch workspace after a successful build")
+    ap.add_argument("--passphrase", default="",
+                    help="import-bundle: passphrase for an encrypted pack "
+                         "(or the PACK_PASSPHRASE env var)")
+    ap.add_argument("--verify", action="store_true",
+                    help="import-bundle: recompute the pack's content hash and "
+                         "refuse on mismatch (tamper check)")
     ap.add_argument("--near", action="store_true",
                     help="dedupe: also find near-duplicates (same text, different wording)")
     ap.add_argument("--threshold", type=float, default=0.9,
@@ -1049,6 +1106,10 @@ def main(argv=None):
 
     if args.command in ("bundles", "split", "source", "scenario"):   # modular §16, KB-only
         return _run_bundles(cfg, args, log)
+    if args.command == "pack":                # clean-room pack producer (PACK-01 §3)
+        store.close()
+        return _run_pack(cfg, log, args)
+
     if args.command == "import-bundle":       # absorb a shipped brain into the master
         import json as _json
         from . import bundles as B
@@ -1059,7 +1120,9 @@ def main(argv=None):
             return 1
         try:
             res = B.import_bundle(cfg, path, name=args.name, trust=args.trust,
-                                  log_fn=log.info)
+                                  log_fn=log.info, verify=args.verify,
+                                  passphrase=(args.passphrase
+                                              or os.environ.get("PACK_PASSPHRASE", "")))
         except ValueError as e:
             log.error("%s", e)
             return 1
