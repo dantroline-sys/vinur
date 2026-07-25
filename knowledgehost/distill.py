@@ -394,7 +394,12 @@ EXTRA_CARD_KEYS = ("branches", "troubleshooting", "expectations", "misconception
 # v3 = the truncation-recovery sweep: cards trail concepts in the full pass's
 # constrained JSON, so an output-budget truncation ate procedures/criteria
 # (and the families after them) while the chunk was still marked distilled
-# AND recarded-current — versioning proc/crit re-opens every chunk for them.
+# AND recarded-current — versioning proc/crit re-opens every chunk for them
+# (the `before`-cutoff recard recovers the historical backlog).  Going forward
+# this can't re-accumulate: a live truncation now leaves the chunk recard-
+# eligible (extract() flags `_cards_truncated`; the write paths skip the recard
+# stamp), so the next cards-only sweep re-mines what the budget ate — the pass
+# gives its whole token budget to cards, so it almost never truncates again.
 _FAMILY_VERSION = {"branches": 1, "troubleshooting": 1, "expectations": 1,
                    "misconceptions": 1, "enumerations": 2,
                    "procedures": 3, "criteria": 3}
@@ -891,9 +896,16 @@ class DistillLM:
             # objects DID complete rather than losing the chunk (rest is lost).
             salvaged = _salvage_concepts(content)
             if salvaged:
+                # Concepts survived; the cards (procedures/criteria/extras, which trail
+                # them in the schema) were truncated away.  Flag the chunk so the write
+                # path leaves it RECARD-eligible instead of stamping it current — the
+                # cards-only recard pass then re-mines them with the whole token budget
+                # to itself, so it almost never truncates.  Self-healing, not lost.
+                chunk["_cards_truncated"] = True
                 log.warning("distillation output truncated at max_tokens=%d — salvaged "
-                            "%d concept(s), any cards after them are LOST (chunk %s of "
-                            "%s); raise distill_max_tokens if frequent",
+                            "%d concept(s); the cards after them will be re-mined by the "
+                            "recard pass (chunk %s of %s); raise distill_max_tokens to "
+                            "capture them in one pass if this is frequent",
                             self.max_tokens, len(salvaged), chunk.get("id"),
                             chunk.get("path_or_url") or chunk.get("title") or "?")
                 return salvaged, [], [], [], {}
@@ -2217,7 +2229,10 @@ def _distill_sequential(store, kb, lm, embedder, cfg, *, limit=None, bundle=None
                     nc, nr, ncard = distill_chunk(kb, lm, embedder, chunk,
                                                   source_regime=reg)
                     kb.mark_distilled(chunk["id"])    # parse-fail counts as done (0) → progress
-                    kb.mark_recarded(chunk["id"], RECARD_VERSION)   # families extracted inline
+                    if not chunk.get("_cards_truncated"):
+                        kb.mark_recarded(chunk["id"], RECARD_VERSION)  # families extracted inline
+                    # else: cards were truncated away — leave recard-eligible so the
+                    # cards-only pass recovers them (concepts already landed).
                 break
             except BackendUnavailable as e:
                 if e.permanent:                       # this chunk is unservable — skip IT,
@@ -2355,7 +2370,8 @@ def _distill_parallel(store, kb, lms, embedder, cfg, *, limit=None, bundle=None)
                         nc, nr, ncard = distill_chunk(kb, writer_lm, embedder, chunk,
                                                       gen, source_regime=regime, narrative=narr)
                         kb.mark_distilled(chunk["id"])
-                        kb.mark_recarded(chunk["id"], RECARD_VERSION)
+                        if not chunk.get("_cards_truncated"):   # truncated → recard recovers
+                            kb.mark_recarded(chunk["id"], RECARD_VERSION)
                     done += 1
                     concepts += nc
                     relations += nr
@@ -2885,7 +2901,8 @@ def _distill_pipeline(store, kb, extractors, verifiers, embedder, cfg, *, limit=
                 nc, nr, ncard = distill_chunk(kb, rlm, emb, ch, gen,
                                               source_regime=reg, narrative=narr)
                 kb.mark_distilled(ch["id"])
-                kb.mark_recarded(ch["id"], RECARD_VERSION)   # families extracted inline
+                if not ch.get("_cards_truncated"):            # truncated → recard recovers
+                    kb.mark_recarded(ch["id"], RECARD_VERSION)   # families extracted inline
             with lock:
                 st["done"] += 1
                 st["concepts"] += nc

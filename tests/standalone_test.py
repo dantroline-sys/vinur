@@ -885,6 +885,19 @@ def main():
         assert not e.permanent, "timeout stays transient"
     ok("DistillLM._content: 4xx -> permanent (body in message); 5xx/timeout -> transient")
 
+    # ── a truncated pass salvages concepts AND flags the chunk for recard ────────
+    dlt = D.DistillLM({"distill_url": "http://x", "distill_model": "m",
+                       "distill_timeout_s": 5, "distill_max_tokens": 4096})
+    # concepts complete, then the output is cut mid-object (cards would follow)
+    dlt._content = lambda *a, **k: ('{"concepts": [{"label":"A","summary":"sa"},'
+                                    '{"label":"B","summary":"sb"},{"label":"C')
+    ch_t = {"id": "trunc1", "text": "dense prose", "path_or_url": "d.pdf"}
+    conc, rel, proc, crit, extras = dlt.extract(ch_t, "reference")
+    assert len(conc) == 2, conc
+    assert proc == [] and crit == [] and extras == {}, (proc, crit, extras)
+    assert ch_t.get("_cards_truncated") is True, "truncation must flag the chunk"
+    ok("extract(): truncation salvages concepts AND flags the chunk for recard recovery")
+
     # ── degenerate two-tier collapses to single-tier (same server+model) ──────
     pipe0 = D._distill_pipeline
 
@@ -1385,6 +1398,30 @@ def main():
         D.distill_chunk = dc0
     assert ("d", "z1") in seq_marks and ("r", "z1", D.RECARD_VERSION) in seq_marks, seq_marks
     ok("full distill stamps recarded at the CURRENT version")
+
+    # ── a truncated chunk is marked distilled but LEFT recard-eligible ──────────
+    seq_marks2 = []
+    kb_seq2 = SimpleNamespace(
+        is_distilled=lambda cid: False,
+        mark_distilled=lambda cid: seq_marks2.append(("d", cid)),
+        mark_recarded=lambda cid, v=1: seq_marks2.append(("r", cid, v)),
+        claim_text=lambda th, cid: cid,
+        record_dupe=lambda *a, **k: None,
+        batch=lambda: contextlib.nullcontext())
+
+    def _trunc_distill(kb, lm, emb, chunk, *a, **k):
+        chunk["_cards_truncated"] = True     # what extract() does on a truncated pass
+        return (1, 0, 0)                      # concepts salvaged, cards lost
+    D.distill_chunk = _trunc_distill
+    try:
+        D._distill_sequential(RecStore([{"id": "z2", "text": "prose."}]), kb_seq2,
+                              RecLM(), StubEmb(), {"ingest_log_every": 0})
+    finally:
+        D.distill_chunk = dc0
+    assert ("d", "z2") in seq_marks2, seq_marks2
+    assert not any(m[0] == "r" for m in seq_marks2), \
+        "a truncated chunk must stay recard-eligible (no current stamp)"
+    ok("truncated distill marks distilled but NOT recarded — recard recovers the cards")
 
     # ── zones: structural furniture detection; body wins on doubt ───────────
     from knowledgehost import zones as Z
