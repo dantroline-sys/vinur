@@ -4,7 +4,9 @@ One resident process owns every service this machine serves — the declared
 LMs (knowledgehost.serving), the embed endpoint, the CPU reranker, and the
 kb server itself — as direct children in their own process groups:
 
-    python -m knowledgehost.supervisor start|stop|restart [svc]|status|swap <llm>|logs [svc]
+    python -m knowledgehost.supervisor start|stop|restart [svc]|status [--json]|swap <llm>|logs [svc]
+    python -m knowledgehost.supervisor run              # foreground (systemd/launchd mode)
+    python -m knowledgehost.supervisor service install|uninstall|status [--dry-run]
 
 `start`/`stop`/`restart` with a service name act on that one service (the
 panel's Serving buttons post the same requests): a stop is HELD — the watchdog
@@ -468,7 +470,9 @@ def _loopback(host: str) -> bool:
     return host in ("127.0.0.1", "localhost", "::1", "")
 
 
-def cmd_start() -> int:
+def _prepare_start():
+    """Shared preflight for the detached start and the foreground `run` (the
+    OS-service mode).  Returns (cfg, svcs), or an int exit code."""
     st = read_state()
     if alive(st.get("supervisor", 0)):
         print(f"already running (supervisor pid={st['supervisor']}) — './vinur.sh status'")
@@ -499,6 +503,14 @@ def cmd_start() -> int:
     if px_warn:
         print(f"warning: {px_warn}", file=sys.stderr)
     LOGS.mkdir(parents=True, exist_ok=True)
+    return cfg, svcs
+
+
+def cmd_start() -> int:
+    r = _prepare_start()
+    if isinstance(r, int):
+        return r
+    cfg, svcs = r
 
     if os.fork() != 0:                                 # parent: report and leave
         for _ in range(50):
@@ -517,6 +529,18 @@ def cmd_start() -> int:
     os.dup2(logf.fileno(), 2)
     _run(svcs, cfg)
     os._exit(0)
+
+
+def cmd_run() -> int:
+    """Foreground supervisor — the OS-service mode (systemd/launchd is the
+    daemonizer and captures stdout; see knowledgehost/service.py).  Same
+    preflight as `start`, no fork, no log redirect."""
+    r = _prepare_start()
+    if isinstance(r, int):
+        return r
+    cfg, svcs = r
+    _run(svcs, cfg)
+    return 0
 
 
 def cmd_stop() -> int:
@@ -554,29 +578,67 @@ def cmd_stop() -> int:
     return 0
 
 
-def cmd_status() -> int:
+def status_data() -> dict:
+    """Machine-readable box status — THE seam `status --json`, the web panel
+    and a GUI shell all share (one collection, several renderers).  Safe on a
+    quiet box: running:false with whatever else is knowable."""
     st = read_state()
     sup = st.get("supervisor", 0)
-    if not alive(sup):
-        print("not running" + (" (stale state — './vinur.sh stop' cleans up)" if st else ""))
-        return 1
-    print(f"supervisor pid={sup}")
+    out: dict = {"running": alive(sup), "supervisor": sup if alive(sup) else 0,
+                 "stale": bool(st) and not alive(sup), "repo": str(ROOT),
+                 "panel": "", "services": [], "swap": {}}
+    try:
+        cfg = load_cfg()
+        out["panel"] = f"http://{cfg.get('host') or '127.0.0.1'}:{cfg.get('port')}"
+    except Exception:
+        pass
     failed = st.get("failed") or {}
     for name, pid in (st.get("services") or {}).items():
-        hint = st.get("hints", {}).get(name, "")
         if name in failed:
-            print(f"  {name:<12} FAILED  {failed[name]}")
+            out["services"].append({"name": name, "state": "failed", "pid": 0,
+                                    "note": str(failed[name])})
         elif alive(pid):
-            print(f"  {name:<12} up      pid={pid}  {hint}")
+            out["services"].append({"name": name, "state": "up", "pid": pid,
+                                    "note": st.get("hints", {}).get(name, "")})
         else:
-            line = last_log_line(name)
-            print(f"  {name:<12} dead    {('— ' + line) if line else ''}")
+            out["services"].append({"name": name, "state": "dead", "pid": 0,
+                                    "note": last_log_line(name)})
     for entry, name in (st.get("standby") or {}).items():
-        print(f"  {name:<12} standby — './vinur.sh swap {entry}' loads it")
+        out["services"].append({"name": name, "state": "standby", "pid": 0,
+                                "entry": entry, "note": f"'./vinur.sh swap {entry}' loads it"})
     for name in st.get("held") or []:
-        print(f"  {name:<12} stopped — by request; './vinur.sh start {name}' brings it back")
-    from . import serving as sv
-    sw = sv.swap_state()
+        out["services"].append({"name": name, "state": "stopped", "pid": 0,
+                                "note": f"by request; './vinur.sh start {name}' brings it back"})
+    try:
+        from . import serving as sv
+        out["swap"] = sv.swap_state() or {}
+    except Exception:
+        out["swap"] = {}
+    return out
+
+
+def cmd_status(as_json: bool = False) -> int:
+    d = status_data()
+    if as_json:
+        print(json.dumps(d, indent=1))
+        return 0 if d["running"] else 1
+    if not d["running"]:
+        print("not running" + (" (stale state — './vinur.sh stop' cleans up)"
+                               if d["stale"] else ""))
+        return 1
+    print(f"supervisor pid={d['supervisor']}")
+    for s in d["services"]:
+        if s["state"] == "failed":
+            print(f"  {s['name']:<12} FAILED  {s['note']}")
+        elif s["state"] == "up":
+            print(f"  {s['name']:<12} up      pid={s['pid']}  {s['note']}")
+        elif s["state"] == "dead":
+            print(f"  {s['name']:<12} dead    {('— ' + s['note']) if s['note'] else ''}")
+        elif s["state"] == "standby":
+            print(f"  {s['name']:<12} standby — {s['note']}")
+        else:
+            print(f"  {s['name']:<12} stopped — {s['note']}")
+    sw = d["swap"]
     if sw.get("status") == "swapping":
         print(f"  (swap in progress: -> {sw.get('request')})")
     elif sw.get("status") == "error":
@@ -682,10 +744,15 @@ def main(argv: list[str] | None = None) -> int:
     cmd = args[0] if args else "status"
     if cmd == "start":
         return cmd_service(args[1], "start") if len(args) > 1 else cmd_start()
+    if cmd == "run":
+        return cmd_run()
     if cmd == "stop":
         return cmd_service(args[1], "stop") if len(args) > 1 else cmd_stop()
     if cmd == "status":
-        return cmd_status()
+        return cmd_status(as_json="--json" in args)
+    if cmd == "service":
+        from . import service as service_mod
+        return service_mod.main(args[1:])
     if cmd == "restart":
         return cmd_restart(args[1] if len(args) > 1 else None)
     if cmd == "swap":

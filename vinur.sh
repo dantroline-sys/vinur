@@ -7,6 +7,9 @@
 #   ./vinur.sh stop             # stop them
 #   ./vinur.sh restart [svc]    # restart everything, or one service
 #   ./vinur.sh status           # what's up (dead services show their log reason)
+#   ./vinur.sh status --json    # the same, machine-readable (scripts / the GUI shell)
+#   ./vinur.sh service install  # start at login via systemd/launchd — the OS revives
+#                               #   the supervisor itself (--dry-run previews; uninstall|status)
 #   ./vinur.sh swap <llm>       # exclusive models: load this one in place of the
 #                               #   resident one (waits for /health; minutes for big weights)
 #   ./vinur.sh logs [svc]       # follow logs (Ctrl-C detaches)
