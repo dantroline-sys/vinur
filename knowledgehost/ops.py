@@ -32,7 +32,7 @@ COMMANDS: dict = {
     "rebuild-fts": {},                     # reindex FTS with the configured tokenizer (no re-parse)
     "distill":    {"limit": "int", "watch": "bool", "interval": "int", "bundle": "str"},
     "recard":     {"limit": "int", "bundle": "str",    # cards-only re-pass (see HELP)
-                   "all_families": "bool", "before": "str"},
+                   "all_families": "bool", "before": "str", "since": "str"},
     # clean-room pack producer (VINUR-PACK-01 §3); encryption is CLI-only —
     # a passphrase must never ride argv where `ps` can read it
     "pack":       {"path": "path", "name": "str", "title": "str", "author": "str",
@@ -108,7 +108,11 @@ HELP: dict = {
                                "output budget while chunks were already marked done)",
                "before": "only chunks DISTILLED before this date/time (YYYY-MM-DD "
                          "or YYYY-MM-DDTHH:MM) — bound the recovery to what "
-                         "predates the budget fix; the healthy tail is spared"},
+                         "predates the budget fix; the healthy tail is spared",
+               "since": "RECOVERY mirror of before: re-open chunks DISTILLED "
+                        "on/after this date/time REGARDLESS of stamp, to recover "
+                        "cards truncated after a chunk was stamped current "
+                        "(idempotent — the title gate folds already-carded chunks)"},
     "dedupe": {"_": "Janitor (no LM): find chunks holding text the corpus already "
                     "has. A chunk id is sha1(path+section+text), so the same text "
                     "arriving by another route — a research drop re-exported under "

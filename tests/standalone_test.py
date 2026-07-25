@@ -1378,6 +1378,26 @@ def main():
     ok("recard --before: pre-cutoff chunks re-asked, healthy tail spared with its "
        "stamp intact, timestampless rows stay eligible")
 
+    # ── since recovery: re-opens the recent window REGARDLESS of stamp ────────
+    RecLM.calls = []
+    skb = RecKB(distilled={"c1", "c3"},
+                recarded={"c1": D.RECARD_VERSION, "c3": D.RECARD_VERSION}, regimes={})
+    skb.at = {"c1": 500.0, "c3": 100.0}                 # c1 recent, c3 old
+    sres = D.recard_corpus(RecStore([rc_chunks[0], rc_chunks[2]]), skb,
+                           [RecLM()], StubEmb(), rcfg, since=300.0)
+    assert [c[0] for c in RecLM.calls] == ["c1"], \
+        "since re-opens the recent chunk though it is stamped CURRENT"
+    assert RecLM.calls[0][2] == D.RECARD_FAMILIES, "recovery re-asks EVERY family"
+    assert sres["chunks"] == 1 and sres["skipped_recent"] == 1, sres
+    RecLM.calls = []
+    skb2 = RecKB(distilled={"c1"}, recarded={"c1": D.RECARD_VERSION}, regimes={})
+    skb2.at = {}                                        # timestampless = OLD
+    D.recard_corpus(RecStore(rc_chunks[:1]), skb2, [RecLM()], StubEmb(), rcfg,
+                    since=300.0)
+    assert RecLM.calls == [], "timestampless row is OLD — outside the since window"
+    ok("recard --since: recovers the recent window (stamp ignored, every family), "
+       "spares older + timestampless rows")
+
     # ── full distill stamps the recard checkpoint (swept corpus stays swept) ─
     seq_marks = []
     kb_seq = SimpleNamespace(
@@ -1526,12 +1546,15 @@ def main():
     from knowledgehost import autopilot as AP_
     from knowledgehost import ops as OPS_
     assert OPS_.COMMANDS["recard"] == {"limit": "int", "bundle": "str",
-                                       "all_families": "bool", "before": "str"}
+                                       "all_families": "bool", "before": "str",
+                                       "since": "str"}
     assert OPS_.HELP["recard"]["_"] and "bundle" in OPS_.HELP["recard"]
     assert "all_families" in OPS_.HELP["recard"] and "before" in OPS_.HELP["recard"]
+    assert "since" in OPS_.HELP["recard"]
     assert OPS_._argv("recard", {"all_families": True}) == ["--all-families"], \
         "the bool flag must render with the dash"
     assert OPS_._argv("recard", {"before": "2026-07-24"}) == ["--before", "2026-07-24"]
+    assert OPS_._argv("recard", {"since": "2026-07-20"}) == ["--since", "2026-07-20"]
     assert any(s["command"] == "recard" and not s["enabled"]
                for s in AP_.DEFAULT_PLAN["steps"])
     assert AP_.auto_model({"distill_urls": []}, "recard") is None  # distill lane, no urls

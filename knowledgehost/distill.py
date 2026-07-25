@@ -2390,7 +2390,8 @@ def _distill_parallel(store, kb, lms, embedder, cfg, *, limit=None, bundle=None)
 
 
 # ── recard corpus sweep ──────────────────────────────────────────────────────────
-def _pending_recard_chunks(store, kb, counter, bundle=None, cfg=None, before=None):
+def _pending_recard_chunks(store, kb, counter, bundle=None, cfg=None,
+                           before=None, since=None):
     """Chunks the generic pass already distilled but the cards-only pass hasn't
     fully seen: unstamped, OR stamped with an older RECARD_VERSION (new families
     added since — the sweep re-opens them for ONLY the new families, via
@@ -2400,26 +2401,41 @@ def _pending_recard_chunks(store, kb, counter, bundle=None, cfg=None, before=Non
     to chunks DISTILLED before that moment — the recovery case: everything
     distilled after the output-budget fix is already healthy, so a cutoff at
     the fix date spares the whole clean tail (rows with no timestamp are old
-    and stay eligible).  counter: [ineligible, zone-skipped, after-cutoff]."""
+    and stay eligible).  `since` (epoch) is the RECOVERY MIRROR: it re-opens
+    chunks distilled AT OR AFTER that moment REGARDLESS of their recard stamp —
+    the window where an output-budget truncation ate a chunk's cards AFTER the
+    v3 sweep had already stamped it current, so the version gate can no longer
+    reach it.  It re-asks EVERY family (dedup + the title gate keep it idempotent
+    for chunks that already have their cards); timestampless rows are OLD, so
+    `since` excludes them.  counter: [ineligible, zone-skipped, out-of-window]."""
     skip = _zone_skip_set(cfg)
     for ch in store.iter_chunks():
         if bundle is not None and _chunk_bundle(ch) != bundle:
             continue
         v = kb.recard_version(ch["id"])
-        if not kb.is_distilled(ch["id"]) or v >= RECARD_VERSION:
+        if not kb.is_distilled(ch["id"]):
             counter[0] += 1
             continue
-        if before is not None:
-            at = kb.distilled_at(ch["id"])
-            if at is not None and at >= before:
+        at = kb.distilled_at(ch["id"]) if (since is not None or before is not None) else None
+        recover = False
+        if since is not None:
+            if at is None or at < since:              # before the recovery window
                 if len(counter) > 2:
                     counter[2] += 1
                 continue
+            recover = True                            # in-window: bypass the version gate
+        if not recover and v >= RECARD_VERSION:       # already current, nothing new to ask
+            counter[0] += 1
+            continue
+        if before is not None and at is not None and at >= before:
+            if len(counter) > 2:
+                counter[2] += 1
+            continue
         ch["zone"] = zones.classify(ch.get("section") or "", ch.get("text") or "")
         if ch["zone"] in skip:
             counter[1] += 1
             continue
-        ch["_recard_from"] = v
+        ch["_recard_from"] = 0 if recover else v      # recovery re-asks every family
         yield ch
 
 
@@ -2474,7 +2490,7 @@ def _recard_store(kb, embedder, chunk, extras) -> int:
 
 
 def recard_corpus(store, kb, lms, embedder, cfg, *, limit=None, bundle=None,
-                  all_families=False, before=None) -> dict:
+                  all_families=False, before=None, since=None) -> dict:
     """Cards-only sweep: run the card-families extraction (procedures/criteria
     included from v3) over chunks stamped before the current RECARD_VERSION.
     Nothing else is re-emitted — nodes are joined, never re-created, and
@@ -2483,8 +2499,11 @@ def recard_corpus(store, kb, lms, embedder, cfg, *, limit=None, bundle=None,
     preamble makes vLLM prefix caching very effective.  `all_families` ignores
     each stamp's AGE (eligibility is unchanged) so a recovery sweep re-asks
     EVERY family — for chunks whose cards were lost to output truncation while
-    their stamps said done.  Raises BackendUnavailable when every endpoint is
-    gone (resumable abort)."""
+    their stamps said done.  `before`/`since` (epoch) bound the sweep by distill
+    time: `before` spares the healthy tail (version-gated as usual); `since` is
+    the recovery mirror — it re-opens the recent window REGARDLESS of stamp, to
+    catch chunks truncated after the v3 sweep had already stamped them current.
+    Raises BackendUnavailable when every endpoint is gone (resumable abort)."""
     import queue
     import threading
     from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
@@ -2527,7 +2546,7 @@ def recard_corpus(store, kb, lms, embedder, cfg, *, limit=None, bundle=None,
             return chunk, None, lm, regime, families, e   # caller decides: retry vs drop
 
     chunks = _pending_recard_chunks(store, kb, skipped, bundle=bundle, cfg=cfg,
-                                    before=before)
+                                    before=before, since=since)
     stop = False
     with ThreadPoolExecutor(max_workers=len(lms)) as ex:
         futures = set()

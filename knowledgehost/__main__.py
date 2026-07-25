@@ -390,25 +390,40 @@ def _run_pack(cfg, log, args) -> int:
 
 
 def _run_recard(cfg, store, embedder, log, *, limit=None, bundle=None,
-                all_families=False, before=None) -> int:
+                all_families=False, before=None, since=None) -> int:
     """Cards-only sweep over already-distilled chunks: harvest the card families
     (procedures and criteria included from v3, plus branch/troubleshooting/
     expectation/misconception/enumeration) from corpus stamped before the current
     RECARD_VERSION.  --all-families re-asks EVERY family regardless of stamp age
-    (truncation recovery).  Joins existing concept nodes and never re-emits nodes
-    or relations, so the adjudication queue stays quiet.  Resumable (the recarded
-    set is the checkpoint); big-LM work, fanned out like distill."""
+    (truncation recovery).  --before bounds the sweep to chunks distilled before a
+    date; --since is its recovery mirror — it re-opens the recent window
+    REGARDLESS of stamp, to recover chunks truncated after they were stamped
+    current.  Joins existing concept nodes and never re-emits nodes or relations,
+    so the adjudication queue stays quiet.  Resumable (the recarded set is the
+    checkpoint); big-LM work, fanned out like distill."""
     from . import distill as distill_mod
-    cutoff = None
-    if before:
-        from datetime import datetime
+    from datetime import datetime
+
+    def _epoch(val, flag):
         try:
-            cutoff = datetime.fromisoformat(str(before)).timestamp()
+            return datetime.fromisoformat(str(val)).timestamp(), None
         except ValueError:
-            log.error("--before: %r is not a date/time (YYYY-MM-DD or "
-                      "YYYY-MM-DDTHH:MM).", before)
+            return None, ("%s: %r is not a date/time (YYYY-MM-DD or "
+                          "YYYY-MM-DDTHH:MM)." % (flag, val))
+    cutoff = floor = None
+    if before:
+        cutoff, err = _epoch(before, "--before")
+        if err:
+            log.error(err)
             return 1
         log.info("recard: bounded to chunks distilled before %s", before)
+    if since:
+        floor, err = _epoch(since, "--since")
+        if err:
+            log.error(err)
+            return 1
+        log.info("recard: RECOVERY of chunks distilled since %s (re-opens the "
+                 "window regardless of stamp)", since)
     if not embedder.embed_one("warmup", "document"):
         log.error("embed endpoint unreachable — recard needs vectors for the new cards.")
         return 1
@@ -427,7 +442,8 @@ def _run_recard(cfg, store, embedder, log, *, limit=None, bundle=None,
     try:
         stats = distill_mod.recard_corpus(store, kb, big, embedder, cfg,
                                           limit=limit, bundle=bundle,
-                                          all_families=all_families, before=cutoff)
+                                          all_families=all_families,
+                                          before=cutoff, since=floor)
         log.info("recard: %s", stats)
         log.info("kb: %s", kb.counts())
         ops_mod.emit_result(stats.get("chunks", 0) > 0 or stats.get("no_menu", 0) > 0,
@@ -996,6 +1012,13 @@ def main(argv=None):
                          "(YYYY-MM-DD or YYYY-MM-DDTHH:MM, local) — bound the "
                          "recovery sweep to what predates the budget fix; the "
                          "healthy tail distilled since is spared")
+    ap.add_argument("--since",
+                    help="recard: RECOVERY mirror of --before — re-open chunks "
+                         "DISTILLED on/after this date/time (YYYY-MM-DD or "
+                         "YYYY-MM-DDTHH:MM, local) REGARDLESS of their recard "
+                         "stamp, to recover cards truncated after a chunk was "
+                         "already stamped current (idempotent: the title gate "
+                         "folds chunks that already have their cards)")
     ap.add_argument("--author", help="pack: producer name for the manifest")
     ap.add_argument("--contact", help="pack: producer contact for the manifest")
     ap.add_argument("--pack-version", default="1.0.0", dest="pack_version",
@@ -1207,7 +1230,8 @@ def main(argv=None):
         return _run_recard(cfg, store, embedder, log, limit=args.limit,
                            bundle=getattr(args, "bundle", None),
                            all_families=getattr(args, "all_families", False),
-                           before=getattr(args, "before", None))
+                           before=getattr(args, "before", None),
+                           since=getattr(args, "since", None))
 
     if args.command == "find":                 # hub search + fits-this-machine verdicts
         store.close()
