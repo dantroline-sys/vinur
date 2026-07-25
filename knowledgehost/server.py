@@ -385,6 +385,19 @@ class Handler(BaseHTTPRequestHandler):
                 return self._send_json({"ok": False, "error": "unauthorized"}, 401)
             from . import serving as sv
             return self._send_json({"ok": True, **sv.swap_state()})
+        if path == "/serving/schedule":            # Serving › Schedule: weekly minimal-mode plan
+            if not self._authed():
+                return self._send_json({"ok": False, "error": "unauthorized"}, 401)
+            from datetime import datetime
+            from . import serving as sv
+            sched = sv.read_schedule()
+            now = datetime.now()
+            return self._send_json(
+                {"ok": True, "schedule": sched,
+                 "minimal": sv.minimal_state(),          # current live posture
+                 # server-local clock so the editor can show "now" against the grid
+                 "now": {"dow": now.weekday(), "hhmm": now.strftime("%H:%M")},
+                 "wants_minimal": sv.schedule_wants_minimal(sched, now)})
         if path == "/serving/status":              # Serving tab: models + weights + state
             if not self._authed():
                 return self._send_json({"ok": False, "error": "unauthorized"}, 401)
@@ -547,8 +560,8 @@ class Handler(BaseHTTPRequestHandler):
         if path not in ("/call", "/ops/run", "/ops/stop", "/ops/reload", "/config",
                         "/ops/autopilot", "/library/config", "/library/root",
                         "/source", "/scenario", "/brain", "/drop", "/serving/swap",
-                        "/serving/control", "/serving/minimal", "/serving/model",
-                        "/serving/add",
+                        "/serving/control", "/serving/minimal", "/serving/schedule",
+                        "/serving/model", "/serving/add",
                         "/serving/pull", "/serving/download", "/serving/tune", "/net",
                         "/metrics/mark", "/gaps/close", "/settings/paths"):
             return self._send_json({"ok": False, "error": "not found"}, 404)
@@ -651,6 +664,16 @@ class Handler(BaseHTTPRequestHandler):
             return self._send_json({"ok": True, **summary,
                                     "note": "the supervisor acts within a few seconds — "
                                             "re-poll /serving/status"})
+        if path == "/serving/schedule":                # save the weekly minimal-mode plan
+            # Validated + normalised, then written to var/run/schedule.json; the
+            # supervisor re-reads it live and flips minimal at window boundaries.
+            from . import serving as sv
+            from . import supervisor as sup
+            cleaned = sv.clean_schedule(req if isinstance(req, dict) else {})
+            sv.write_schedule(cleaned)
+            return self._send_json(
+                {"ok": True, "schedule": cleaned,
+                 "note": f"saved — the supervisor applies it within ~{int(sup.SCHED_TICK_S)}s"})
         if path == "/net":                             # broker: setting write OR action
             act = str(req.get("action") or "")
             if act:                                    # operator actions, audited

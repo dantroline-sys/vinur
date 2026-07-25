@@ -868,6 +868,96 @@ def clear_minimal() -> None:
         pass
 
 
+# ── weekly schedule (drives minimal mode by day-of-week + time window) ────────
+# The panel's Serving › Schedule tab writes this; the supervisor re-reads it live
+# each ~30s and flips minimal mode at window boundaries.  Windows are FULL-POWER
+# (ingest) windows — the box runs full while inside one and MINIMAL (VRAM freed)
+# outside — so the user schedules the heavy GPU work for hours that suit them.
+#   schedule.json  {"enabled": bool, "windows": {"mon": [["22:00","06:00"]], ...}}
+# A window whose end <= start wraps past midnight into the next day.  Same var/run
+# idiom + atomic write as the swap/minimal lanes; persists across a reboot.
+SCHEDULE_FILE = ROOT / "var" / "run" / "schedule.json"
+_DAYS = ("mon", "tue", "wed", "thu", "fri", "sat", "sun")
+
+
+def read_schedule() -> dict:
+    try:
+        d = json.loads(SCHEDULE_FILE.read_text())
+        return d if isinstance(d, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
+def write_schedule(d: dict) -> None:
+    SCHEDULE_FILE.parent.mkdir(parents=True, exist_ok=True)
+    tmp = SCHEDULE_FILE.with_suffix(".tmp")
+    tmp.write_text(json.dumps(d))
+    os.replace(tmp, SCHEDULE_FILE)
+
+
+def _hhmm(s) -> int | None:
+    """Minutes-since-midnight for 'HH:MM', or None if malformed."""
+    try:
+        h, m = str(s).split(":")
+        h, m = int(h), int(m)
+        return h * 60 + m if 0 <= h < 24 and 0 <= m < 60 else None
+    except (ValueError, AttributeError):
+        return None
+
+
+def _norm_hhmm(s) -> str:
+    v = _hhmm(s)
+    return "%02d:%02d" % divmod(v, 60) if v is not None else "00:00"
+
+
+def clean_schedule(d: dict) -> dict:
+    """Validate+normalise a schedule from the panel: keep only real days and
+    well-formed HH:MM windows (start != end), normalise to zero-padded, cap the
+    windows per day.  Fail-soft — a bad row is dropped, not an error."""
+    out = {"enabled": bool(d.get("enabled")), "windows": {}}
+    win = d.get("windows") if isinstance(d.get("windows"), dict) else {}
+    for day in _DAYS:
+        rows = []
+        for pair in (win.get(day) or [])[:12]:
+            if isinstance(pair, (list, tuple)) and len(pair) == 2:
+                a, b = _hhmm(pair[0]), _hhmm(pair[1])
+                if a is not None and b is not None and a != b:
+                    rows.append([_norm_hhmm(pair[0]), _norm_hhmm(pair[1])])
+        if rows:
+            out["windows"][day] = rows
+    return out
+
+
+def _in_full_window(windows: dict, dow: int, cur: int) -> bool:
+    """Is minute-of-day `cur` on weekday `dow` (0=Mon) inside a FULL-power window?
+    A window [s,e] with e<=s wraps past midnight — its tail counts on the NEXT
+    day's morning, so yesterday's wrapping windows are checked too."""
+    for s, e in windows.get(_DAYS[dow], []):
+        sm, em = _hhmm(s), _hhmm(e)
+        if sm is None or em is None or sm == em:
+            continue
+        if sm < em:
+            if sm <= cur < em:
+                return True
+        elif cur >= sm:                    # overnight window, evening part (this day)
+            return True
+    for s, e in windows.get(_DAYS[(dow - 1) % 7], []):
+        sm, em = _hhmm(s), _hhmm(e)
+        if sm is not None and em is not None and em < sm and cur < em:
+            return True                    # overnight window, morning part (next day)
+    return False
+
+
+def schedule_wants_minimal(sched: dict, now) -> bool | None:
+    """Given the weekly schedule and a datetime, does minimal mode belong ON now
+    (True), OFF (False), or is the schedule disabled (None)?  Minimal is the
+    default OUTSIDE the FULL-power windows."""
+    if not sched.get("enabled"):
+        return None
+    windows = sched.get("windows") if isinstance(sched.get("windows"), dict) else {}
+    return not _in_full_window(windows, now.weekday(), now.hour * 60 + now.minute)
+
+
 def request_swap(name: str) -> None:
     SWAP_REQ.parent.mkdir(parents=True, exist_ok=True)
     tmp = SWAP_REQ.with_suffix(".tmp")

@@ -137,6 +137,9 @@ auth_token = ""         # if set, /call requires Authorization: Bearer <token>
 #                                 #   search survives; embed="off" stops it too and
 #                                 #   kb_ask/kb_search fall back to lexical BM25/FTS.
 #                                 #   The flag persists across a reboot.
+# To run minimal automatically on a weekly timer (ingest only at hours that suit
+# you), use the panel's Serving › Schedule tab — it writes var/run/schedule.json
+# (live, no restart); the box goes full-power inside your windows, minimal outside.
 
 # ── embeddings (the nomic endpoint, shared with Vinkona's memory store) ─────────
 embed_url   = "http://127.0.0.1:11437"

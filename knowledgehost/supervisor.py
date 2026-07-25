@@ -56,6 +56,7 @@ CONTAINER_STOP_S = 60  # in-container TERM -> KILL budget (`<runtime> stop -t`):
                        # a big vLLM engine takes well over GRACE_S to exit, and
                        # the runtime's own KILL still frees VRAM either way
 TICK_S = 2.0           # watchdog cadence
+SCHED_TICK_S = 30.0    # weekly-schedule evaluation cadence (minute resolution is plenty)
 MAX_RESTARTS = 5       # per service, within WINDOW_S, then give up
 WINDOW_S = 600.0
 
@@ -312,6 +313,29 @@ def plan_minimal(cfg: dict, action: str, *, active: str = "", restore: str = "")
             "restart": (["embed"] if embed_on else [])}
 
 
+def _reconcile_schedule(cfg: dict, last_want):
+    """Weekly-schedule tick: flip minimal mode at a window boundary.  `last_want`
+    is the state the schedule last DECIDED (None = not governing).  We act only on
+    a boundary crossing (want != last_want) — so a manual `minimal on/off` inside a
+    window sticks until the next boundary, never fought every tick — and even then
+    only when the box isn't already in the wanted state.  Returns the new want."""
+    from datetime import datetime
+    from . import serving as sv
+    sched = sv.read_schedule()
+    want = sv.schedule_wants_minimal(sched, datetime.now())
+    if want is None:                       # schedule disabled — stop governing
+        return None
+    if want == last_want:                  # inside the same window — respect manual toggles
+        return last_want
+    if want != bool(sv.minimal_state().get("on")):
+        print(f"schedule: window boundary -> minimal {'on' if want else 'off'}", flush=True)
+        try:
+            apply_minimal(cfg, "on" if want else "off")
+        except Exception as e:             # a broken transition must not kill the loop
+            print(f"schedule: apply_minimal failed: {e}", flush=True)
+    return want
+
+
 def apply_minimal(cfg: dict, action: str) -> dict:
     """Execute a minimal-mode transition through the same async request lanes the
     panel/CLI use.  Idempotent-ish: safe to re-issue.  Returns the plan summary."""
@@ -517,10 +541,15 @@ def _run(svcs: list[dict], cfg: dict) -> None:
                     print(f"control: {action}ed {name} pid={procs[name].pid}", flush=True)
             sync_state()
 
+    sched_want = None          # the state the weekly schedule last decided
+    sched_next = 0.0           # next schedule evaluation (throttled to SCHED_TICK_S)
     while not stop_requested:
         time.sleep(TICK_S)
         check_control()
         check_swap()
+        if time.time() >= sched_next:
+            sched_next = time.time() + SCHED_TICK_S
+            sched_want = _reconcile_schedule(cfg, sched_want)
         for name, p in list(procs.items()):
             if p.poll() is None or name in failed:
                 continue

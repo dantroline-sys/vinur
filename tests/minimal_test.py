@@ -188,6 +188,66 @@ def main():
     check("kb_ask: embedder UP is unchanged — dense path ran, no BM25 fallback",
           up.dense >= 1 and up.bm25 == 0)
 
+    # ── weekly schedule: pure evaluator ──────────────────────────────────────
+    from datetime import datetime
+    W = {"enabled": True, "windows": {"mon": [["22:00", "06:00"]],   # overnight
+                                      "wed": [["09:00", "17:00"]]}}   # daytime
+    mon, tue, wed = datetime(2026, 7, 20, 0, 0), datetime(2026, 7, 21, 0, 0), \
+        datetime(2026, 7, 22, 0, 0)
+    check("schedule: inside an overnight window -> full (wants minimal False)",
+          SV.schedule_wants_minimal(W, mon.replace(hour=23)) is False)
+    check("schedule: overnight window's morning tail counts on the NEXT day",
+          SV.schedule_wants_minimal(W, tue.replace(hour=3)) is False
+          and SV.schedule_wants_minimal(W, tue.replace(hour=7)) is True)
+    check("schedule: inside/outside a daytime window",
+          SV.schedule_wants_minimal(W, wed.replace(hour=12)) is False
+          and SV.schedule_wants_minimal(W, wed.replace(hour=18)) is True)
+    check("schedule: a day with no window is minimal all day",
+          SV.schedule_wants_minimal(W, tue.replace(hour=12)) is True)
+    check("schedule: disabled -> None (not governing)",
+          SV.schedule_wants_minimal({"enabled": False, "windows": W["windows"]},
+                                    wed.replace(hour=12)) is None)
+
+    # ── clean_schedule: validate + normalise + drop junk ─────────────────────
+    cl = SV.clean_schedule({"enabled": 1, "windows": {
+        "mon": [["9:5", "17:00"], ["bad", "x"], ["1:1", "1:1"]],   # pad, drop, drop(equal)
+        "zz": [["1:00", "2:00"]]}})                                # bogus day dropped
+    check("clean_schedule: pads HH:MM, drops malformed + zero-length + bad days",
+          cl == {"enabled": True, "windows": {"mon": [["09:05", "17:00"]]}})
+
+    # ── _reconcile_schedule: acts only on boundary crossings ─────────────────
+    rec = {"apply": []}
+    o2 = {n: getattr(SV, n) for n in ("read_schedule", "schedule_wants_minimal",
+                                      "minimal_state")}
+    ap0 = SUP.apply_minimal
+    SV.read_schedule = lambda: {"enabled": True}
+    SUP.apply_minimal = lambda cfg, a: rec["apply"].append(a)
+    try:
+        SV.schedule_wants_minimal = lambda s, n: True     # wants minimal
+        SV.minimal_state = lambda: {"on": False}          # currently full
+        w1 = SUP._reconcile_schedule({}, None)            # first eval → boundary
+        check("_reconcile: first eval crosses to minimal on (box was full)",
+              w1 is True and rec["apply"] == ["on"])
+        rec["apply"].clear()
+        SV.minimal_state = lambda: {"on": True}
+        w2 = SUP._reconcile_schedule({}, w1)              # same want → no action
+        check("_reconcile: inside the same window, no re-fire (manual override sticks)",
+              w2 is True and rec["apply"] == [])
+        SV.schedule_wants_minimal = lambda s, n: False    # boundary: window opened
+        w3 = SUP._reconcile_schedule({}, w2)
+        check("_reconcile: boundary to full-power calls apply_minimal off",
+              w3 is False and rec["apply"] == ["off"])
+        rec["apply"].clear()
+        SV.read_schedule = lambda: {"enabled": False}
+        SV.schedule_wants_minimal = lambda s, n: None
+        w4 = SUP._reconcile_schedule({}, w3)
+        check("_reconcile: disabled schedule stops governing (None, no action)",
+              w4 is None and rec["apply"] == [])
+    finally:
+        for n, f in o2.items():
+            setattr(SV, n, f)
+        SUP.apply_minimal = ap0
+
     print()
     if check.failed:
         print(f"{check.failed} FAILURE(S)")

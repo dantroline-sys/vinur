@@ -188,7 +188,7 @@ const GROUPS = [
                               ['edges', 'Relations'], ['cards', 'Cards']]],
   ['curation', 'Curation', [['adjudication', 'Adjudication'], ['gaps', 'Gaps']]],
   ['ops', 'Operations', []],
-  ['serving', 'Serving', []],
+  ['serving', 'Serving', [['serving', 'Models'], ['schedule', 'Schedule']]],
   ['stats', 'Stats', []],
   ['settings', 'Settings', [['settings', 'General'], ['paths', 'Paths'],
                             ['network', 'Network'], ['bundles', 'Bundles'],
@@ -285,6 +285,7 @@ function go(k, leaf) {
   if (k === 'ask') { askEmptyState(); if ($('#aq')) $('#aq').focus(); }
   else if (k === 'ops') { loadOps(); opsTimer = setInterval(() => { if (active === 'ops') pollOps(); }, 2500); }
   else if (k === 'serving') { loadServing(); opsTimer = setInterval(() => { if (active === 'serving') pollServing(); }, 2500); }
+  else if (k === 'schedule') { loadSchedule(); }
   else if (k === 'stats') { loadStatsTab(); opsTimer = setInterval(() => { if (active === 'stats') loadStatsTab(true); }, 10000); }
   else if (k === 'overview') { loadOverview(); }
   else if (k === 'settings') { loadSettings(); }
@@ -330,6 +331,11 @@ function renderBar(k) {
   } else if (k === 'serving') {
     $('#bar').innerHTML = tokInput()
       + ` <button class="toolbtn" onclick="pollServing()">Refresh</button>`;
+  } else if (k === 'schedule') {
+    $('#bar').innerHTML = tokInput()
+      + ` <button class="toolbtn" onclick="saveSchedule()">Save schedule</button>`
+      + ` <button class="toolbtn" onclick="loadSchedule()">Refresh</button>`
+      + ` <span style="opacity:.6;font-size:13px">windows = full-power (ingest) hours; the box runs minimal (VRAM freed) outside them</span>`;
   } else if (k === 'stats') {
     $('#bar').innerHTML = tokInput()
       + ` <select id="strange" onchange="loadStatsTab()" title="time range">`
@@ -1892,6 +1898,87 @@ async function saveAutopilot() {
   const r = await postJSON('/ops/autopilot', { plan }).catch(e => ({ ok: false, error: netErr(e) }));
   $('#banner').innerHTML = `<div class="note">${r.ok ? '✓ plan saved' : '✗ ' + esc(r.error || 'failed')}</div>`;
   if (r.ok) loadAutopilot();
+}
+
+// ── Serving › Schedule: weekly minimal-mode timer ────────────────────────────
+// Windows are FULL-POWER (ingest) hours; the box runs minimal (VRAM freed, KB
+// still served) OUTSIDE them.  Same editor shape as the Prioritizer: a JSON
+// state file the supervisor re-reads live.
+const SCHED_DAYS = [['mon', 'Monday'], ['tue', 'Tuesday'], ['wed', 'Wednesday'],
+                    ['thu', 'Thursday'], ['fri', 'Friday'], ['sat', 'Saturday'],
+                    ['sun', 'Sunday']];
+let SCHED = { enabled: false, windows: {} }, SCHED_META = {};
+async function loadSchedule() {
+  $('#banner').innerHTML = ''; $('#results').className = ''; $('#results').textContent = 'loading schedule…';
+  let r; try { r = await (await authFetch('/serving/schedule')).json(); } catch (e) { $('#results').textContent = 'request failed: ' + e; return; }
+  if (!r.ok) { $('#results').className = 'empty'; $('#results').textContent = 'enter the auth token above to edit the schedule'; return; }
+  SCHED = r.schedule && r.schedule.windows ? r.schedule : { enabled: !!(r.schedule || {}).enabled, windows: {} };
+  if (!SCHED.windows) SCHED.windows = {};
+  SCHED_META = { now: r.now || {}, minimal: r.minimal || {}, wants: r.wants_minimal };
+  renderSchedule();
+}
+function renderSchedule() {
+  const m = SCHED_META, on = !!(m.minimal || {}).on;
+  const postureNow = on ? '<b style="color:#999">MINIMAL</b> (VRAM freed, KB served)'
+                        : '<b style="color:#2e7d32">FULL</b> (serving + ingest)';
+  const wants = m.wants === true ? 'minimal (out of window)'
+              : m.wants === false ? 'full-power (in a window)' : 'not governing (disabled)';
+  const nowStr = m.now && m.now.hhmm != null
+    ? `${(SCHED_DAYS[m.now.dow] || [, '?'])[1]} ${esc(m.now.hhmm)}` : '';
+  const rows = SCHED_DAYS.map(([k, lbl]) => {
+    const wins = (SCHED.windows[k] || []);
+    const cells = wins.map((w, i) =>
+      `<span style="white-space:nowrap;margin-right:10px;display:inline-block">
+         <input type="time" data-day="${k}" data-i="${i}" data-e="0" value="${esc(w[0] || '')}">
+         –<input type="time" data-day="${k}" data-i="${i}" data-e="1" value="${esc(w[1] || '')}">
+         <button class="toolbtn" onclick="schDelWindow('${k}',${i})" title="remove this window">✕</button>
+       </span>`).join('');
+    return `<tr><td style="white-space:nowrap;font-weight:600">${lbl}</td>
+      <td>${cells || '<span style="opacity:.45">minimal all day</span>'} </td>
+      <td><button class="toolbtn" onclick="schAddWindow('${k}')">+ window</button></td></tr>`;
+  }).join('');
+  $('#results').innerHTML =
+    `<div style="margin:6px 0 12px;font-size:13px">
+       <label><input type="checkbox" id="schEnabled" ${SCHED.enabled ? 'checked' : ''}> <b>Schedule enabled</b></label>
+       ${nowStr ? `&nbsp;·&nbsp; now: ${nowStr} &nbsp;·&nbsp; posture: ${postureNow}` : ''}
+       <div style="opacity:.65;margin-top:6px;max-width:820px">Each <b>window</b> is a FULL-POWER stretch: the
+         big model is up and the Prioritizer's ingest/distill runs. OUTSIDE every window the box drops to
+         <b>minimal mode</b> — all VRAM freed for your other GPU work — while still answering kb_ask / kb_search
+         for Vinkona. A window whose end is earlier than its start runs <b>overnight</b> into the next day
+         (e.g. 22:00–06:00). The supervisor applies changes within ~30 s; a manual override on the Models tab
+         holds until the next window boundary. Schedule wants right now: <b>${esc(wants)}</b>.</div>
+     </div>
+     <table><tr><th style="width:90px">day</th><th>full-power (ingest) windows</th><th></th></tr>${rows}</table>
+     <div style="opacity:.6;font-size:12px;margin-top:8px">Tip: leave a day with no windows to keep it minimal
+       around the clock; add 00:00–23:59 to keep it full all day.</div>`;
+}
+function _readScheduleForm() {
+  const out = { enabled: $('#schEnabled') ? $('#schEnabled').checked : false, windows: {} };
+  document.querySelectorAll('#results input[type=time]').forEach(inp => {
+    const d = inp.dataset.day, i = +inp.dataset.i, e = +inp.dataset.e;
+    (out.windows[d] = out.windows[d] || [])[i] = out.windows[d][i] || ['', ''];
+    out.windows[d][i][e] = inp.value;
+  });
+  // drop incomplete pairs (a half-filled row the user never finished)
+  for (const d of Object.keys(out.windows))
+    out.windows[d] = out.windows[d].filter(w => w && w[0] && w[1]);
+  return out;
+}
+function schAddWindow(day) {
+  SCHED = _readScheduleForm();
+  (SCHED.windows[day] = SCHED.windows[day] || []).push(['22:00', '06:00']);
+  renderSchedule();
+}
+function schDelWindow(day, i) {
+  SCHED = _readScheduleForm();
+  if (SCHED.windows[day]) SCHED.windows[day].splice(i, 1);
+  renderSchedule();
+}
+async function saveSchedule() {
+  const body = _readScheduleForm();
+  const r = await postJSON('/serving/schedule', body).catch(e => ({ ok: false, error: netErr(e) }));
+  $('#banner').innerHTML = `<div class="note">${r.ok ? '✓ schedule saved — ' + esc(r.note || '') : '✗ ' + esc(r.error || 'failed')}</div>`;
+  if (r.ok) loadSchedule();
 }
 
 async function loadSettings() {
