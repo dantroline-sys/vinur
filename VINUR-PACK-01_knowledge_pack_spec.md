@@ -1,6 +1,6 @@
 # VINUR-PACK-01 — Knowledge Packs (clean-room export / import of shareable distillates)
 
-**Status:** Draft for review · **Doc version:** 1.0 · **Date:** 2026-07-25
+**Status:** Draft for review · **Doc version:** 1.1 · **Date:** 2026-07-25
 **Component:** `python3 -m knowledgehost pack` (producer) + `import-brain` extensions (consumer)
 **Builds on:** the `.kdb` bundle machinery (`bundles.py`, manifest format 1) — packs are `.kdb`
 files with a richer manifest and a defined production method; every existing import guarantee
@@ -28,6 +28,12 @@ In scope:
 4. Optional gzip compression and optional passphrase encryption of the artifact.
 5. Import-side extensions: compressed/encrypted artifacts, sidecar hash verification, and the
    compatibility decision table with named remedies.
+6. **The consumer profile.** Import and the read path MUST remain consumable as a plain Python
+   library with zero hard dependencies (the existing ratchet), so a client application — e.g.
+   Vinkona — can import packs and serve read-only kb queries **in-process, with no host running
+   and none of the ingest/distill machinery installed as services**.  The read path already
+   degrades without an embedder (lexical/FTS retrieval); with one, dense retrieval and
+   re-embedding of foreign packs work as on a full host.
 
 Out of scope (v1 — see Appendix A):
 
@@ -217,9 +223,12 @@ Compression composes as compress-then-encrypt (§3.2).
 | `requires` non-empty      | soft | warn naming each missing pack and the import order (v1 does not enforce)    |
 | `shareable: false`        | soft | provenance warning (§5)                                                     |
 
-4. **Absorb** exactly as today: content-hash idempotent, sources rebranded to the pack id,
+4. **Bootstrap**: importing into a box with NO master kb MUST create an empty, full-schema
+   master and proceed (implemented) — the consumer profile's very first action is importing a
+   pack into nothing, and "run ingest first" is not an acceptable answer there.
+5. **Absorb** exactly as today: content-hash idempotent, sources rebranded to the pack id,
    support trust capped unless `trust='keep'`. The pack's manifest never sets its own trust.
-5. **Follow-up note** printed on success: run `link` then `adjudicate` — a pack is a seed, not
+6. **Follow-up note** printed on success: run `link` then `adjudicate` — a pack is a seed, not
    mature tissue; connectivity to the local graph grows in the first cycle.
 
 ## 9. Panel surface
@@ -245,6 +254,10 @@ job. Help entries updated. Nothing else moves.
    prints its stated warning; format-1 `.kdb` files still import unchanged.
 7. Sidecar tamper: altering the artifact after sidecar write is caught by `--verify`.
 8. Manifest v2 survives `inspect` → reserialize with unknown fields intact.
+9. Consumer bootstrap: import into a nonexistent master creates a full-schema kb and lands the
+   pack; re-import is the usual no-op; the resulting kb answers read-path queries (lexical tier
+   at minimum) with no other setup.  *(Bootstrap half implemented with this doc revision —
+   `tests/brains_test.py` virgin-box battery.)*
 
 ---
 

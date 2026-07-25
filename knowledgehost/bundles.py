@@ -314,8 +314,14 @@ def import_bundle(cfg: dict, path: str, *, name: str | None = None,
     master_path = str(Path(cfg.get("_master_kb_path")
                            or cfg["kb_path"]).expanduser())
     if not os.path.exists(master_path):
-        raise ValueError(f"no master kb at {master_path} — run ingest first "
-                         "(or copy the brain in as your kb.db)")
+        # First import on a fresh box — the consumer profile (packs, no ingest,
+        # possibly no host at all: a client using this module as a library).
+        # Bootstrap an empty master with the full schema instead of refusing;
+        # the pack becomes the box's first knowledge.
+        say(f"no master kb at {master_path} — creating an empty one "
+            "(first import bootstraps a consumer box)")
+        from .kb import KB as _KB
+        _KB({**cfg, "kb_path": master_path, "kb_encrypted": False}).close()
 
     src = _connect(str(Path(path).expanduser()))
     master = _connect(master_path)

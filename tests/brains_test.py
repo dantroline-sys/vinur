@@ -201,6 +201,24 @@ def main():
           r4["sources_new"] == 1 and node(KB(cfg_b), "n_basalt") is not None)
     b.close()
 
+    # ── consumer bootstrap: first import on a VIRGIN box creates the master ──
+    # (the consumer profile — packs, no ingest, possibly no host: a client
+    # using bundles as a library.  PACK-01 §8.)
+    cfg_v = {"kb_path": os.path.join(td, "virgin", "kb.db"),
+             "bundle_dir": os.path.join(td, "virgin", "bundles"),
+             "embed_model": cfg_a["embed_model"]}
+    rv = B.import_bundle(cfg_v, geo_kdb)
+    check("virgin box: first import bootstraps an empty master + lands the pack",
+          os.path.exists(cfg_v["kb_path"]) and rv["sources_new"] == 1)
+    v = KB(cfg_v)
+    check("bootstrapped master is a full-schema kb (nodes + cards queryable)",
+          node(v, "n_rock") is not None and
+          v.db.execute("SELECT COUNT(*) FROM procedure_cards").fetchone()[0] == 1)
+    v.close()
+    rv2 = B.import_bundle(cfg_v, geo_kdb)
+    check("virgin-box re-import is the usual no-op",
+          rv2["sources_new"] == 0)
+
     print()
     if check.failed:
         print(f"{check.failed} FAILURE(S)")
