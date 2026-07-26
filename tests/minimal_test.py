@@ -248,6 +248,42 @@ def main():
             setattr(SV, n, f)
         SUP.apply_minimal = ap0
 
+    # ── autopilot stands down during minimal (must NOT swap the model back) ───
+    import threading
+    import time as _time
+    from knowledgehost import autopilot as AP
+
+    class FakeOps:
+        def __init__(self):
+            self.started = []
+        def running(self):
+            return False
+        def start(self, cmd, args):
+            self.started.append(cmd)
+            return {"ok": True}
+        def result(self):
+            return {}
+        def status(self):
+            return {"exit_code": 0}
+
+    ap = AP.Autopilot({"serving": {"llms": [], "swap_timeout_s": 900}}, FakeOps())
+    lp0, ms1 = AP.load_plan, SV.minimal_state
+    AP.load_plan = lambda cfg: {"enabled": True, "idle_interval_s": 60,
+                                "respect_leases": False, "auto_models": True,
+                                "steps": [{"command": "distill", "enabled": True,
+                                           "args": {}, "min_interval_s": 0}]}
+    try:
+        check("_minimal_on reflects the flag",
+              (setattr(SV, "minimal_state", lambda: {"on": True}) or ap._minimal_on()) is True
+              and (setattr(SV, "minimal_state", lambda: {}) or ap._minimal_on()) is False)
+        SV.minimal_state = lambda: {"on": True}          # minimal engaged
+        t = threading.Thread(target=ap._loop, daemon=True)
+        t.start(); _time.sleep(0.3); ap.stop(); t.join(timeout=2)
+        check("autopilot PAUSES during minimal — never launches a step (no model swap)",
+              ap.ops.started == [] and "minimal" in ap._state["last_reason"])
+    finally:
+        AP.load_plan, SV.minimal_state = lp0, ms1
+
     print()
     if check.failed:
         print(f"{check.failed} FAILURE(S)")

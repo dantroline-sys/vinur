@@ -25,6 +25,11 @@ it holds the LM leases (lm_fast / lm_big); with respect_leases on, the autopilot
 stands down so the two never fight over the GPUs — the mirror of the assistant's
 'pause idle work' button.
 
+Minimal mode (the manual switch or the weekly schedule vacated all VRAM to serve
+the KB only): the autopilot PAUSES entirely.  Its steps need the big LM, and with
+auto_models on a step would otherwise swap it back in (ensure_active un-holds it) —
+silently undoing minimal.  So the ingest a schedule 'turns off' really is off.
+
 Exclusive models (a box whose big LMs can't co-reside): with auto_models on
 (the default) each step swaps in the model its verb's LM lane points at
 (auto_model — distill/refine → the distill_urls entry; link/adjudicate follow
@@ -246,6 +251,19 @@ class Autopilot:
         except Exception:                           # pragma: no cover
             return False
 
+    def _minimal_on(self) -> bool:
+        """Minimal mode = the big LM is deliberately stopped and its VRAM freed
+        (manual switch or the weekly schedule).  The autopilot MUST stand down:
+        its steps need the big LM, and with auto_models on a step would otherwise
+        SWAP THE MODEL BACK IN (ensure_active un-holds it) — silently undoing
+        minimal.  Pausing here is the single gate that keeps ingest off the GPU
+        during a minimal window."""
+        try:
+            from . import serving as _sv
+            return bool(_sv.minimal_state().get("on"))
+        except Exception:                           # pragma: no cover
+            return False
+
     def _loop(self):
         log.info("autopilot thread started")
         while not self._stop.is_set():
@@ -254,6 +272,11 @@ class Autopilot:
                 if not plan.get("enabled"):
                     self._state.update(running_step=None, last_reason="disabled")
                     self._sleep(5)
+                    continue
+                if self._minimal_on():             # VRAM vacated (switch/schedule) — no ingest
+                    self._state.update(running_step=None,
+                                       last_reason="paused — minimal mode (VRAM vacated for serving)")
+                    self._sleep(min(30, plan["idle_interval_s"]))
                     continue
                 if self.ops.running():              # a manual job owns the single slot
                     self._state["last_reason"] = "a manual job is running"
