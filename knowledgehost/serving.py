@@ -950,11 +950,22 @@ def _in_full_window(windows: dict, dow: int, cur: int) -> bool:
 
 def schedule_wants_minimal(sched: dict, now) -> bool | None:
     """Given the weekly schedule and a datetime, does minimal mode belong ON now
-    (True), OFF (False), or is the schedule disabled (None)?  Minimal is the
-    default OUTSIDE the FULL-power windows."""
+    (True), OFF (False), or is the schedule NOT GOVERNING (None)?  Minimal is the
+    default OUTSIDE the FULL-power windows.
+
+    Not-governing (None) covers two cases: the schedule is disabled, OR it is
+    enabled but has NO windows configured on ANY day.  The second is a half-set
+    schedule (enabled the feature, never added a window) — treating that as "always
+    outside a window → always minimal" would silently park ingest and the
+    Prioritizer forever, which is never what a blank schedule means.  A single day
+    left empty while others have windows still means minimal on that day; only the
+    all-empty case opts out entirely.  If a user truly wants round-the-clock
+    minimal, that is the manual switch, not a windowless schedule."""
     if not sched.get("enabled"):
         return None
     windows = sched.get("windows") if isinstance(sched.get("windows"), dict) else {}
+    if not any(windows.get(d) for d in _DAYS):
+        return None
     return not _in_full_window(windows, now.weekday(), now.hour * 60 + now.minute)
 
 

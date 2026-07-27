@@ -207,6 +207,14 @@ def main():
     check("schedule: disabled -> None (not governing)",
           SV.schedule_wants_minimal({"enabled": False, "windows": W["windows"]},
                                     wed.replace(hour=12)) is None)
+    # The footgun that parks the Prioritizer: enabling the schedule before adding
+    # any window must NOT read as "always outside a window -> always minimal".
+    check("schedule: enabled but NO windows anywhere -> None (not governing, not minimal)",
+          SV.schedule_wants_minimal({"enabled": True, "windows": {}}, wed.replace(hour=12)) is None
+          and SV.schedule_wants_minimal({"enabled": True}, wed.replace(hour=12)) is None)
+    check("schedule: one populated day keeps governing (empty guard is all-days-only)",
+          SV.schedule_wants_minimal({"enabled": True, "windows": {"wed": [["09:00", "17:00"]]}},
+                                    wed.replace(hour=12)) is False)
 
     # ── clean_schedule: validate + normalise + drop junk ─────────────────────
     cl = SV.clean_schedule({"enabled": 1, "windows": {
@@ -281,6 +289,18 @@ def main():
         t.start(); _time.sleep(0.3); ap.stop(); t.join(timeout=2)
         check("autopilot PAUSES during minimal — never launches a step (no model swap)",
               ap.ops.started == [] and "minimal" in ap._state["last_reason"])
+        # the pause reason names WHICH lever stopped it, so the tab is diagnostic
+        rs0, sw0 = SV.read_schedule, SV.schedule_wants_minimal
+        try:
+            SV.read_schedule = lambda: {"enabled": True}
+            SV.schedule_wants_minimal = lambda s, n: True
+            check("pause reason blames the schedule when it wants minimal now",
+                  "schedule" in ap._minimal_reason())
+            SV.schedule_wants_minimal = lambda s, n: None
+            check("pause reason blames the manual switch when the schedule isn't governing",
+                  "manual switch" in ap._minimal_reason())
+        finally:
+            SV.read_schedule, SV.schedule_wants_minimal = rs0, sw0
     finally:
         AP.load_plan, SV.minimal_state = lp0, ms1
 

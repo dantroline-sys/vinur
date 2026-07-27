@@ -1935,8 +1935,11 @@ function renderSchedule() {
   const m = SCHED_META, on = !!(m.minimal || {}).on;
   const postureNow = on ? '<b style="color:#b26a00">MINIMAL</b> (VRAM freed, KB served)'
                         : '<b style="color:#2e7d32">FULL</b> (serving + ingest)';
+  const anyWin = Object.keys(SCHED.windows || {}).some(d => (SCHED.windows[d] || []).length);
   const wants = m.wants === true ? 'minimal (out of window)'
-              : m.wants === false ? 'full-power (in a window)' : 'not governing (disabled)';
+              : m.wants === false ? 'full-power (in a window)'
+              : SCHED.enabled ? 'not governing — enabled but no windows set anywhere'
+              : 'not governing (disabled)';
   const dayName = (SCHED_DAYS[(m.now || {}).dow] || [, ''])[1];
   const tz = (m.now || {}).tz ? `${esc(m.now.tz)} ${esc(m.now.offset || '')}` : '';
   // The diagnostic Dan needs: does what the schedule WANTS match the box's posture?
@@ -1959,7 +1962,11 @@ function renderSchedule() {
       <td>${cells || '<span style="opacity:.45">minimal all day</span>'} </td>
       <td><button class="toolbtn" onclick="schAddWindow('${k}')">+ window</button></td></tr>`;
   }).join('');
-  const warn = disagree
+  const warn = (SCHED.enabled && !anyWin)
+    ? `<div class="note" style="margin:6px 0">⚠ Schedule is <b>enabled but has no windows</b> on any day, so it
+         is <b>not governing</b> — the box follows the manual switch and the Prioritizer runs as normal. Add at
+         least one full-power window below (or turn the schedule off) to drive minimal mode by the clock.</div>`
+    : disagree
     ? `<div class="note" style="margin:6px 0">⚠ The schedule wants <b>${esc(wants)}</b> but the box is
          <b>${on ? 'minimal' : 'full'}</b>. The supervisor reconciles within ~30 s of a boundary — if this
          persists, the schedule timer isn't running (is the supervisor up, and running this build?), or the

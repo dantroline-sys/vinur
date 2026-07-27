@@ -264,6 +264,20 @@ class Autopilot:
         except Exception:                           # pragma: no cover
             return False
 
+    def _minimal_reason(self) -> str:
+        """Why the prioritizer is parked — named so the Prioritizer tab tells the
+        user WHICH lever stopped it (the weekly schedule vs. the manual switch) and
+        where to change it, instead of a bare "paused"."""
+        base = "paused — minimal mode: VRAM freed for other GPU work, still serving the KB"
+        try:
+            from datetime import datetime
+            from . import serving as _sv
+            if _sv.schedule_wants_minimal(_sv.read_schedule(), datetime.now()):
+                return base + " (the weekly schedule wants minimal now — Serving › Schedule)"
+        except Exception:                           # pragma: no cover
+            pass
+        return base + " (manual switch — './vinur.sh minimal off' to resume ingest)"
+
     def _loop(self):
         log.info("autopilot thread started")
         while not self._stop.is_set():
@@ -274,8 +288,7 @@ class Autopilot:
                     self._sleep(5)
                     continue
                 if self._minimal_on():             # VRAM vacated (switch/schedule) — no ingest
-                    self._state.update(running_step=None,
-                                       last_reason="paused — minimal mode (VRAM vacated for serving)")
+                    self._state.update(running_step=None, last_reason=self._minimal_reason())
                     self._sleep(min(30, plan["idle_interval_s"]))
                     continue
                 if self.ops.running():              # a manual job owns the single slot
