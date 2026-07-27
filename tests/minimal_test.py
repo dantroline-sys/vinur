@@ -284,6 +284,20 @@ def main():
     finally:
         AP.load_plan, SV.minimal_state = lp0, ms1
 
+    # ── 'no endpoint' error is honest when a process IS up (the false-negative) ──
+    from knowledgehost import distill as D
+    ums = SV.up_llm_urls
+    try:
+        SV.up_llm_urls = lambda cfg: []
+        check("endpoint_down_hint: nothing running -> 'start one first.'",
+              D.endpoint_down_hint({}) == "start one first.")
+        SV.up_llm_urls = lambda cfg: [("big", "http://127.0.0.1:11438")]
+        h = D.endpoint_down_hint({})
+        check("endpoint_down_hint: a live process -> names it, points at model-name/loading",
+              "IS running" in h and "model name" in h and "start one first" not in h)
+    finally:
+        SV.up_llm_urls = ums
+
     print()
     if check.failed:
         print(f"{check.failed} FAILURE(S)")

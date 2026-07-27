@@ -1907,24 +1907,46 @@ async function saveAutopilot() {
 const SCHED_DAYS = [['mon', 'Monday'], ['tue', 'Tuesday'], ['wed', 'Wednesday'],
                     ['thu', 'Thursday'], ['fri', 'Friday'], ['sat', 'Saturday'],
                     ['sun', 'Sunday']];
-let SCHED = { enabled: false, windows: {} }, SCHED_META = {};
+let SCHED = { enabled: false, windows: {} }, SCHED_META = {}, SCHED_CLOCK = null;
 async function loadSchedule() {
   $('#banner').innerHTML = ''; $('#results').className = ''; $('#results').textContent = 'loading schedule…';
   let r; try { r = await (await authFetch('/serving/schedule')).json(); } catch (e) { $('#results').textContent = 'request failed: ' + e; return; }
   if (!r.ok) { $('#results').className = 'empty'; $('#results').textContent = 'enter the auth token above to edit the schedule'; return; }
   SCHED = r.schedule && r.schedule.windows ? r.schedule : { enabled: !!(r.schedule || {}).enabled, windows: {} };
   if (!SCHED.windows) SCHED.windows = {};
-  SCHED_META = { now: r.now || {}, minimal: r.minimal || {}, wants: r.wants_minimal };
+  SCHED_META = { now: r.now || {}, minimal: r.minimal || {}, wants: r.wants_minimal, at: Date.now() };
   renderSchedule();
+}
+// A ticking box-clock: seed from the server's reported time + elapsed since the
+// fetch, so the displayed clock is the BOX's wall time (with its timezone) — the
+// one the schedule is actually evaluated against.
+function schClockNow() {
+  const n = SCHED_META.now || {};
+  if (n.clock == null) return '';
+  const [h, m, s] = n.clock.split(':').map(Number);
+  const base = (h * 3600 + m * 60 + (s || 0)) * 1000;
+  const t = new Date(base + (Date.now() - (SCHED_META.at || Date.now())));
+  const hh = String(t.getUTCHours() % 24).padStart(2, '0');
+  const mm = String(t.getUTCMinutes()).padStart(2, '0');
+  const ss = String(t.getUTCSeconds()).padStart(2, '0');
+  return `${hh}:${mm}:${ss}`;
 }
 function renderSchedule() {
   const m = SCHED_META, on = !!(m.minimal || {}).on;
-  const postureNow = on ? '<b style="color:#999">MINIMAL</b> (VRAM freed, KB served)'
+  const postureNow = on ? '<b style="color:#b26a00">MINIMAL</b> (VRAM freed, KB served)'
                         : '<b style="color:#2e7d32">FULL</b> (serving + ingest)';
   const wants = m.wants === true ? 'minimal (out of window)'
               : m.wants === false ? 'full-power (in a window)' : 'not governing (disabled)';
-  const nowStr = m.now && m.now.hhmm != null
-    ? `${(SCHED_DAYS[m.now.dow] || [, '?'])[1]} ${esc(m.now.hhmm)}` : '';
+  const dayName = (SCHED_DAYS[(m.now || {}).dow] || [, ''])[1];
+  const tz = (m.now || {}).tz ? `${esc(m.now.tz)} ${esc(m.now.offset || '')}` : '';
+  // The diagnostic Dan needs: does what the schedule WANTS match the box's posture?
+  // If enabled and they disagree for more than a tick, the supervisor timer isn't acting.
+  const disagree = SCHED.enabled && m.wants != null && (!!m.wants !== on);
+  const clockLine = (m.now || {}).clock != null
+    ? `<div style="font-size:15px;margin-bottom:4px">🕐 Box clock:
+         <b><span id="schclock">${esc(schClockNow())}</span></b>
+         ${dayName ? esc(dayName) : ''} <span style="opacity:.7">${tz}</span>
+         &nbsp;·&nbsp; posture now: ${postureNow}</div>` : '';
   const rows = SCHED_DAYS.map(([k, lbl]) => {
     const wins = (SCHED.windows[k] || []);
     const cells = wins.map((w, i) =>
@@ -1937,20 +1959,34 @@ function renderSchedule() {
       <td>${cells || '<span style="opacity:.45">minimal all day</span>'} </td>
       <td><button class="toolbtn" onclick="schAddWindow('${k}')">+ window</button></td></tr>`;
   }).join('');
+  const warn = disagree
+    ? `<div class="note" style="margin:6px 0">⚠ The schedule wants <b>${esc(wants)}</b> but the box is
+         <b>${on ? 'minimal' : 'full'}</b>. The supervisor reconciles within ~30 s of a boundary — if this
+         persists, the schedule timer isn't running (is the supervisor up, and running this build?), or the
+         box clock/timezone above isn't what you expected.</div>` : '';
   $('#results').innerHTML =
-    `<div style="margin:6px 0 12px;font-size:13px">
+    `${clockLine}${warn}
+     <div style="margin:6px 0 12px;font-size:13px">
        <label><input type="checkbox" id="schEnabled" ${SCHED.enabled ? 'checked' : ''}> <b>Schedule enabled</b></label>
-       ${nowStr ? `&nbsp;·&nbsp; now: ${nowStr} &nbsp;·&nbsp; posture: ${postureNow}` : ''}
+       &nbsp;·&nbsp; schedule wants right now: <b>${esc(wants)}</b>
        <div style="opacity:.65;margin-top:6px;max-width:820px">Each <b>window</b> is a FULL-POWER stretch: the
          big model is up and the Prioritizer's ingest/distill runs. OUTSIDE every window the box drops to
          <b>minimal mode</b> — all VRAM freed for your other GPU work — while still answering kb_ask / kb_search
-         for Vinkona. A window whose end is earlier than its start runs <b>overnight</b> into the next day
-         (e.g. 22:00–06:00). The supervisor applies changes within ~30 s; a manual override on the Models tab
-         holds until the next window boundary. Schedule wants right now: <b>${esc(wants)}</b>.</div>
+         for Vinkona. Times are the <b>box's local clock</b> (shown above with its timezone) — if that isn't your
+         wall-clock time, set the box's timezone or offset the windows. A window whose end is earlier than its
+         start runs <b>overnight</b> into the next day (e.g. 22:00–06:00). The supervisor applies changes within
+         ~30 s; a manual override on the Models tab holds until the next window boundary.</div>
      </div>
      <table><tr><th style="width:90px">day</th><th>full-power (ingest) windows</th><th></th></tr>${rows}</table>
      <div style="opacity:.6;font-size:12px;margin-top:8px">Tip: leave a day with no windows to keep it minimal
        around the clock; add 00:00–23:59 to keep it full all day.</div>`;
+  // tick the box clock once a second while the tab is open
+  if (SCHED_CLOCK) clearInterval(SCHED_CLOCK);
+  SCHED_CLOCK = setInterval(() => {
+    const el = $('#schclock');
+    if (!el || active !== 'schedule') { clearInterval(SCHED_CLOCK); SCHED_CLOCK = null; return; }
+    el.textContent = schClockNow();
+  }, 1000);
 }
 function _readScheduleForm() {
   const out = { enabled: $('#schEnabled') ? $('#schEnabled').checked : false, windows: {} };

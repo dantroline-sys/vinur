@@ -392,11 +392,17 @@ class Handler(BaseHTTPRequestHandler):
             from . import serving as sv
             sched = sv.read_schedule()
             now = datetime.now()
+            loc = now.astimezone()                       # the box's local tz (what the
+            #                                              schedule is evaluated against)
             return self._send_json(
                 {"ok": True, "schedule": sched,
                  "minimal": sv.minimal_state(),          # current live posture
-                 # server-local clock so the editor can show "now" against the grid
-                 "now": {"dow": now.weekday(), "hhmm": now.strftime("%H:%M")},
+                 # server-local clock so the editor can show "now" against the grid —
+                 # tz included so a UTC-vs-wall-clock mismatch (a classic "timer fires at
+                 # the wrong hour" cause) is visible at a glance
+                 "now": {"dow": now.weekday(), "hhmm": now.strftime("%H:%M"),
+                         "clock": now.strftime("%H:%M:%S"),
+                         "tz": loc.strftime("%Z") or "local", "offset": loc.strftime("%z")},
                  "wants_minimal": sv.schedule_wants_minimal(sched, now)})
         if path == "/serving/status":              # Serving tab: models + weights + state
             if not self._authed():

@@ -204,20 +204,21 @@ def _run_link(cfg, log, *, limit=None, top_k=None, fast=False) -> int:
     """Phase 1 graph linkage: type structural edges (is_a/requires/part_of/alternative/
     related) between card-bearing concepts and their embedding-neighbours, via an LM.
     KB-only + one LM endpoint; resumable (judged pairs are checkpointed) and lease-aware
-    (yields the matching GPU while Vinkona is using it).  --fast routes to the 9B (4090) —
+    (yields the matching GPU while Vinkona is using it).  --fast routes to the extractor LM —
     relation-typing is well within its range and it clears the sweep far quicker than the
-    big LM (3090).  Build the ANN index first for speed at scale."""
+    big verifier LM.  Build the ANN index first for speed at scale."""
     from . import distill as distill_mod
     from . import link as link_mod
     from . import lm_lease
     endpoints = distill_mod.fast_endpoints if fast else distill_mod.verify_endpoints
     lease = lm_lease.FAST if fast else lm_lease.BIG
-    tier = "fast 9B (4090)" if fast else "big LM (3090)"
+    tier = "fast extractor LM" if fast else "big verifier LM"
     urls_hint = (cfg.get("extract_urls") if fast
                  else (cfg.get("verify_urls") or cfg.get("distill_urls"))) or []
     live = endpoints(cfg, log)
     if not live:
-        log.error("no %s endpoint up — start one (%s) first.", tier, ", ".join(urls_hint))
+        log.error("no %s answered (%s) — %s", tier, ", ".join(urls_hint),
+                  distill_mod.endpoint_down_hint(cfg))
         return 1
     log.info("link: using the %s", tier)
     kb = KB(cfg)
@@ -251,8 +252,9 @@ def _run_refine(cfg, store, embedder, log, *, limit=None, force=False) -> int:
         return 1
     big = distill_mod.verify_endpoints(cfg, log)
     if not big:
-        log.error("no big-LM endpoint up — start one (verify_urls=%s) first.",
-                  ", ".join(cfg.get("verify_urls") or cfg.get("distill_urls") or []))
+        log.error("no big verifier LM answered (%s) — %s",
+                  ", ".join(cfg.get("verify_urls") or cfg.get("distill_urls") or []),
+                  distill_mod.endpoint_down_hint(cfg))
         store.close()
         return 1
     lm = big[0]
@@ -429,8 +431,9 @@ def _run_recard(cfg, store, embedder, log, *, limit=None, bundle=None,
         return 1
     big = distill_mod.verify_endpoints(cfg)
     if not big:
-        log.error("no big-LM endpoint up (%s) — start one first.",
-                  ", ".join(cfg.get("verify_urls") or cfg.get("distill_urls") or []))
+        log.error("no big verifier LM answered (%s) — %s",
+                  ", ".join(cfg.get("verify_urls") or cfg.get("distill_urls") or []),
+                  distill_mod.endpoint_down_hint(cfg))
         return 1
     # verify_endpoints builds clients with the VERDICT budget (verify_max_tokens,
     # 1024) — this sweep emits procedure/criteria payloads, so re-stamp the
@@ -464,15 +467,15 @@ def _run_adjudicate(cfg, log, *, limit=None, batch=8, watch=False, interval=30,
     """Drain the node-merge queue.  A deterministic pre-pass (auto_resolve) first clears
     the lexically-obvious pairs without any LM — merging plural/exact duplicates, adding
     is_a for token-subsets, and deferring the weak tail — so the LM only judges the thin
-    ambiguous band that remains.  --fast routes that residual to the fast 9B (4090) instead
-    of the big LM (3090): same/distinct on synonyms is well within its range and it clears
+    ambiguous band that remains.  --fast routes that residual to the fast extractor LM instead
+    of the big verifier LM: same/distinct on synonyms is well within its range and it clears
     the queue far quicker.  Resumable and lease-aware (yielding the matching GPU)."""
     from . import adjudicate as adj
     from . import distill as distill_mod
     from . import lm_lease
     endpoints = distill_mod.fast_endpoints if fast else distill_mod.verify_endpoints
     lease = lm_lease.FAST if fast else lm_lease.BIG
-    tier = "fast 9B (4090)" if fast else "big LM (3090)"
+    tier = "fast extractor LM" if fast else "big verifier LM"
     urls_hint = (cfg.get("extract_urls") if fast
                  else (cfg.get("verify_urls") or cfg.get("distill_urls"))) or []
     kb = KB(cfg)
@@ -494,8 +497,8 @@ def _run_adjudicate(cfg, log, *, limit=None, batch=8, watch=False, interval=30,
                                 tier, interval)
                     time.sleep(interval)
                     continue
-                log.error("no %s endpoint up (%s) — start it first.",
-                          tier, ", ".join(urls_hint))
+                log.error("no %s answered (%s) — %s", tier, ", ".join(urls_hint),
+                          distill_mod.endpoint_down_hint(cfg))
                 rc = 1
                 break
             log.info("adjudicating residual with the %s", tier)
@@ -967,7 +970,7 @@ def main(argv=None):
     ap.add_argument("--auto-only", action="store_true",
                     help="adjudicate: run ONLY the deterministic pre-pass, no LM")
     ap.add_argument("--fast", action="store_true",
-                    help="adjudicate/link: use the fast 9B (4090) instead of the big LM (3090)")
+                    help="adjudicate/link: use the fast extractor LM instead of the big verifier LM")
     ap.add_argument("--path", help="import-conceptnet/import-bundle: path to the input file")
     ap.add_argument("--name", help="import-bundle: bundle name to absorb the file under "
                                    "(default: its manifest name, else the file stem)")

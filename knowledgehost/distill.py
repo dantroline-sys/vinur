@@ -2008,8 +2008,29 @@ def healthy_endpoints(cfg, urls=None, overrides=None, log=None) -> list:
     return live
 
 
+def endpoint_down_hint(cfg) -> str:
+    """Tail for a 'no endpoint answered' error: distinguish NOTHING RUNNING from
+    a process that IS up but failed the warmup — the latter is almost always a
+    served-model-name mismatch (the box serves 'big' but distill_model/verify_model
+    is still a GGUF filename) or a model mid-load, NOT a reason to 'start it first'.
+    Consults the supervisor's live process list, so it never says 'start one' while
+    something is serving."""
+    try:
+        from .serving import up_llm_urls
+        up = up_llm_urls(cfg)
+    except Exception:
+        up = []
+    if not up:
+        return "start one first."
+    names = ", ".join(f"llm-{n} ({u})" for n, u in up)
+    return (f"but {names} IS running — the endpoint just didn't answer a warmup "
+            "chat. It may still be loading, or (most often) the served model name "
+            "doesn't match distill_model / verify_model — set those (or the "
+            "server's served_model_name) to match; see var/log/<service>.log.")
+
+
 def fast_endpoints(cfg, log=None) -> list:
-    """The fast EXTRACTOR tier (e.g. Qwen3.5-9B on the 4090)."""
+    """The fast EXTRACTOR tier (e.g. a small instruct model)."""
     return healthy_endpoints(cfg, cfg.get("extract_urls") or [], log=log, overrides={
         "distill_model": cfg.get("extract_model") or cfg["distill_model"],
         "distill_timeout_s": cfg.get("extract_timeout_s", cfg["distill_timeout_s"]),
@@ -2017,7 +2038,7 @@ def fast_endpoints(cfg, log=None) -> list:
 
 
 def verify_endpoints(cfg, log=None) -> list:
-    """The big VERIFIER tier (defaults to the distill_urls 32B)."""
+    """The big VERIFIER tier (defaults to the distill_urls big LM)."""
     urls = cfg.get("verify_urls") or cfg.get("distill_urls") or [cfg["distill_url"]]
     return healthy_endpoints(cfg, urls, log=log, overrides={
         "distill_model": cfg.get("verify_model") or cfg["distill_model"],
