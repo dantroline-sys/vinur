@@ -864,6 +864,7 @@ def main():
     import io as _io
     import urllib.error as _ue
     dl = D.DistillLM({"distill_url": "http://x", "distill_model": "m", "distill_timeout_s": 5})
+    dl._ctx_cached = 0          # this test exercises error-mapping, not context fitting — skip /v1/models
     dl._post = lambda payload: (_ for _ in ()).throw(_ue.HTTPError(
         "http://x", 400, "Bad Request", None, _io.BytesIO(b"maximum context length exceeded")))
     try:
@@ -884,6 +885,80 @@ def main():
     except D.BackendUnavailable as e:
         assert not e.permanent, "timeout stays transient"
     ok("DistillLM._content: 4xx -> permanent (body in message); 5xx/timeout -> transient")
+
+    # ── max_tokens is fitted to the model context (the distill_max_tokens==ctx 400) ──
+    import http.server as _hs
+    import threading as _th
+
+    class _CtxLM(_hs.BaseHTTPRequestHandler):
+        expose_len = True                        # class flags toggled per case
+        ctx = 16384
+        last_max = None
+
+        def log_message(self, *a):
+            pass
+
+        def _send(self, code, obj):
+            b = json.dumps(obj).encode()
+            self.send_response(code)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(b)))
+            self.end_headers()
+            self.wfile.write(b)
+
+        def do_GET(self):                        # /v1/models
+            d = {"id": "m"}
+            if _CtxLM.expose_len:
+                d["max_model_len"] = _CtxLM.ctx
+            self._send(200, {"data": [d]})
+
+        def do_POST(self):                       # /v1/chat/completions
+            n = int(self.headers.get("Content-Length", 0))
+            req = json.loads(self.rfile.read(n) or b"{}")
+            _CtxLM.last_max = int(req.get("max_tokens", 0))
+            if _CtxLM.last_max >= _CtxLM.ctx:    # no room for any prompt -> the real vLLM 400
+                self._send(400, {"error": {"message":
+                    f"This model's maximum context length is {_CtxLM.ctx} tokens. "
+                    f"However, you requested {_CtxLM.last_max} output tokens."}})
+                return
+            self._send(200, {"choices": [{"message": {"content": '{"ok": true}'}}]})
+
+    csrv = _hs.ThreadingHTTPServer(("127.0.0.1", 0), _CtxLM)
+    _th.Thread(target=csrv.serve_forever, daemon=True).start()
+    cbase = f"http://127.0.0.1:{csrv.server_address[1]}"
+    try:
+        # proactive: server advertises max_model_len -> clamp BEFORE sending (no 400)
+        _CtxLM.expose_len = True
+        _CtxLM.last_max = None
+        lmc = D.DistillLM({"distill_url": cbase, "distill_model": "m",
+                           "distill_timeout_s": 5, "distill_max_tokens": 16384})
+        outc = lmc._content("sys", "user", {}, 16384)
+        assert outc is not None, "clamped request should succeed"
+        assert lmc._ctx() == 16384 and _CtxLM.last_max < 16384, (lmc._ctx(), _CtxLM.last_max)
+        ok("DistillLM: max_tokens clamped to the advertised model context (no overflow)")
+
+        # reactive: server hides max_model_len -> first request overflows, retry learns it
+        _CtxLM.expose_len = False
+        _CtxLM.last_max = None
+        lmr = D.DistillLM({"distill_url": cbase, "distill_model": "m",
+                           "distill_timeout_s": 5, "distill_max_tokens": 16384})
+        outr = lmr._content("sys", "user", {}, 16384)
+        assert outr is not None, "retry after learning the window should succeed"
+        assert lmr._ctx_cached == 16384, lmr._ctx_cached
+        ok("DistillLM: context-overflow 400 learned from the server message, retried once")
+
+        # a prompt too big for the window -> permanent + actionable (not an opaque 400)
+        lmb = D.DistillLM({"distill_url": cbase, "distill_model": "m",
+                           "distill_timeout_s": 5, "distill_max_tokens": 4096,
+                           "distill_ctx": 1000})
+        try:
+            lmb._content("x" * 6000, "y" * 6000, {}, 4096)
+            assert False, "must raise"
+        except D.BackendUnavailable as e:
+            assert e.permanent and "too big" in str(e).lower(), e
+        ok("DistillLM: prompt larger than the window -> permanent, actionable error")
+    finally:
+        csrv.shutdown()
 
     # ── a truncated pass salvages concepts AND flags the chunk for recard ────────
     dlt = D.DistillLM({"distill_url": "http://x", "distill_model": "m",

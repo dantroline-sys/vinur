@@ -157,8 +157,13 @@ DEFAULTS = {
     # (16k+ vLLM) set 8192: it's a cap, not a target — chunks that finish
     # early cost the same, and the "truncated — salvaged N concept(s)" warning
     # means tail concepts are being silently dropped.  Keep prompt (~3k) +
-    # this ≤ the server's max_model_len, or vLLM rejects the request.
+    # this ≤ the server's max_model_len.  You no longer have to keep that by hand:
+    # DistillLM caps max_tokens to (context − prompt − margin) automatically, so an
+    # over-set value is clamped to fit rather than 400-rejected (which drops the chunk).
     "distill_max_tokens": 3072,
+    # Model context window (max_model_len).  0 = auto-discover from the server's
+    # /v1/models (vLLM reports it); set explicitly only for a server that doesn't.
+    "distill_ctx": 0,
     # Requests kept in flight PER distill/extract/verify endpoint.  0 = auto:
     # an endpoint this box serves with a batching engine ([[serving.llms]]
     # engine = "vllm"/"container") gets 8 (capped by that entry's

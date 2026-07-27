@@ -22,6 +22,7 @@ import copy
 import fnmatch
 import json
 import logging
+import re
 import threading
 import time
 import urllib.error
@@ -758,6 +759,15 @@ _NARR_FAMILY = {
 }
 
 
+# max_tokens is the OUTPUT budget; an OpenAI-style server counts prompt+output
+# against one window and 400-rejects the whole request when they don't fit.  We
+# over-estimate the prompt (chars/3) and keep this much headroom for the chat
+# template + grammar preamble, so a big distill_max_tokens is capped to fit rather
+# than sent as-is (which drops the chunk as a "permanent" 4xx veto).
+_CTX_MARGIN_TOK = 512
+_MIN_OUTPUT_TOK = 256          # below this an extraction reply is useless
+
+
 class DistillLM:
     """OpenAI /v1/chat/completions client for the big reasoning model."""
 
@@ -766,6 +776,8 @@ class DistillLM:
         self.model = cfg["distill_model"]
         self.timeout = cfg["distill_timeout_s"]
         self.max_tokens = cfg.get("distill_max_tokens", 3072)
+        self.cfg_ctx = int(cfg.get("distill_ctx", 0) or 0)   # 0 = auto-discover from /v1/models
+        self._ctx_cached: int | None = None
         self._name_checked = False
 
     def _served_ids(self) -> list:
@@ -775,6 +787,52 @@ class DistillLM:
             return [str(d.get("id")) for d in (data.get("data") or []) if d.get("id")]
         except Exception:               # any shape/transport surprise → "don't know"
             return []
+
+    def _discover_ctx(self) -> int:
+        """The served model's context length — vLLM reports max_model_len on
+        /v1/models.  0 when the server doesn't advertise one (e.g. plain
+        llama-server); the reactive retry in _content covers that case."""
+        try:
+            with urllib.request.urlopen(f"{self.url}/v1/models", timeout=5) as r:
+                entries = (json.loads(r.read()).get("data") or [])
+        except Exception:
+            return 0
+        for d in entries:                       # prefer the model we actually call
+            if str(d.get("id")) == self.model and d.get("max_model_len"):
+                return int(d["max_model_len"])
+        for d in entries:
+            if d.get("max_model_len"):
+                return int(d["max_model_len"])
+        return 0
+
+    def _ctx(self) -> int:
+        """Model context window: the configured distill_ctx, else discovered once
+        and cached (0 = unknown → don't clamp, lean on the reactive retry)."""
+        if self._ctx_cached is None:
+            self._ctx_cached = self.cfg_ctx if self.cfg_ctx > 0 else self._discover_ctx()
+        return self._ctx_cached
+
+    def _fit_output(self, system: str, user: str, want: int) -> int:
+        """Cap the output budget so prompt+output fit the context window.  A
+        distill_max_tokens set at (or near) the model's context leaves no room for
+        the prompt; the server then 400-rejects the request, and a 4xx is treated as
+        a permanent veto that DROPS the chunk — so an over-set knob silently loses
+        good chunks.  If even a minimal reply won't fit, the chunk is genuinely too
+        big: raise a permanent error with an actionable reason instead of an opaque
+        server 400."""
+        ctx = self._ctx()
+        if ctx <= 0:
+            return want                         # unknown window → reactive retry handles it
+        est_in = (len(system) + len(user)) // 3 + _CTX_MARGIN_TOK
+        room = ctx - est_in
+        if room < _MIN_OUTPUT_TOK:
+            exc = BackendUnavailable(
+                f"distill prompt (~{est_in} tok incl. margin) leaves only {room} tok for "
+                f"output in a {ctx}-tok context — chunk too big for this model; reduce "
+                f"chunk size, lower distill_max_tokens, or serve a larger context")
+            exc.permanent = True
+            raise exc
+        return max(_MIN_OUTPUT_TOK, min(want, room))
 
     def _post(self, payload: dict):
         def go(body: dict):
@@ -828,9 +886,11 @@ class DistillLM:
         except (urllib.error.URLError, OSError, ValueError, TimeoutError):
             return False
 
-    def _content(self, system: str, user: str, schema: dict, max_tokens: int):
+    def _content(self, system: str, user: str, schema: dict, max_tokens: int,
+                 _retry: bool = False):
         """Raw assistant content for a grammar-constrained chat, or None if the
         response has no content.  Raises BackendUnavailable on transport failure."""
+        max_tokens = self._fit_output(system, user, max_tokens)
         payload = {
             "model": self.model,
             "messages": [{"role": "system", "content": system},
@@ -852,6 +912,17 @@ class DistillLM:
                 body = (e.read() or b"").decode("utf-8", "replace")[:300]
             except Exception:
                 pass
+            # Context overflow on a server that didn't advertise its window: it just
+            # told us the real limit — learn it and retry ONCE, now that _fit_output
+            # can size the output budget to fit.  The net for llama-server et al.
+            if e.code == 400 and not _retry:
+                m = re.search(r"maximum context length is (\d+)", body)
+                if m:
+                    self._ctx_cached = int(m.group(1))
+                    log.warning("distill: output budget overflowed the model context — "
+                                "refitting to the server's %d-tok window and retrying once",
+                                self._ctx_cached)
+                    return self._content(system, user, schema, max_tokens, _retry=True)
             permanent = 400 <= e.code < 500 and e.code not in (408, 425, 429)
             exc = BackendUnavailable(
                 f"distill LM {'rejected this request (a retry cannot help)' if permanent else 'unreachable'}: "
