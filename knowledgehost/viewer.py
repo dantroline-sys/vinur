@@ -673,6 +673,7 @@ async function load(kind) {
 // ingested docs the distiller hasn't reached (invisible to the registry)
 let SRCBUNDLE = '';                    // sources view: the selected bundle filter
 function srcBundlePick(b) { SRCBUNDLE = b; load('sources'); }
+let PENDROWS = [];      // queued (undistilled) docs, index-keyed for deleteQueued
 function renderSources(rows, pending, totals, bundles) {
   rows = rows || []; pending = pending || []; totals = totals || {}; bundles = bundles || {};
   // per-bundle counts FIRST: the registry lists newest-first with a row cap,
@@ -710,7 +711,7 @@ function renderSources(rows, pending, totals, bundles) {
   if (summary) summary = `<div style="font-size:13px;opacity:.75;margin-bottom:8px">${summary}</div>`;
   const head = '<tr><th>doc</th><th>title</th><th>type</th><th>trust</th><th>regime</th>'
     + '<th>status</th><th>chunks</th><th>distilled</th><th>file date</th></tr>';
-  const row = (r, queued) => {
+  const row = (r, queued, idx) => {
     // a doc can be COMPLETE below 100%: furniture zones (references/toc/
     // index) are deliberately never distilled, and shared-text chunks were
     // distilled under another doc — say so instead of looking stuck
@@ -731,21 +732,28 @@ function renderSources(rows, pending, totals, bundles) {
     const pcell = r.pct == null ? '—'
       : `<span class="pbar" title="${esc(tipbits.join(' · '))}">`
         + `<i style="width:${r.pct}%"></i></span> ${r.pct}%${why}`;
+    // doc_id is an untrusted path/URL — pass the ROW INDEX to the handler, never the id
+    // into the onclick attribute (same rule as the gaps dismiss button).
+    const del = (queued && idx != null)
+      ? ` <button class="toolbtn" style="font-size:11px;padding:1px 7px"
+           title="Delete this queued document and its ingested chunks"
+           onclick="deleteQueued(${idx})">✕</button>` : '';
     return `<tr${queued ? ' style="opacity:.65"' : ''}><td>${esc(r.doc_id)}</td>
       <td>${esc(r.title)}</td><td>${esc(r.source_type)}</td>
       <td>${r.trust_weight != null ? esc(r.trust_weight) : '—'}</td>
       <td>${r.regime ? esc(r.regime) : '—'}</td><td>${esc(r.status)}</td>
       <td>${r.chunks != null ? fmtCompact(r.chunks) : '—'}</td>
       <td style="white-space:nowrap">${pcell}</td>
-      <td style="white-space:nowrap;opacity:.75">${esc(r.file_time || '—')}</td></tr>`;
+      <td style="white-space:nowrap;opacity:.75">${esc(r.file_time || '—')}${del}</td></tr>`;
   };
+  PENDROWS = pending;                    // index-keyed for deleteQueued (untrusted doc_id)
   let body = rows.map(r => row(r, false)).join('');
   if (pending.length) {
     body += `<tr><td colspan="9" style="padding-top:14px;opacity:.7">⏳ <b>Queued</b> —
       ingested, awaiting distillation`
       + (totals.queued > pending.length ? ` (newest ${pending.length} of ${fmtCompact(totals.queued)})` : '')
       + `. They enter the registry (trust/regime editable) once their first chunk distils.</td></tr>`;
-    body += pending.map(r => row(r, true)).join('');
+    body += pending.map((r, i) => row(r, true, i)).join('');
   }
   setRows(chips + summary + '<table>' + head + body + '</table>');
 }
@@ -775,6 +783,22 @@ async function dismissGap(i) {
     ? '✓ dismissed ' + (r.closed || 0) + ' gap(s)'
     : '✗ ' + esc(r.error || 'failed — auth token?')}</div>`;
   if (r.ok) load('gaps');
+}
+
+// Delete a QUEUED (not-yet-distilled) document and its ingested chunks.  Index-keyed:
+// the doc_id (a path/URL) is read from PENDROWS, never interpolated into the button.
+async function deleteQueued(i) {
+  const r = PENDROWS[i]; if (!r || !r.doc_id) return;
+  if (!confirm(`Delete the queued document\n\n${r.doc_id}\n\nand its ${fmtCompact(r.chunks || 0)} `
+    + `ingested chunk(s)? This removes the chunks now. If the source file is still in your `
+    + `ingest folder it will be re-ingested on the next run — remove the file to keep it out.`))
+    return;
+  const res = await postJSON('/queue/delete', { doc_id: r.doc_id })
+    .catch(e => ({ ok: false, error: netErr(e) }));
+  $('#banner').innerHTML = `<div class="note">${res.ok
+    ? '✓ deleted — removed ' + (res.chunks || 0) + ' ingested chunk(s)'
+    : '✗ ' + esc(res.error || 'failed — auth token?')}</div>`;
+  if (res.ok) load('sources');
 }
 
 const BAND_COLOR = { high: '#22aa66', medium: '#e0a800', low: '#f5a623', contra: '#d9534f', none: '#888' };

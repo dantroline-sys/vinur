@@ -234,6 +234,22 @@ class SqliteStore:
         self.db.commit()
         self._mat = None
 
+    def purge_source(self, path_or_url: str) -> dict:
+        """Fully forget one source's ingested chunks — and, via the chunks AFTER-DELETE
+        trigger, their vectors and FTS rows — plus its doc_meta and manifest entry.  For
+        a QUEUED (not-yet-distilled) document: it leaves nothing behind, and a later
+        ingest re-adds it ONLY if the source file is still present (the cleared manifest
+        entry is what lets it come back rather than being skipped as 'unchanged').
+        Returns {"chunks": n}."""
+        n = self.db.execute("SELECT COUNT(*) FROM chunks WHERE path_or_url=?",
+                             (path_or_url,)).fetchone()[0]
+        self.db.execute("DELETE FROM chunks WHERE path_or_url=?", (path_or_url,))  # → vectors + fts (trigger)
+        self.db.execute("DELETE FROM doc_meta WHERE path_or_url=?", (path_or_url,))
+        self.db.execute("DELETE FROM manifest WHERE path=?", (path_or_url,))
+        self.db.commit()
+        self._mat = None
+        return {"chunks": int(n)}
+
     def add_chunks(self, records: list[dict]):
         if not records:
             return

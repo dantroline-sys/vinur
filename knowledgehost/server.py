@@ -569,7 +569,7 @@ class Handler(BaseHTTPRequestHandler):
                         "/serving/control", "/serving/minimal", "/serving/schedule",
                         "/serving/model", "/serving/add",
                         "/serving/pull", "/serving/download", "/serving/tune", "/net",
-                        "/metrics/mark", "/gaps/close", "/settings/paths"):
+                        "/metrics/mark", "/gaps/close", "/queue/delete", "/settings/paths"):
             return self._send_json({"ok": False, "error": "not found"}, 404)
         if not self._authed():
             return self._send_json({"ok": False, "error": "unauthorized"}, 401)
@@ -592,6 +592,30 @@ class Handler(BaseHTTPRequestHandler):
                     {"ok": False, "error": "status must be dismissed|acquired"}, 400)
             n = kb.close_gap(req.get("query") or "", status=status)
             return self._send_json({"ok": True, "closed": n})
+        if path == "/queue/delete":                    # Sources: drop a QUEUED doc + its chunks
+            store = getattr(self.server, "store", None)
+            if store is None or not hasattr(store, "purge_source"):
+                return self._send_json({"ok": False, "error": "no chunk store on this box"}, 400)
+            doc_id = str(req.get("doc_id") or "").strip()
+            if not doc_id:
+                return self._send_json({"ok": False, "error": "doc_id required"}, 400)
+            # Only for QUEUED (undistilled) docs: a distilled doc is in the source registry
+            # with nodes/cards/edges hanging off it — dropping just its chunks would orphan
+            # those, so refuse and point at the heavier unimport/eject path.
+            kb = getattr(self.server, "kb", None)
+            if kb is not None:
+                try:
+                    seen = kb.db.execute("SELECT 1 FROM source_registry WHERE doc_id=?",
+                                         (doc_id,)).fetchone()
+                except Exception:
+                    seen = None
+                if seen:
+                    return self._send_json(
+                        {"ok": False, "error": "already distilled — remove it with "
+                         "unimport/eject, not the queue"}, 409)
+            res = store.purge_source(doc_id)
+            log.info("queue delete: purged %s (%d chunk(s))", doc_id, res.get("chunks", 0))
+            return self._send_json({"ok": True, **res})
         if path == "/call":
             name = req.get("name")
             if not name:
