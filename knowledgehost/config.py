@@ -164,6 +164,19 @@ DEFAULTS = {
     # Model context window (max_model_len).  0 = auto-discover from the server's
     # /v1/models (vLLM reports it); set explicitly only for a server that doesn't.
     "distill_ctx": 0,
+    # edge-audit: LM-free graph-hygiene pass (see knowledgehost/edge_audit.py).  A relation
+    # is flagged SOUND-ALIKE when its two node labels are orthographically similar
+    # (orth_high) but semantically distant (sem_low) — linked on how the words look/sound,
+    # not what they mean; UNGROUNDED when endpoints are very distant (sem_vlow), uncited,
+    # and never co-occur in the corpus (the STAT PPMI table).  Retracts (soft, reversible)
+    # only with --apply; report-only otherwise.  Tune on a report run before applying.
+    "edge_audit": {
+        "orth_high": 0.82,        # label look-alike floor (difflib ratio, 0..1)
+        "sem_low": 0.35,          # semantic ceiling for a sound-alike (node-embedding cosine)
+        "sem_vlow": 0.15,         # semantic ceiling for an ungrounded over-link
+        "min_label_len": 3,       # skip 1-2 char labels (ratio is noise there)
+        "sample": 25,             # flagged edges to list in the report
+    },
     # Requests kept in flight PER distill/extract/verify endpoint.  0 = auto:
     # an endpoint this box serves with a batching engine ([[serving.llms]]
     # engine = "vllm"/"container") gets 8 (capped by that entry's

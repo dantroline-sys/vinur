@@ -548,6 +548,31 @@ def _run_import_conceptnet(cfg, log, *, path=None, min_weight=None,
     return 0
 
 
+def _run_edge_audit(cfg, log, *, apply=False, limit=None) -> int:
+    """Cull nonsense graph associations without an LM: flag relations whose labels are
+    orthographically alike but semantically distant (sound-alike links), or that are
+    distant + uncited + never co-occur in the corpus (ungrounded over-links).  Reports
+    by default; --apply soft-retracts (reversible via edge_audit.restore)."""
+    from .kb import KB
+    from . import edge_audit
+    kb = KB(cfg)
+    try:
+        rep = edge_audit.audit_edges(kb, cfg, apply=apply, limit=limit)
+    finally:
+        kb.close()
+    log.info("edge-audit: scanned %d active edge(s), flagged %d %s — %s",
+             rep["scanned"], rep["flagged"], rep["by_verdict"] or "{}",
+             f"retracted {rep['applied']}" if apply
+             else "report only (pass --apply to retract)")
+    if rep["cooc_note"]:
+        log.warning("edge-audit: %s", rep["cooc_note"])
+    for f in rep["sample"]:
+        log.info("  [%s] %r --%s--> %r  (orth %.2f sem %s cooc %s) — %s",
+                 f["verdict"], f["src"], f["type"], f["dst"],
+                 f["orth"], f["sem"], f["cooc"], f["reason"])
+    return 0
+
+
 def _run_migrate_vocab(cfg, log) -> int:
     """One-shot: migrate a pre-1.2 KB to the CONF-01/1.2 domain-neutral vocabulary
     (relation 'incompatible', table 'uses', acts_via roles) and rename the distilled
@@ -941,7 +966,7 @@ def main(argv=None):
                     choices=["serve", "ingest", "distill", "recard", "pack", "dedupe", "find", "pull", "adopt", "adjudicate", "reconcile",
                              "link", "refine", "import-conceptnet", "import-atomic",
                              "import-glucose", "import-causenet", "unimport", "embed-nodes", "build-ann",
-                             "optimize", "stats", "reset", "bump-version", "migrate-vocab",
+                             "optimize", "edge-audit", "stats", "reset", "bump-version", "migrate-vocab",
                              "bundles", "split", "source", "scenario", "eval", "facetize",
                              "ingest-library", "rebuild-fts", "import-bundle", "eject-bundle"])
     # positional args for the modular-bundle verbs:
@@ -1049,7 +1074,7 @@ def main(argv=None):
     ap.add_argument("--threshold", type=float, default=0.9,
                     help="dedupe --near: similarity floor (default 0.9)")
     ap.add_argument("--apply", action="store_true",
-                    help="dedupe --near: mark them (default reports only)")
+                    help="dedupe --near / edge-audit: apply changes (default reports only)")
     ap.add_argument("--model", help="pull: the HF model id to fetch (org/Name), "
                                     "or a row number from the last find")
     ap.add_argument("--revision", default="main", help="pull: repo revision (default main)")
@@ -1129,6 +1154,9 @@ def main(argv=None):
 
     if args.command == "optimize":            # KB-only; one-time node layout fix
         return _run_optimize(cfg, log, vacuum=args.vacuum)
+
+    if args.command == "edge-audit":          # KB-only; LM-free graph-hygiene pass
+        return _run_edge_audit(cfg, log, apply=args.apply, limit=args.limit)
 
     if args.command in ("bundles", "split", "source", "scenario"):   # modular §16, KB-only
         return _run_bundles(cfg, args, log)

@@ -66,6 +66,7 @@ COMMANDS: dict = {
     "build-ann":  {},
     "embed-nodes": {"limit": "int"},
     "optimize":   {"vacuum": "bool"},
+    "edge-audit": {"limit": "int", "apply": "bool"},
     "stats":      {},
     "split":      {"force": "bool"},    # export each bundle group to its <bundle>.kdb file
     # brains: absorb a shipped .kdb into the master / permanently remove one bundle.
@@ -190,6 +191,9 @@ HELP: dict = {
                     "limit": "max nodes this run"},
     "optimize": {"_": "One-time node table layout fix",
                  "vacuum": "reclaim disk afterwards"},
+    "edge-audit": {"_": "Cull nonsense edges — sound-alike (labels look/sound alike but "
+                        "mean unrelated things) + ungrounded over-links; LM-free, soft-retract",
+                   "limit": "max edges this run", "apply": "retract flagged edges (default: report only)"},
     "stats": {"_": "Print corpus statistics"},
     "split": {"_": "Export each bundle to its own .kdb brain file",
               "force": "overwrite existing files"},
