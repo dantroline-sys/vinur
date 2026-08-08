@@ -695,6 +695,13 @@ def main():
                 "phone-home stats must be off at launch (B-14)"
             assert "HF_TOKEN" not in e and "HUGGING_FACE_HUB_TOKEN" not in e, \
                 "engines never hold the token — the broker attaches it to pulls"
+            # vLLM's distributed store is pinned to loopback so torch/c10d can't latch onto
+            # a broken IPv6 link-local address on an isolated box (the c10d connect failure).
+            assert e["VLLM_HOST_IP"] == "127.0.0.1", ("default host IP pins vLLM to loopback", e)
+        # …configurable: a real multi-node deployment overrides it, "" opts out entirely.
+        assert sv.hf_env({"serving": {"vllm_host_ip": "10.0.0.5"}}, "container")["VLLM_HOST_IP"] == "10.0.0.5"
+        assert "VLLM_HOST_IP" not in sv.hf_env({"serving": {"vllm_host_ip": ""}}, "vllm"), \
+            "empty vllm_host_ip lets vLLM autodetect (multi-node)"
         assert sv.hf_env(hcfg, "llama") == {}, "llama engines take local GGUFs only"
         os.environ["HF_TOKEN"] = "hf_fromhost"
         assert "HF_TOKEN" not in sv.hf_env({}, "container"), \

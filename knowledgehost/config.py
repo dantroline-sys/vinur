@@ -56,6 +56,14 @@ DEFAULTS = {
     "serving": {
         "llms": [],
         "swap_timeout_s": 900,   # weights-load budget before a swap reports error
+        # Pin vLLM's internal distributed store address.  On a single isolated box,
+        # torch/c10d otherwise auto-detects the host IP and can latch onto a broken IPv6
+        # link-local address (fe80::…) — the Gloo/TCPStore connect then fails ("errno 22 /
+        # Address family for hostname not supported") and the engine never starts.
+        # 127.0.0.1 keeps all of vLLM's own comms on loopback: correct for one node,
+        # including same-node tensor parallel.  Set "" to let vLLM autodetect (a genuine
+        # multi-node deployment); a per-model serving.llms[].env still overrides it.
+        "vllm_host_ip": "127.0.0.1",
         # nomic embeds via llama-server --embedding (the GGUF auto-downloads
         # into models/ on first start) — pair with embed_url above.
         "embed": {"enabled": False, "port": 11437, "args": []},

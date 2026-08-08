@@ -437,11 +437,22 @@ def hf_env(cfg: dict, engine: str, root: Path = ROOT) -> dict:
     # Belt AND braces: the offline flags say "don't", the null endpoint says
     # "can't" — any code path that ignores HF_HUB_OFFLINE dials a loopback
     # port nothing listens on and fails in milliseconds instead of leaking.
-    return {"HF_HUB_OFFLINE": "1", "TRANSFORMERS_OFFLINE": "1",
-            "HF_ENDPOINT": "http://127.0.0.1:9",     # discard port: refused instantly
-            "HF_HUB_DISABLE_TELEMETRY": "1",
-            "VLLM_NO_USAGE_STATS": "1", "VLLM_DO_NOT_TRACK": "1",
-            "DO_NOT_TRACK": "1"}
+    env = {"HF_HUB_OFFLINE": "1", "TRANSFORMERS_OFFLINE": "1",
+           "HF_ENDPOINT": "http://127.0.0.1:9",     # discard port: refused instantly
+           "HF_HUB_DISABLE_TELEMETRY": "1",
+           "VLLM_NO_USAGE_STATS": "1", "VLLM_DO_NOT_TRACK": "1",
+           "DO_NOT_TRACK": "1"}
+    # Pin vLLM's internal distributed store to a fixed address.  Without this, torch/c10d
+    # auto-detects the host IP and on an isolated box can latch onto a broken IPv6 link-local
+    # address (fe80::…) — the Gloo/TCPStore connect fails ("errno 22 / Address family for
+    # hostname not supported") and the engine never comes up.  127.0.0.1 keeps vLLM's own
+    # comms on loopback (correct for one node, incl. same-node tensor parallel).  It rides INTO
+    # the container as a -e flag (host env doesn't cross); serving.vllm_host_ip = "" opts out
+    # for genuine multi-node; a per-model env still wins.  Recognised var → no vLLM env warning.
+    host_ip = str((cfg.get("serving") or {}).get("vllm_host_ip", "127.0.0.1")).strip()
+    if host_ip:
+        env["VLLM_HOST_IP"] = host_ip
+    return env
 
 
 _PROXY_KEYS = ("http_proxy", "https_proxy", "all_proxy")
