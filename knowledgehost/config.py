@@ -139,7 +139,13 @@ DEFAULTS = {
     # doing extraction directly (the previous single-tier behaviour).
     "verify": True,                              # gate fast-LM output through the verifier
     "extract_urls": ["http://127.0.0.1:11435"],  # the fast primary distiller(s) — 4090
-    "extract_model": "Qwen3.5-9B-Instruct-Q4_K_M.gguf",
+    # Empty ⇒ inherit distill_model (see fast_endpoints).  It used to name a specific
+    # small GGUF, but that default (a) named a model that never shipped — a carry-over
+    # from the united vinkona/vinur days — and (b) 404s any vLLM that serves under a
+    # served_model_name.  Set this only if you run a SEPARATE fast extractor whose served
+    # name differs from the big LM; on a single-endpoint / exclusive-swap box, leave it
+    # empty and the tiers collapse to the one resident model.
+    "extract_model": "",
     "extract_timeout_s": 90,
     "extract_max_tokens": 3072,
     "verify_urls": [],                           # the verifier(s); empty => use distill_urls (11438)
