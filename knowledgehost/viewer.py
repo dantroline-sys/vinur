@@ -755,7 +755,18 @@ function renderSources(rows, pending, totals, bundles) {
       + `. They enter the registry (trust/regime editable) once their first chunk distils.</td></tr>`;
     body += pending.map((r, i) => row(r, true, i)).join('');
   }
-  setRows(chips + summary + '<table>' + head + body + '</table>');
+  // bulk queue-clear — only when there's a queue.  Quarantine (move files aside so
+  // they don't re-ingest) is ON by default; partial-trim is opt-in.
+  const controls = (totals.queued || 0) > 0
+    ? `<div style="margin:2px 0 10px;display:flex;gap:14px;flex-wrap:wrap;align-items:center">
+         <button class="toolbtn" onclick="clearQueue()"
+           title="Drop every queued (undistilled) document and move its source file to the quarantine folder so it won't re-ingest — for undoing an accidental over-ingest">
+           Clear queue (${fmtCompact(totals.queued)})…</button>
+         <label style="font-size:12px;opacity:.8"><input type="checkbox" id="clearQuar" checked> move files to quarantine</label>
+         <label style="font-size:12px;opacity:.8"><input type="checkbox" id="clearPartial"> also trim partially-distilled docs</label>
+       </div>`
+    : '';
+  setRows(chips + summary + controls + '<table>' + head + body + '</table>');
 }
 
 // gaps get a per-row dismiss; rows are index-keyed (query text is untrusted —
@@ -797,6 +808,63 @@ async function deleteQueued(i) {
     .catch(e => ({ ok: false, error: netErr(e) }));
   $('#banner').innerHTML = `<div class="note">${res.ok
     ? '✓ deleted — removed ' + (res.chunks || 0) + ' ingested chunk(s)'
+    : '✗ ' + esc(res.error || 'failed — auth token?')}</div>`;
+  if (res.ok) load('sources');
+}
+
+// Bulk-clear the whole distillation queue: quarantine the untouched docs' source
+// files (default), then drop their chunks; optionally trim partially-distilled
+// docs. Two-step: a dry-run PREVIEW builds the confirm, then it executes.
+async function clearQueue() {
+  const include_partial = !!($('#clearPartial') && $('#clearPartial').checked);
+  const quarantine = !($('#clearQuar') && !$('#clearQuar').checked);   // default true
+  const prev = await postJSON('/queue/clear', { dry_run: true, include_partial, quarantine })
+    .catch(e => ({ ok: false, error: netErr(e) }));
+  if (prev.needs_quarantine_dir) {          // no silent default — make the user choose it
+    const p = prompt('Set a quarantine folder first — cleared files are MOVED here (folder '
+      + 'structure preserved) so you know exactly where they went.\n\n'
+      + 'An absolute path on the server — conventionally a "quarantined" folder inside your '
+      + 'source root (the crawl always skips it, so moved files stay reverted):',
+      prev.suggested_quarantine_dir || '');
+    if (!p) return;
+    const set = await postJSON('/settings/paths', { key: 'quarantine_dir', value: p })
+      .catch(e => ({ ok: false, error: netErr(e) }));
+    if (!set.ok) {
+      $('#banner').innerHTML = `<div class="note">✗ ${esc(set.error || 'could not set the folder')}</div>`;
+      return;
+    }
+    $('#banner').innerHTML = `<div class="note">✓ quarantine folder set to ${esc(set.value || p)}</div>`;
+    return clearQueue();                     // retry now that it's set (and persisted)
+  }
+  if (!prev.ok) {
+    $('#banner').innerHTML = `<div class="note">✗ ${esc(prev.error || 'preview failed — auth token?')}</div>`;
+    return;
+  }
+  const q = prev.quarantine || {};
+  let msg = 'Clear the distillation queue?\n\n'
+    + `• ${fmtCompact(prev.queued_docs)} untouched document(s) — ${fmtCompact(prev.queued_chunks)} chunk(s) removed.`;
+  if (include_partial)
+    msg += `\n• ${fmtCompact(prev.partial_docs)} partially-distilled doc(s) — `
+      + `${fmtCompact(prev.partial_chunks)} pending chunk(s) trimmed (distilled work kept).`;
+  else if (prev.partial_chunks)
+    msg += `\n• (${fmtCompact(prev.partial_docs)} partial doc(s) with ${fmtCompact(prev.partial_chunks)} `
+      + `pending chunk(s) left alone — tick "also trim" to include them.)`;
+  if (quarantine) {
+    const left = (q.skipped_nonfile || 0) + (q.skipped_outside || 0);
+    msg += `\n• ${fmtCompact(q.moved || 0)} source file(s) MOVED to ${q.dest_root || 'the quarantine folder'}`
+      + (left ? ` (${fmtCompact(left)} URL/outside-root left in place)` : '') + '.';
+  } else {
+    msg += '\n• Files NOT moved — they will re-ingest on the next crawl unless you remove them.';
+  }
+  msg += "\n\nThis can't be undone.";
+  if (!confirm(msg)) return;
+  const res = await postJSON('/queue/clear', { dry_run: false, include_partial, quarantine })
+    .catch(e => ({ ok: false, error: netErr(e) }));
+  const rq = res.quarantine || {};
+  $('#banner').innerHTML = `<div class="note">${res.ok
+    ? '✓ cleared — removed ' + fmtCompact(res.chunks_removed || 0) + ' chunk(s)'
+      + (quarantine ? ', quarantined ' + fmtCompact(rq.moved || 0) + ' file(s)' : '')
+      + (rq.errors ? ' (' + rq.errors + ' move error(s) — see log)' : '')
     : '✗ ' + esc(res.error || 'failed — auth token?')}</div>`;
   if (res.ok) load('sources');
 }

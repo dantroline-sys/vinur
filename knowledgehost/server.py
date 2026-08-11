@@ -616,6 +616,27 @@ class Handler(BaseHTTPRequestHandler):
             res = store.purge_source(doc_id)
             log.info("queue delete: purged %s (%d chunk(s))", doc_id, res.get("chunks", 0))
             return self._send_json({"ok": True, **res})
+        if path == "/queue/clear":                     # Sources: bulk-drop the whole queue
+            store = getattr(self.server, "store", None)
+            if store is None or not hasattr(store, "clear_queue"):
+                return self._send_json({"ok": False, "error": "no chunk store on this box"}, 400)
+            from . import ingest as ingest_mod
+            include_partial = bool(req.get("include_partial"))
+            quarantine = req.get("quarantine")
+            quarantine = True if quarantine is None else bool(quarantine)   # default on
+            dry_run = bool(req.get("dry_run"))
+            res = ingest_mod.clear_ingest_queue(
+                self.cfg, store, self.server.master_kb_path(),
+                include_partial=include_partial, quarantine=quarantine, dry_run=dry_run)
+            if not res.get("ok"):
+                return self._send_json(res, 400)
+            if not dry_run:
+                q = res.get("quarantine") or {}
+                log.info("queue clear: removed %d chunk(s) (untouched %d doc(s), partial=%s); "
+                         "quarantined %d file(s), %d error(s)",
+                         res.get("chunks_removed", 0), res.get("queued_docs", 0),
+                         include_partial, q.get("moved", 0), q.get("errors", 0))
+            return self._send_json(res)
         if path == "/call":
             name = req.get("name")
             if not name:

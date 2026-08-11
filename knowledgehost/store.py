@@ -250,6 +250,78 @@ class SqliteStore:
         self._mat = None
         return {"chunks": int(n)}
 
+    def clear_queue(self, kb_path: str, *, include_partial: bool = False,
+                    dry_run: bool = False) -> dict:
+        """Bulk-revert the distillation QUEUE — undo an accidental over-ingest.
+
+        The queue is the ingested-but-not-yet-distilled chunks.  By default this
+        drops every FULLY-untouched document (nothing of it distilled → not in
+        kb.db's source_registry), exactly as purge_source does per-doc: its chunks
+        (→ vectors + FTS via the AFTER-DELETE trigger), doc_meta and manifest, so a
+        later ingest can re-add it only if the file is still there.  With
+        include_partial=True it ALSO trims the still-pending chunks of
+        partially-distilled docs (chunks not yet distilled / zoned / de-duped),
+        leaving their distilled chunks, manifest entry, and the cards already in
+        kb.db untouched.
+
+        Deletes run against the current registry via an anti-join (not a stale
+        pre-scanned list), so a doc that distils mid-run is not wrongly dropped.
+        dry_run counts what would go and writes nothing.  Returns
+        {queued_docs, queued_chunks, partial_docs, partial_chunks, chunks_removed,
+         include_partial, dry_run, elapsed_s}."""
+        t0 = time.time()
+        st = {"queued_docs": 0, "queued_chunks": 0, "partial_docs": 0,
+              "partial_chunks": 0, "chunks_removed": 0,
+              "include_partial": bool(include_partial), "dry_run": bool(dry_run)}
+        con = sqlite3.connect(self.cfg["db_path"], timeout=10)
+        try:
+            con.execute("PRAGMA busy_timeout=10000")
+            con.execute("ATTACH ? AS kbdb", (str(kb_path),))
+            not_reg = ("path_or_url NOT IN "
+                       "(SELECT doc_id FROM kbdb.source_registry)")
+            untouched = [r[0] for r in con.execute(
+                f"SELECT DISTINCT path_or_url FROM chunks WHERE {not_reg}")]
+            st["queued_docs"] = len(untouched)
+            st["queued_doc_ids"] = untouched      # for the quarantine file-move step
+            st["queued_chunks"] = con.execute(
+                f"SELECT COUNT(*) FROM chunks WHERE {not_reg}").fetchone()[0]
+            # partial = a doc in the registry that still carries pending chunks
+            # (not distilled, and not the furniture/dupe the distiller marks done).
+            part = ("path_or_url IN (SELECT doc_id FROM kbdb.source_registry) "
+                    "AND id NOT IN (SELECT chunk_id FROM kbdb.distilled_chunks)")
+            part_full = (part + " AND id NOT IN (SELECT chunk_id FROM kbdb.zone_skips)"
+                         " AND id NOT IN (SELECT chunk_id FROM kbdb.chunk_dupes)")
+            try:
+                con.execute(f"SELECT 1 FROM chunks WHERE {part_full} LIMIT 1")
+                part = part_full                         # kb.db has the newer tables
+            except sqlite3.Error:
+                pass                                     # older kb.db → distilled-only
+            st["partial_docs"] = con.execute(
+                f"SELECT COUNT(DISTINCT path_or_url) FROM chunks WHERE {part}"
+            ).fetchone()[0]
+            st["partial_chunks"] = con.execute(
+                f"SELECT COUNT(*) FROM chunks WHERE {part}").fetchone()[0]
+            if not dry_run:
+                # doc_meta + manifest first (they key off the still-present chunks),
+                # then the chunks themselves; then the partial trim if requested.
+                con.execute(f"DELETE FROM doc_meta WHERE path_or_url IN "
+                            f"(SELECT DISTINCT path_or_url FROM chunks WHERE {not_reg})")
+                con.execute(f"DELETE FROM manifest WHERE path IN "
+                            f"(SELECT DISTINCT path_or_url FROM chunks WHERE {not_reg})")
+                removed = con.execute(f"DELETE FROM chunks WHERE {not_reg}").rowcount
+                if include_partial:
+                    removed += con.execute(f"DELETE FROM chunks WHERE {part}").rowcount
+                con.commit()
+                st["chunks_removed"] = int(removed)
+        except sqlite3.Error as e:
+            st["error"] = f"clear_queue failed: {e}"
+        finally:
+            con.close()
+        if not dry_run and not st.get("error"):
+            self._mat = None                             # dense cache now holds gone rows
+        st["elapsed_s"] = round(time.time() - t0, 1)
+        return st
+
     def add_chunks(self, records: list[dict]):
         if not records:
             return

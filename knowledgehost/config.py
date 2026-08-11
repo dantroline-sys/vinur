@@ -254,6 +254,15 @@ DEFAULTS = {
     #    "history": "historical"}
     "source_regimes": {},
     "extensions": [".pdf", ".epub", ".html", ".htm", ".txt", ".md"],
+    # Where `clear-queue` MOVES the source files of documents it drops from the
+    # distillation queue — with their tree relative to each source root preserved,
+    # so an accidental over-ingest can be undone.  Conventionally a `quarantined/`
+    # folder INSIDE a source root (e.g. ~/Documents → ~/Documents/quarantined): the
+    # crawl always skips the quarantine dir, so files moved there don't re-ingest.
+    # DELIBERATELY EMPTY by default: the user must choose it (Settings › Paths, or
+    # `quarantine_dir` in config) so it's obvious where cleared files land — no
+    # silent default to hunt for.  It may not equal or contain a `sources` root.
+    "quarantine_dir": "",
     # Wikipedia: a Kiwix ZIM (pre-rendered, cleaned HTML).  Keep it in its OWN folder
     # (e.g. ~/dev/knowledge-host/wikipedia/enwiki.zim) — deliberately NOT under `sources`,
     # so the document crawl never touches it.  Tier-0 search queries the ZIM's built-in
@@ -1126,6 +1135,11 @@ EDITABLE_PATHS = {
                             "live": True,
                             "note": "research-drop inbox — Vinkona's /drop lands here; "
                                     "empty = drops REFUSED (created on save)"},
+    "quarantine_dir": {"kind": "dir", "optional": True, "create": True, "live": True,
+                       "note": "where clear-queue MOVES cleared files (tree preserved); "
+                               "empty = clear-queue refuses to move (created on save). "
+                               "Usually a 'quarantined' folder inside a source root — the "
+                               "crawl skips it, so moved files stay reverted"},
     "bundle_dir": {"kind": "dir", "optional": True, "live": True,
                    "note": "where split/eject write .kdb brains (empty = var/bundles)"},
     "bundle_work_dir": {"kind": "dir", "optional": True, "live": True,

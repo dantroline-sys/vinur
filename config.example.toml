@@ -201,6 +201,12 @@ distill_skip_zones = ["references", "toc", "index", "boilerplate"]
 # Roots crawled for documents. Layout is not assumed; the tree is walked.
 sources    = ["~/Documents", "~/Books"]
 extensions = [".pdf", ".epub", ".html", ".htm", ".txt", ".md"]
+# Where `clear-queue` MOVES the files it reverts (undo an accidental over-ingest),
+# tree preserved: ~/Documents/Science/x.pdf -> ~/Documents/quarantined/Science/x.pdf.
+# Conventionally a "quarantined" folder INSIDE a source root — the crawl always skips
+# it, so moved files never re-ingest. Empty => clear-queue refuses to move (it asks
+# you to set this first, so you always know where cleared files went).
+quarantine_dir = "~/Documents/quarantined"
 # Wikipedia: a Kiwix ZIM (pre-rendered HTML). Empty => skipped.
 zim_path   = ""
 ocr        = true       # OCR scanned PDF pages that have no text layer

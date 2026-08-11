@@ -614,6 +614,92 @@ def _run_unimport(cfg, log, *, dataset=None) -> int:
     return 0
 
 
+def _run_clear_queue(cfg, store, log, *, include_partial=False, quarantine=True,
+                     dry_run=False, yes=False) -> int:
+    """Bulk-revert the distillation queue (undo an accidental over-ingest): move
+    untouched docs' source files to the quarantine dir, then drop their chunks;
+    with include_partial also trim partially-distilled docs' pending chunks."""
+    from . import ingest as ingest_mod
+    kb_path = cfg["kb_path"]
+    # quarantine_dir has no silent default — prompt for it (or refuse) so the user
+    # knows where cleared files went.
+    if quarantine and not str(cfg.get("quarantine_dir") or "").strip():
+        if yes:
+            log.error("quarantine_dir is not set — set it in config (Settings › Paths) or "
+                      "pass --no-quarantine to only drop DB rows.")
+            return 1
+        suggested = ingest_mod._suggested_quarantine_dir(cfg)   # usually <root>/quarantined
+        try:
+            ans = input("Quarantine folder is not set — cleared files must be moved somewhere "
+                        "you can find.\n"
+                        + (f"Enter an absolute path [{suggested}] (Enter = accept, blank+Enter "
+                           "twice = cancel): " if suggested
+                           else "Enter an absolute path (blank = cancel): ")).strip()
+        except EOFError:
+            ans = ""
+        if not ans and suggested:
+            ans = suggested
+        ans = os.path.expanduser(ans)
+        if not ans or not os.path.isabs(ans):
+            log.info("no quarantine folder set — aborted. Set quarantine_dir in config, or "
+                     "re-run with --no-quarantine.")
+            return 1
+        cfg = {**cfg, "quarantine_dir": ans}
+        log.info("using quarantine_dir=%s for this run — add it to config to persist.", ans)
+    prev = ingest_mod.clear_ingest_queue(cfg, store, kb_path, include_partial=include_partial,
+                                         quarantine=quarantine, dry_run=True)
+    if not prev.get("ok"):
+        log.error("clear-queue: %s", prev.get("error", "scan failed"))
+        return 1
+    q = prev.get("quarantine") or {}
+    log.info("queue: %d untouched doc(s) / %d chunk(s)%s", prev["queued_docs"],
+             prev["queued_chunks"],
+             ("; %d partial doc(s), %d pending chunk(s)"
+              % (prev["partial_docs"], prev["partial_chunks"])) if prev.get("partial_docs") else "")
+    if quarantine:
+        log.info("quarantine → %s: %d file(s) to move (%d non-file, %d outside a source root)",
+                 q.get("dest_root", "?"), q.get("moved", 0),
+                 q.get("skipped_nonfile", 0), q.get("skipped_outside", 0))
+    would = prev["queued_chunks"] + (prev["partial_chunks"] if include_partial else 0)
+    if dry_run:
+        log.info("dry-run: would remove %d chunk(s)%s and move %d file(s) — nothing written.",
+                 would, " (incl. partial trim)" if include_partial else "",
+                 q.get("moved", 0) if quarantine else 0)
+        return 0
+    if would == 0 and (not quarantine or q.get("moved", 0) == 0):
+        log.info("queue already empty — nothing to do.")
+        return 0
+    if not yes:
+        msg = (f"Remove {prev['queued_chunks']} chunk(s) from {prev['queued_docs']} untouched doc(s)"
+               + (f", trim {prev['partial_chunks']} pending chunk(s) from {prev['partial_docs']} "
+                  "partial doc(s)" if include_partial else "")
+               + (f", and MOVE {q.get('moved', 0)} file(s) to {q.get('dest_root')}"
+                  if quarantine else "")
+               + "? [y/N] ")
+        try:
+            ans = input(msg)
+        except EOFError:
+            ans = ""
+        if ans.strip().lower() not in ("y", "yes"):
+            log.info("aborted — nothing changed.")
+            return 1
+    res = ingest_mod.clear_ingest_queue(cfg, store, kb_path, include_partial=include_partial,
+                                        quarantine=quarantine, dry_run=False)
+    if not res.get("ok"):
+        log.error("clear-queue: %s", res.get("error", "failed"))
+        return 1
+    q = res.get("quarantine") or {}
+    log.info("clear-queue: removed %d chunk(s) from %d untouched doc(s)%s; quarantined %d file(s)%s (%.1fs)",
+             res["chunks_removed"], res["queued_docs"],
+             " + partial trim" if include_partial else "", q.get("moved", 0),
+             (", %d move error(s)" % q["errors"]) if q.get("errors") else "",
+             res.get("elapsed_s", 0.0))
+    ops_mod.emit_result(res["chunks_removed"] > 0 or q.get("moved", 0) > 0,
+                        chunks_removed=res["chunks_removed"], docs=res["queued_docs"],
+                        quarantined=q.get("moved", 0), move_errors=q.get("errors", 0))
+    return 0
+
+
 def _run_import_atomic(cfg, log, *, path=None, min_count=None, limit=None) -> int:
     """Stream the ATOMIC if-then graph into the KB (regime=conventional, low trust,
     has_reference=0).  Idempotent — re-run to add only what is new."""
@@ -968,7 +1054,8 @@ def main(argv=None):
                              "import-glucose", "import-causenet", "unimport", "embed-nodes", "build-ann",
                              "optimize", "edge-audit", "stats", "reset", "bump-version", "migrate-vocab",
                              "bundles", "split", "source", "scenario", "eval", "facetize",
-                             "ingest-library", "rebuild-fts", "import-bundle", "eject-bundle"])
+                             "ingest-library", "rebuild-fts", "import-bundle", "eject-bundle",
+                             "clear-queue"])
     # positional args for the modular-bundle verbs:
     #   source <doc_id> [--title ..] [--bundle ..]   scenario [name]   split [dir]
     #   import-bundle <file.kdb>     eject-bundle <bundle>
@@ -1004,9 +1091,16 @@ def main(argv=None):
                          "shipped knowledge earns promotion) or 'keep' its own values "
                          "(your own brains moving between your own boxes)")
     ap.add_argument("--dry-run", action="store_true", dest="dry_run",
-                    help="eject-bundle: scan and count, delete nothing")
+                    help="eject-bundle / clear-queue: scan and count, change nothing")
     ap.add_argument("--no-export", action="store_true", dest="no_export",
                     help="eject-bundle: skip the safety export to <bundle>.kdb first")
+    ap.add_argument("--include-partial", action="store_true", dest="include_partial",
+                    help="clear-queue: also trim the pending chunks of partially-distilled docs")
+    ap.add_argument("--no-quarantine", action="store_true", dest="no_quarantine",
+                    help="clear-queue: only drop DB rows; do NOT move source files aside "
+                         "(they will re-ingest on the next crawl unless you remove them)")
+    ap.add_argument("--yes", "-y", action="store_true",
+                    help="clear-queue: skip the confirmation prompt")
     ap.add_argument("--min-weight", type=float, dest="min_weight",
                     help="import-conceptnet: drop assertions below this weight")
     ap.add_argument("--all", action="store_true",
@@ -1344,6 +1438,13 @@ def main(argv=None):
     if args.command == "embed-nodes":
         store.close()                          # KB + embed endpoint only
         return _run_embed_nodes(cfg, embedder, log, limit=args.limit)
+
+    if args.command == "clear-queue":          # revert the distillation queue (+ quarantine files)
+        rc = _run_clear_queue(cfg, store, log, include_partial=args.include_partial,
+                              quarantine=not args.no_quarantine,
+                              dry_run=args.dry_run, yes=args.yes)
+        store.close()
+        return rc
 
     if args.command == "ingest":
         if not embedder.embed_one("warmup", "document"):

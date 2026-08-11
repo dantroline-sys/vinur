@@ -15,6 +15,7 @@ from __future__ import annotations
 import hashlib
 import logging
 import os
+import shutil
 import time
 
 from . import research, sanitize
@@ -233,6 +234,25 @@ def _apply_parsed(store, embedder, cfg, res, version) -> int:
     return n
 
 
+def _skip_dirs(cfg) -> set:
+    """Realpath'd folders the crawl must never descend into.  Currently the
+    quarantine dir: `clear-queue` typically MOVES cleared files into a
+    `quarantined/` subfolder INSIDE a source root, so the crawl has to skip it or
+    it would just re-ingest everything it was asked to revert."""
+    q = str(cfg.get("quarantine_dir") or "").strip()
+    return {os.path.realpath(os.path.expanduser(q))} if q else set()
+
+
+def _walk_pruned(root, skip: set):
+    """os.walk(root) that never descends into any realpath in `skip` (mutating
+    the dirs list in place, the way os.walk expects, before it recurses)."""
+    for dirpath, dirs, files in os.walk(root):
+        if skip:
+            dirs[:] = [d for d in dirs
+                       if os.path.realpath(os.path.join(dirpath, d)) not in skip]
+        yield dirpath, dirs, files
+
+
 def crawl_library(store, embedder, cfg, *, force=False) -> dict:
     """Index the search-only library (library_sources) into its OWN store — lexical FTS
     by default (embedder passed only when library_dense), NOT distilled.  Each doc is
@@ -243,6 +263,7 @@ def crawl_library(store, embedder, cfg, *, force=False) -> dict:
     every = cfg["ingest_log_every"]
     version = int(store.manifest.meta_get("version", "1"))
     lib_root = os.path.realpath(cfg["library_root"]) if cfg.get("library_root") else ""
+    skip = _skip_dirs(cfg)                                 # never re-crawl the quarantine dir
 
     # 1. enumerate work: cheap mtime-skip here; the byte-identical skip is done in the worker
     #    (which is reading the file to hash it anyway).
@@ -257,7 +278,7 @@ def crawl_library(store, embedder, cfg, *, force=False) -> dict:
         base_coll = None
         if lib_root and os.path.realpath(os.path.dirname(os.path.normpath(root))) == lib_root:
             base_coll = os.path.basename(os.path.normpath(root)).lower()
-        for dirpath, _dirs, files in os.walk(root):
+        for dirpath, _dirs, files in _walk_pruned(root, skip):
             for name in files:
                 if os.path.splitext(name)[1].lower() not in exts:
                     continue
@@ -363,11 +384,12 @@ def crawl(store, embedder, cfg, *, force=False) -> dict:
     solved = cfg.get("research_solved_dir")
     if solved and solved not in roots:
         roots.append(solved)                       # low-trust vinkona bundle (research §6)
+    skip = _skip_dirs(cfg)                          # never re-crawl the quarantine dir
     for root in roots:
         if not os.path.isdir(root):
             log.info("source root missing, skipping: %s", root)
             continue
-        for dirpath, _dirs, files in os.walk(root):
+        for dirpath, _dirs, files in _walk_pruned(root, skip):
             for name in files:
                 if os.path.splitext(name)[1].lower() not in exts:
                     continue
@@ -379,6 +401,143 @@ def crawl(store, embedder, cfg, *, force=False) -> dict:
                 if docs and every and docs % every == 0:
                     log.info("… %d docs / %d chunks", docs, chunks)
     return {"docs": docs, "chunks": chunks}
+
+
+def _quarantine_roots(cfg) -> list:
+    """The source roots a queued file may live under (expanded + realpath'd)."""
+    roots = []
+    for r in (cfg.get("sources") or []):
+        rp = os.path.realpath(os.path.expanduser(str(r)))
+        if rp not in roots:
+            roots.append(rp)
+    return roots
+
+
+def _unique_dest(dest: str) -> str:
+    """A non-clobbering variant of `dest` — adds ' (2)', ' (3)', … before the ext."""
+    if not os.path.exists(dest):
+        return dest
+    base, ext = os.path.splitext(dest)
+    i = 2
+    while os.path.exists(f"{base} ({i}){ext}"):
+        i += 1
+    return f"{base} ({i}){ext}"
+
+
+def _suggested_quarantine_dir(cfg) -> str:
+    """The conventional home for cleared files: a ``quarantined/`` folder inside the
+    first source root (``~/Documents`` → ``~/Documents/quarantined``).  The crawl
+    skips it (see _skip_dirs), so moved files stay reverted."""
+    roots = _quarantine_roots(cfg)
+    return os.path.join(roots[0], "quarantined") if roots else ""
+
+
+def quarantine_docs(cfg, doc_ids, *, dry_run: bool = False) -> dict:
+    """MOVE the source files of ``doc_ids`` out of the ingest queue into
+    ``cfg['quarantine_dir']``, preserving each file's path relative to its source
+    root, so an accidental over-ingest can be reverted without the files being
+    re-crawled.  The conventional home is a ``quarantined/`` subfolder INSIDE a
+    source root (``~/Documents/Science/x.pdf`` → ``~/Documents/quarantined/Science/
+    x.pdf``); the crawl always skips the quarantine dir, so files moved there don't
+    come back.
+
+    Only real files under a configured ``sources`` root move; URL/virtual docs
+    (``wikipedia:``, ``zim://``, ``http(s)://``), files outside every root, and
+    files already living under the quarantine dir are left in place (their DB rows
+    are cleared by clear_queue regardless).  With more than one source root the
+    per-root basename prefixes the mirrored path so same-named trees don't merge; a
+    file already present at the destination is never overwritten (a numeric suffix
+    is added).  ``dry_run`` counts without moving.  Returns
+    {moved, skipped_nonfile, skipped_outside, errors, dest_root, samples} — or
+    {error: …, needs_quarantine_dir, suggested_dir} if the dir is unset, or {error:
+    …} if the dir contains/equals a source root (which would leave nothing to
+    crawl)."""
+    raw_q = str(cfg.get("quarantine_dir") or "").strip()
+    if not raw_q:
+        # No silent default — the user must choose where cleared files land, or
+        # they'll never find them.  Refuse (the orchestrator makes no DB changes),
+        # but hand back the conventional suggestion so the UI/CLI can pre-fill it.
+        return {"moved": 0, "skipped_nonfile": 0, "skipped_outside": 0, "errors": 0,
+                "dest_root": "", "samples": [], "needs_quarantine_dir": True,
+                "suggested_dir": _suggested_quarantine_dir(cfg),
+                "error": "quarantine_dir is not set — choose a folder (Settings › Paths, "
+                         "or set quarantine_dir in config) so cleared files have a known home"}
+    roots = _quarantine_roots(cfg)
+    multi = len(roots) > 1
+    qroot = os.path.realpath(os.path.expanduser(raw_q))
+    res = {"moved": 0, "skipped_nonfile": 0, "skipped_outside": 0, "errors": 0,
+           "dest_root": qroot, "samples": []}
+    # A quarantine dir strictly INSIDE a source root is the intended layout (the
+    # crawl skips it).  Only refuse the degenerate cases that would swallow a whole
+    # source: the dir IS a root, or it CONTAINS one (root nested under quarantine).
+    for r in roots:
+        if qroot == r or r.startswith(qroot + os.sep):
+            return {**res, "error": f"quarantine_dir {qroot} equals or contains source root {r} "
+                    "— set it to a subfolder like <source root>/quarantined instead"}
+    for doc in doc_ids or []:
+        if not doc or "://" in str(doc):               # URL/virtual source, not a file
+            res["skipped_nonfile"] += 1
+            continue
+        p = os.path.realpath(os.path.expanduser(str(doc)))
+        if not os.path.isfile(p):
+            res["skipped_nonfile"] += 1
+            continue
+        if p == qroot or p.startswith(qroot + os.sep):  # already in quarantine — leave it
+            res["skipped_outside"] += 1
+            continue
+        root = next((r for r in roots if p == r or p.startswith(r + os.sep)), None)
+        if root is None:
+            res["skipped_outside"] += 1
+            continue
+        rel = os.path.relpath(p, root)
+        dest = (os.path.join(qroot, os.path.basename(root.rstrip(os.sep)) or "root", rel)
+                if multi else os.path.join(qroot, rel))
+        if len(res["samples"]) < 5:
+            res["samples"].append({"from": p, "to": dest})
+        if dry_run:
+            res["moved"] += 1
+            continue
+        try:
+            os.makedirs(os.path.dirname(dest), exist_ok=True)
+            shutil.move(p, _unique_dest(dest))
+            res["moved"] += 1
+        except OSError as e:
+            res["errors"] += 1
+            log.warning("quarantine: could not move %s -> %s: %s", p, dest, e)
+    return res
+
+
+def clear_ingest_queue(cfg, store, kb_path, *, include_partial: bool = False,
+                       quarantine: bool = True, dry_run: bool = False) -> dict:
+    """Revert the distillation queue — the one entry point the CLI and the panel
+    both call.  Optionally MOVE untouched docs' source files to the quarantine dir
+    (so they don't re-ingest), then drop their chunks/doc_meta/manifest from the
+    store; with include_partial, also trim partially-distilled docs' pending
+    chunks.  Files move BEFORE the DB clear; a file that fails to move (and its
+    now-cleared chunks) simply re-ingests on the next crawl — reported via
+    quarantine.errors, self-correcting rather than silently lost.  dry_run previews
+    counts (docs/chunks to drop, files to quarantine) and writes nothing."""
+    scan = store.clear_queue(kb_path, include_partial=include_partial, dry_run=True)
+    if scan.get("error"):
+        return {"ok": False, **{k: v for k, v in scan.items() if k != "queued_doc_ids"}}
+    doc_ids = scan.get("queued_doc_ids") or []
+    q = (quarantine_docs(cfg, doc_ids, dry_run=True) if quarantine
+         else {"moved": 0, "skipped_nonfile": 0, "skipped_outside": 0, "errors": 0})
+    out = {k: v for k, v in scan.items() if k != "queued_doc_ids"}   # never leak the list
+    out["quarantine"] = q
+    if q.get("error"):
+        return {"ok": False, "error": q["error"],
+                "needs_quarantine_dir": bool(q.get("needs_quarantine_dir")),
+                "suggested_quarantine_dir": q.get("suggested_dir", ""), **out}
+    if dry_run:
+        return {"ok": True, "dry_run": True, **out}
+    if quarantine:
+        out["quarantine"] = quarantine_docs(cfg, doc_ids, dry_run=False)
+    res = store.clear_queue(kb_path, include_partial=include_partial, dry_run=False)
+    final = {k: v for k, v in res.items() if k != "queued_doc_ids"}
+    final["quarantine"] = out["quarantine"]
+    final["ok"] = not res.get("error")
+    return final
 
 
 def ingest_wikipedia(store, embedder, cfg, *, limit: int | None = None,
