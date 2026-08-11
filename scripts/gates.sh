@@ -51,6 +51,9 @@ run "cli parser builds" ""     "$PY" -m knowledgehost --help
 # triple-quoted page) — catches a \n eaten into a real newline inside a quoted JS
 # string, which serves 200 but runs no script.  Skips when node is absent.
 run "viewer JS parses"  node   "$PY" tests/viewer_js_test.py
+# every `path == "..."` handler in _do_POST must be in its allow-list, or the route
+# 404s "not found" before the handler runs.
+run "post routes wired" ""     "$PY" tests/post_routes_test.py
 run "dependency ratchet" ""    "$PY" tests/deps_test.py
 run "broker battery"    ""     "$PY" tests/amiga_net_test.py
 run "model finder"      ""     "$PY" tests/modelfind_test.py

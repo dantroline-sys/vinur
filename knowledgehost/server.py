@@ -569,7 +569,8 @@ class Handler(BaseHTTPRequestHandler):
                         "/serving/control", "/serving/minimal", "/serving/schedule",
                         "/serving/model", "/serving/add",
                         "/serving/pull", "/serving/download", "/serving/tune", "/net",
-                        "/metrics/mark", "/gaps/close", "/queue/delete", "/settings/paths"):
+                        "/metrics/mark", "/gaps/close", "/queue/delete", "/queue/clear",
+                        "/settings/paths"):
             return self._send_json({"ok": False, "error": "not found"}, 404)
         if not self._authed():
             return self._send_json({"ok": False, "error": "unauthorized"}, 401)
