@@ -822,7 +822,7 @@ async function clearQueue() {
     .catch(e => ({ ok: false, error: netErr(e) }));
   if (prev.needs_quarantine_dir) {          // no silent default — make the user choose it
     const p = prompt('Set a quarantine folder first — cleared files are MOVED here (folder '
-      + 'structure preserved) so you know exactly where they went.\n\n'
+      + `structure preserved) so you know exactly where they went.\n\n`
       + 'An absolute path on the server — conventionally a "quarantined" folder inside your '
       + 'source root (the crawl always skips it, so moved files stay reverted):',
       prev.suggested_quarantine_dir || '');
@@ -841,7 +841,7 @@ async function clearQueue() {
     return;
   }
   const q = prev.quarantine || {};
-  let msg = 'Clear the distillation queue?\n\n'
+  let msg = `Clear the distillation queue?\n\n`
     + `• ${fmtCompact(prev.queued_docs)} untouched document(s) — ${fmtCompact(prev.queued_chunks)} chunk(s) removed.`;
   if (include_partial)
     msg += `\n• ${fmtCompact(prev.partial_docs)} partially-distilled doc(s) — `
@@ -854,9 +854,9 @@ async function clearQueue() {
     msg += `\n• ${fmtCompact(q.moved || 0)} source file(s) MOVED to ${q.dest_root || 'the quarantine folder'}`
       + (left ? ` (${fmtCompact(left)} URL/outside-root left in place)` : '') + '.';
   } else {
-    msg += '\n• Files NOT moved — they will re-ingest on the next crawl unless you remove them.';
+    msg += `\n• Files NOT moved — they will re-ingest on the next crawl unless you remove them.`;
   }
-  msg += "\n\nThis can't be undone.";
+  msg += `\n\nThis can't be undone.`;
   if (!confirm(msg)) return;
   const res = await postJSON('/queue/clear', { dry_run: false, include_partial, quarantine })
     .catch(e => ({ ok: false, error: netErr(e) }));
