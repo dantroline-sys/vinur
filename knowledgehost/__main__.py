@@ -1099,8 +1099,6 @@ def main(argv=None):
     ap.add_argument("--no-quarantine", action="store_true", dest="no_quarantine",
                     help="clear-queue: only drop DB rows; do NOT move source files aside "
                          "(they will re-ingest on the next crawl unless you remove them)")
-    ap.add_argument("--yes", "-y", action="store_true",
-                    help="clear-queue: skip the confirmation prompt")
     ap.add_argument("--min-weight", type=float, dest="min_weight",
                     help="import-conceptnet: drop assertions below this weight")
     ap.add_argument("--all", action="store_true",
@@ -1191,7 +1189,7 @@ def main(argv=None):
     ap.add_argument("--raw", action="store_true",
                     help="reset: clear only the raw chunk store (keep the KB)")
     ap.add_argument("-y", "--yes", action="store_true",
-                    help="reset: skip the confirmation prompt")
+                    help="reset / clear-queue: skip the confirmation prompt")
     args = ap.parse_args(argv)
 
     cfg = load_config(args.config)
