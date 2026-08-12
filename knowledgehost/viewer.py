@@ -1210,6 +1210,23 @@ async function pollOps() {
   OPBUSY = true;
   try { await pollOps_(); } finally { OPBUSY = false; }
 }
+const PHASE_TABLE = { source_registry: 'sources', nodes: 'concepts', procedure_cards: 'cards',
+  edges: 'relations', surface_questions: 'questions', surface_propositions: 'propositions' };
+function opsProgressBar(prog, s) {
+  if (!prog || !s.running) return '';           // only while a job is actually running
+  const steps = prog.steps || 5;
+  const step = Math.max(1, Math.min(steps, prog.step || 1));
+  const pct = Math.round(step / steps * 100);
+  let detail = '';
+  if (prog.chunks != null) detail = ` — ${fmtCompact(prog.chunks)} chunk(s)`;
+  else if (prog.added && typeof prog.added === 'object') {
+    const a = Object.entries(prog.added).map(([k, v]) => `${fmtCompact(v)} ${PHASE_TABLE[k] || k}`).join(', ');
+    detail = a ? ` — added ${esc(a)}` : ' — nothing new';
+  } else if (prog.created != null) detail = prog.created ? ' — new file' : ' — merged';
+  return `<span style="display:inline-flex;gap:8px;align-items:center;margin-left:10px">`
+    + `<span class="pbar" style="width:150px"><i style="width:${pct}%"></i></span>`
+    + `<span style="font-size:12px">${step}/${steps} <b>${esc(prog.phase)}</b>${detail}</span></span>`;
+}
 async function pollOps_() {
   let r; try { r = await (await authFetch('/ops/log?tail=400')).json(); } catch (e) { return; }
   if (!r.ok) { $('#opstatus').textContent = (r.error === 'unauthorized')
@@ -1217,9 +1234,17 @@ async function pollOps_() {
   const s = r.status || {};
   const run = s.running ? `▶ ${esc(s.command)} ${esc((s.argv || []).join(' '))} — ${s.elapsed_s}s`
     : (s.command ? `■ ${esc(s.command)} finished (exit ${s.exit_code})` : 'idle — pick a command and Run');
-  $('#opstatus').innerHTML = run + ' &nbsp; ' + healthStrip(r.health);
+  // pull the latest machine progress line for the bar; keep those lines OUT of the shown log
+  const NL = String.fromCharCode(10);
+  let prog = null; const shown = [];
+  (r.log || '').split(NL).forEach(line => {
+    const k = line.indexOf('OPS_PROGRESS ');
+    if (k >= 0) { try { prog = JSON.parse(line.slice(k + 13)); } catch (e) {} return; }
+    shown.push(line);
+  });
+  $('#opstatus').innerHTML = run + ' &nbsp; ' + healthStrip(r.health) + opsProgressBar(prog, s);
   const log = $('#opslog'); if (log) { const atBottom = log.scrollTop + log.clientHeight >= log.scrollHeight - 20;
-    log.textContent = r.log || '(no output yet)'; if (atBottom) log.scrollTop = log.scrollHeight; }
+    log.textContent = shown.join(NL) || '(no output yet)'; if (atBottom) log.scrollTop = log.scrollHeight; }
 }
 async function loadOps() {
   $('#results').className = '';

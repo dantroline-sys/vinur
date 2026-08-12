@@ -407,7 +407,8 @@ def _run_collect(cfg, log, args) -> int:
         res = pack_mod.add_to_collection(
             cfg, doc, target, bundle, license_override=args.license or "",
             allow_unlicensed=args.allow_unlicensed, force=args.force,
-            dry_run=args.dry_run, log_fn=log.info)
+            dry_run=args.dry_run, log_fn=log.info,
+            report=ops_mod.emit_progress)      # live phase bar in the Operations panel
     except ValueError as e:
         log.error("%s", e)
         ops_mod.emit_result(False, error=str(e))

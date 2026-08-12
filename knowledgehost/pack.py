@@ -226,10 +226,29 @@ def scratch_cfg(cfg: dict, build: Path, src: Path) -> dict:
     return s
 
 
-def _pipeline(scfg: dict, src: Path, say) -> dict:
+# The phases a clean-room build moves through, in order — shared by _pipeline
+# (ingest/distill/link) and add_to_collection (export/done) so the panel's progress
+# bar has one consistent step sequence.
+_BUILD_STEPS = ("ingest", "distill", "link", "export", "done")
+
+
+def _emit(report, phase: str, **extra) -> None:
+    """Fire the optional progress reporter with a consistent step number.  A no-op
+    when no reporter was passed (build_pack), so the OPS_PROGRESS lines only appear
+    for callers that want the bar (collect)."""
+    if not report:
+        return
+    try:
+        report(phase, step=_BUILD_STEPS.index(phase) + 1, steps=len(_BUILD_STEPS), **extra)
+    except Exception:                           # progress is cosmetic — never fail a build for it
+        pass
+
+
+def _pipeline(scfg: dict, src: Path, say, *, label: str = "pack", report=None) -> dict:
     """ingest → distill → link inside the scratch.  Module-level so tests can
     patch it; raises BackendUnavailable when no distill endpoint is up (the
-    scratch survives — re-running resumes)."""
+    scratch survives — re-running resumes).  `label` prefixes the log lines
+    (so a collect build doesn't say "pack"); `report` gets per-phase progress."""
     from . import distill as distill_mod
     from . import embed as embed_mod
     from . import ingest as ingest_mod
@@ -244,33 +263,44 @@ def _pipeline(scfg: dict, src: Path, say) -> dict:
     stats: dict = {}
     try:
         if not embedder.embed_one("warmup", "document"):
-            say("embed endpoint unreachable — pack will carry no vectors "
+            say(f"{label}: embed endpoint unreachable — the file will carry no vectors "
                 "(importers re-embed; retrieval inside the build is sparse-only)")
             # keep going: ingest/distill degrade the same way the normal ops do
+        _emit(report, "ingest")
+        say(f"{label}: ingesting {src.name} …")
+        t0 = time.time()
         if src.is_file():
             n = ingest_mod.ingest_file(store, embedder, scfg, str(src))
             stats["ingest"] = {"docs": 1 if n else 0, "chunks": n}
         else:
             stats["ingest"] = ingest_mod.crawl(store, embedder, scfg)
-        say(f"pack ingest: {stats['ingest']}")
+        chunks = stats["ingest"].get("chunks") or 0
+        say(f"{label}: ingested {stats['ingest']} ({time.time() - t0:.1f}s)")
 
         extractors = distill_mod.fast_endpoints(scfg, log)
         verifiers = distill_mod.verify_endpoints(scfg, log)
         if not (extractors or verifiers):
             raise distill_mod.BackendUnavailable(
-                "no distill endpoint up — start one, then re-run pack (the "
+                f"no distill endpoint up — start one, then re-run {label} (the "
                 "build resumes from its scratch)")
+        _emit(report, "distill", chunks=chunks)
+        say(f"{label}: distilling {chunks} chunk(s) into concepts / relations / cards "
+            "(the long step — progress lines follow) …")
+        t0 = time.time()
         stats["distill"] = distill_mod.distill_corpus(
             store, kb, extractors or verifiers, embedder, scfg,
             verifiers=verifiers if extractors else None)
-        say(f"pack distill: {stats['distill']}")
+        say(f"{label}: distilled {stats['distill']} ({time.time() - t0:.1f}s)")
 
+        _emit(report, "link", **{k: stats["distill"].get(k) for k in ("concepts", "cards")})
         lm = (verifiers or extractors)[0]
         try:
+            say(f"{label}: linking concepts …")
+            t0 = time.time()
             stats["link"] = link_mod.link_concepts(kb, lm, scfg, lease=lm_lease.BIG)
-            say(f"pack link: {stats['link']}")
+            say(f"{label}: linked {stats['link']} ({time.time() - t0:.1f}s)")
         except Exception as e:                  # linkage is a bonus, not a gate
-            say(f"pack link skipped: {e}")
+            say(f"{label}: link skipped: {e}")
     finally:
         kb.close()
         store.close()
@@ -494,7 +524,8 @@ def collection_preview(cfg: dict, target: str, bundle: str) -> dict:
 
 def add_to_collection(cfg: dict, doc: str, target: str, bundle: str, *,
                       license_override: str = "", allow_unlicensed: bool = False,
-                      force: bool = False, dry_run: bool = False, log_fn=None) -> dict:
+                      force: bool = False, dry_run: bool = False, log_fn=None,
+                      report=None) -> dict:
     """Clean-room ingest+distill of ONE document (or folder), then ADD its distilled
     closure to a shareable ``.kdb`` collection under ``bundle`` — creating the file
     or merging into it if it already exists (content-hash ids ⇒ idempotent, so
@@ -524,8 +555,8 @@ def add_to_collection(cfg: dict, doc: str, target: str, bundle: str, *,
     build = Path(cfg.get("pack_build_dir") or "var/packs/build") / f"collect-{bundle_slug}"
     build.mkdir(parents=True, exist_ok=True)
     scfg = scratch_cfg(cfg, build, src)
-    say(f"collection build: clean-room at {build} (master untouched)")
-    stats = _pipeline(scfg, src, say)
+    say(f"collect: clean-room build at {build} (your master KB is untouched)")
+    stats = _pipeline(scfg, src, say, label="collect", report=report)
 
     # license gate over the scratch registry (same rules as `pack`), then stamp the
     # whole scratch into the one bundle so `split` emits exactly it.
@@ -552,6 +583,8 @@ def add_to_collection(cfg: dict, doc: str, target: str, bundle: str, *,
     finally:
         con.close()
 
+    _emit(report, "export")
+    say(f"collect: exporting the '{bundle}' bundle closure …")
     exported = bundles.split(scfg, out_dir=str(build), force=True, only={bundle})
     entry = exported.get(bundle) or {}
     kdb = entry.get("file")
@@ -595,8 +628,9 @@ def add_to_collection(cfg: dict, doc: str, target: str, bundle: str, *,
     os.replace(tmp, tgt)
     shutil.rmtree(build, ignore_errors=True)
 
-    say(f"collection {'created' if created else 'updated'}: {tgt} "
-        f"[{bundle}] added={added} totals={totals}")
+    say(f"collect: {'created' if created else 'updated'} {tgt} "
+        f"[{bundle}] — added {added or 'nothing new'}; file now holds {totals}")
+    _emit(report, "done", created=created, added=added, target=str(tgt), bundle=bundle)
     return {"ok": True, "target": str(tgt), "bundle": bundle, "created": created,
             "added": added, "totals": totals, "shareable": g["shareable"], "stats": stats}
 

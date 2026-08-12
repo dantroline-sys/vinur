@@ -38,7 +38,7 @@ check.failed = 0
 def fake_pipeline(doc, node, label, *, license="CC-BY-4.0", holder="A. Author"):
     """A _pipeline stand-in that drops one source + one node + one card (all citing
     `doc`) into the scratch kb, exactly like a real clean-room build would."""
-    def run(scfg, src, say):
+    def run(scfg, src, say, **_kw):        # absorbs label=/report= that add_to_collection passes
         kb = KB(scfg)
         kb.db.execute(
             "INSERT INTO source_registry(doc_id,title,source_type,trust_weight,"
@@ -82,8 +82,17 @@ def main():
 
             # ── create: first document makes the file ────────────────────────────
             P._pipeline = fake_pipeline("doc:rocks", "n_rock", "rock")
-            r1 = P.add_to_collection(cfg, str(src1), target, "geo")
+            prog = []
+            r1 = P.add_to_collection(cfg, str(src1), target, "geo",
+                                     report=lambda ph, **k: prog.append((ph, k)))
             check("create: file made, created=True", r1["created"] and Path(target).exists())
+            # (the fake _pipeline skips ingest/distill/link phases; add_to_collection
+            #  still drives export + done, which is the wiring under test)
+            phases = [p for p, _ in prog]
+            check("progress: reporter fired export → done, steps=5 throughout",
+                  phases == ["export", "done"] and all(k.get("steps") == 5 for _, k in prog))
+            check("progress: 'done' carries created + added for the bar",
+                  dict(prog)["done"].get("created") is True and dict(prog)["done"].get("added"))
             check("clean room: master kb byte-identical after the build",
                   Path(master).read_bytes() == master_bytes)
             i1 = B.inspect_bundle_file(target)

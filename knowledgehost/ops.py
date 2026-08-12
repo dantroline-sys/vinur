@@ -256,6 +256,27 @@ def emit_result(did_work: bool, **stats) -> None:
           flush=True)
 
 
+# ── live progress channel ─────────────────────────────────────────────────────
+# A long verb may print these AS IT GOES (one per phase); the runner streams them
+# into the ops log and the panel renders the LAST one as a progress bar.  Free-text
+# log lines remain the human-readable detail underneath.
+PROGRESS_PREFIX = "OPS_PROGRESS "
+
+
+def emit_progress(phase: str, *, step: int | None = None, steps: int | None = None,
+                  **extra) -> None:
+    """Print a machine-readable progress line for the panel's bar.  `phase` names the
+    stage; `step`/`steps` (1-based) drive the bar; `extra` carries display detail."""
+    import json as _json
+    rec: dict = {"phase": str(phase)}
+    if step is not None:
+        rec["step"] = int(step)
+    if steps is not None:
+        rec["steps"] = int(steps)
+    rec.update(extra)
+    print(PROGRESS_PREFIX + _json.dumps(rec, ensure_ascii=False), flush=True)
+
+
 def _argv(command: str, args: dict) -> list:
     """Validate the typed options for `command` and render them to CLI flags.  Raises
     ValueError on an unknown verb/option/value — nothing unvalidated reaches the shell."""
