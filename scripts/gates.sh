@@ -63,6 +63,7 @@ run "collect battery"   ""     "$PY" tests/collect_test.py
 run "fs-browse battery" ""     "$PY" tests/fs_browse_test.py
 run "structure battery" ""     "$PY" tests/structure_test.py
 run "structured-ingest"  ""     "$PY" tests/structured_ingest_test.py
+run "pending inbox"      ""     "$PY" tests/pending_test.py
 run "ship battery"      ""     "$PY" tests/ship_test.py
 run "minimal battery"   ""     "$PY" tests/minimal_test.py
 run "G-8 broker size"   ""     "$PY" - <<'EOF'

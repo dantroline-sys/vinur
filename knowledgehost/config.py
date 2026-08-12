@@ -261,6 +261,15 @@ DEFAULTS = {
     # versification / renumbering divergences (e.g. an LXX Psalm split).  Empty by
     # default; a domain pack ships them.  Example: ["refmaps/scripture-multilingual.json"]
     "reference_maps": [],
+    # Bulk-ingest confirm gate: a document of one of these (plain-text) extensions is
+    # ANALYZED before ingest; if it looks like scripture/legal it is set aside into the
+    # 'Needs your input' inbox (knowledgehost.pending) until the user confirms its
+    # referencing — then a later crawl ingests it one canonical unit at a time.  Empty
+    # disables the gate (every doc ingests normally, no questions).  Only plain-text
+    # formats are gated so the crawl never double-parses a PDF/EPUB.
+    "structured_confirm_exts": [".txt", ".text", ".md", ".markdown"],
+    # Where the deferred-ingest inbox lives (empty => <control_dir>/run/pending.db).
+    "pending_db": "",
     "extensions": [".pdf", ".epub", ".html", ".htm", ".txt", ".md"],
     # Where `clear-queue` MOVES the source files of documents it drops from the
     # distillation queue — with their tree relative to each source root preserved,
@@ -595,8 +604,8 @@ _BOOL_KEYS = {"embed_task_prefix", "ocr", "verify", "strict",
               "ask_fit_gate", "use_spacy", "library_dense", "distill_dedupe"}
 _LIST_KEYS = {"sources", "extensions", "distill_urls", "extract_urls", "verify_urls",
               "encrypted_bundles", "library_sources", "stopwords_extra", "reference_maps",
-              "high_stakes_extra", "ops_regions", "ask_exclude_facets",
-              "distill_skip_zones"}
+              "structured_confirm_exts", "high_stakes_extra", "ops_regions",
+              "ask_exclude_facets", "distill_skip_zones"}
 
 
 def _coerce(key: str, value):

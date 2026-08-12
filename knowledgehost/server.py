@@ -606,6 +606,22 @@ class Handler(BaseHTTPRequestHandler):
                 return self._send_json({"ok": False, "error": "unauthorized"}, 401)
             res = _fs_list(self.cfg, (q.get("path") or [""])[0])
             return self._send_json(res, 200 if res.get("ok") else 400)
+        if path == "/pending":                     # 'Needs your input': deferred structured docs
+            if not self._authed():
+                return self._send_json({"ok": False, "error": "unauthorized"}, 401)
+            from . import pending as pending_mod
+            try:
+                p = pending_mod.open_pending(self.cfg)
+                try:
+                    items = p.list("pending")
+                finally:
+                    p.close()
+            except Exception as e:
+                return self._send_json({"ok": False, "error": str(e)}, 500)
+            # strip the bulky proposed profile; the UI only needs kind/questions/docs
+            for it in items:
+                it.pop("profile", None); it.pop("answers", None); it.pop("confirmed", None)
+            return self._send_json({"ok": True, "count": len(items), "pending": items})
         if path == "/ops/autopilot":                # Prioritizer tab: the plan + live state
             if not self._authed():
                 return self._send_json({"ok": False, "error": "unauthorized"}, 401)
@@ -669,7 +685,7 @@ class Handler(BaseHTTPRequestHandler):
                         "/serving/model", "/serving/add",
                         "/serving/pull", "/serving/download", "/serving/tune", "/net",
                         "/metrics/mark", "/gaps/close", "/queue/delete", "/queue/clear",
-                        "/settings/paths"):
+                        "/pending/answer", "/pending/dismiss", "/settings/paths"):
             return self._send_json({"ok": False, "error": "not found"}, 404)
         if not self._authed():
             return self._send_json({"ok": False, "error": "unauthorized"}, 401)
@@ -692,6 +708,54 @@ class Handler(BaseHTTPRequestHandler):
                     {"ok": False, "error": "status must be dismissed|acquired"}, 400)
             n = kb.close_gap(req.get("query") or "", status=status)
             return self._send_json({"ok": True, "closed": n})
+        if path == "/pending/answer":                  # 'Needs your input': confirm a deferred doc group
+            from . import pending as pending_mod, structure as S
+            try:
+                rid = int(req.get("id"))
+            except (TypeError, ValueError):
+                return self._send_json({"ok": False, "error": "id required"}, 400)
+            answers = req.get("answers")
+            if not isinstance(answers, dict):
+                return self._send_json({"ok": False, "error": "answers object required"}, 400)
+            try:
+                p = pending_mod.open_pending(self.cfg)
+                try:
+                    row = p.get(rid)
+                    if not row:
+                        return self._send_json({"ok": False, "error": "no such request"}, 404)
+                    confirmed = S.apply_answers(row.get("profile") or {}, answers)
+                    ok = p.answer(rid, answers, confirmed)
+                finally:
+                    p.close()
+            except Exception as e:
+                return self._send_json({"ok": False, "error": str(e)}, 500)
+            if not ok:
+                return self._send_json({"ok": False, "error": "already dismissed"}, 400)
+            started = False
+            if req.get("ingest_now"):                  # let the confirmed docs flow in now
+                try:
+                    self.server.ops.start("ingest", {})
+                    started = True
+                except Exception:
+                    started = False
+            return self._send_json({"ok": True, "kind": confirmed.get("kind"),
+                                    "ingest_as": confirmed.get("ingest_as"),
+                                    "docs": row.get("doc_count", 0), "ingest_started": started})
+        if path == "/pending/dismiss":                 # 'Needs your input': set a request aside
+            from . import pending as pending_mod
+            try:
+                rid = int(req.get("id"))
+            except (TypeError, ValueError):
+                return self._send_json({"ok": False, "error": "id required"}, 400)
+            try:
+                p = pending_mod.open_pending(self.cfg)
+                try:
+                    ok = p.dismiss(rid)
+                finally:
+                    p.close()
+            except Exception as e:
+                return self._send_json({"ok": False, "error": str(e)}, 500)
+            return self._send_json({"ok": ok})
         if path == "/queue/delete":                    # Sources: drop a QUEUED doc + its chunks
             store = getattr(self.server, "store", None)
             if store is None or not hasattr(store, "purge_source"):

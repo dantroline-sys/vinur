@@ -51,6 +51,7 @@ def run(fixtures, embedder, label):
     cfg["sources"] = [fixtures]
     cfg["backend"] = "sqlite"
     cfg["min_confidence"] = 0.0
+    cfg["pending_db"] = os.path.join(tmp, "pending.db")   # keep the confirm gate hermetic
 
     store = make_store(cfg)
     stats = ingest_mod.crawl(store, embedder, cfg)

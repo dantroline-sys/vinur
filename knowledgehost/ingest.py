@@ -479,9 +479,51 @@ def _ingest_structured_doc(store, embedder, cfg, path, version, chash, st, profi
     return n
 
 
+def _ingest_or_defer(store, embedder, cfg, path, *, force, confirm_exts, pend) -> int:
+    """Bulk-crawl gate for a structured/ambiguous document.  Confirm-eligible files
+    (plain text) are ANALYZED first: real scripture/legal structure is set aside into
+    the 'Needs your input' inbox (once per profile) instead of being ingested on a
+    guess; a standing answer for its profile ingests it unit-by-unit.  Everything else
+    takes the ordinary path.  Never blocks — deferral is immediate."""
+    if pend is None or os.path.splitext(path)[1].lower() not in confirm_exts:
+        return ingest_file(store, embedder, cfg, path, force=force)
+    from . import structure
+    try:
+        st = os.stat(path)
+    except OSError:
+        return 0
+    prev = store.manifest.get(path)
+    unchanged = bool(prev) and not force and abs(prev["mtime"] - st.st_mtime) < 1e-6
+    if unchanged and prev["status"] == "ok":
+        return 0                                   # already ingested, nothing changed
+    if unchanged and prev["status"] == "deferred":
+        confirmed = pend.answer_for_path(path)     # answered since it was set aside?
+        if confirmed is None:
+            return 0                               # still awaiting the user — no re-analysis
+        return ingest_file(store, embedder, cfg, path, force=True, profile=confirmed)
+    # new or changed → analyze and decide
+    prof = analyze_doc(cfg, path)
+    if not structure.should_confirm(prof):
+        return ingest_file(store, embedder, cfg, path, force=force)
+    sig = structure.profile_signature(prof)
+    confirmed = pend.confirmed_profile(sig)        # this profile already confirmed?
+    if confirmed is not None:
+        return ingest_file(store, embedder, cfg, path, force=force, profile=confirmed)
+    # defer: file the questions once per profile, mark the doc awaiting input
+    _rid, is_new = pend.defer(sig, prof.get("kind"), prof, structure.questions_for(prof), path)
+    version = int(store.manifest.meta_get("version", "1"))
+    store.manifest.set(path, _content_hash(path), st.st_mtime, version, "deferred")
+    log.info("%s %s needs confirmation (%s) — set aside for your input%s",
+             "structured document" if is_new else "another", os.path.basename(path),
+             prof.get("kind"), " [new request]" if is_new else "")
+    return 0
+
+
 def crawl(store, embedder, cfg, *, force=False) -> dict:
     """Walk every configured source root and ingest supported files.  Vinkona's research
-    outbox (research_solved_dir) is crawled too — its .md drops route to the vinkona path."""
+    outbox (research_solved_dir) is crawled too — its .md drops route to the vinkona path.
+    Structured/ambiguous plain-text docs are set aside for confirmation (the 'Needs your
+    input' inbox) rather than ingested on a guess — see `structured_confirm_exts`."""
     exts = set(cfg["extensions"])
     docs = chunks = 0
     every = cfg["ingest_log_every"]
@@ -490,22 +532,45 @@ def crawl(store, embedder, cfg, *, force=False) -> dict:
     if solved and solved not in roots:
         roots.append(solved)                       # low-trust vinkona bundle (research §6)
     skip = _skip_dirs(cfg)                          # never re-crawl the quarantine dir
-    for root in roots:
-        if not os.path.isdir(root):
-            log.info("source root missing, skipping: %s", root)
-            continue
-        for dirpath, _dirs, files in _walk_pruned(root, skip):
-            for name in files:
-                if os.path.splitext(name)[1].lower() not in exts:
-                    continue
-                path = os.path.join(dirpath, name)
-                added = ingest_file(store, embedder, cfg, path, force=force)
-                if added:
-                    docs += 1
-                    chunks += added
-                if docs and every and docs % every == 0:
-                    log.info("… %d docs / %d chunks", docs, chunks)
-    return {"docs": docs, "chunks": chunks}
+
+    confirm_exts = {str(e).lower() for e in (cfg.get("structured_confirm_exts") or [])}
+    pend = None
+    if confirm_exts:
+        try:
+            from . import pending as pending_mod
+            pend = pending_mod.open_pending(cfg)
+        except Exception as e:                     # the gate is best-effort, never fatal
+            log.warning("deferred-ingest inbox unavailable (%s) — ingesting without the "
+                        "confirm gate", e)
+            pend = None
+    deferred = 0
+    try:
+        for root in roots:
+            if not os.path.isdir(root):
+                log.info("source root missing, skipping: %s", root)
+                continue
+            for dirpath, _dirs, files in _walk_pruned(root, skip):
+                for name in files:
+                    if os.path.splitext(name)[1].lower() not in exts:
+                        continue
+                    path = os.path.join(dirpath, name)
+                    added = _ingest_or_defer(store, embedder, cfg, path,
+                                             force=force, confirm_exts=confirm_exts, pend=pend)
+                    if added:
+                        docs += 1
+                        chunks += added
+                    if docs and every and docs % every == 0:
+                        log.info("… %d docs / %d chunks", docs, chunks)
+        deferred = pend.pending_count() if pend else 0
+    finally:
+        if pend:
+            pend.close()
+    out = {"docs": docs, "chunks": chunks}
+    if deferred:
+        out["needs_confirm"] = deferred
+        log.info("%d document group(s) need your confirmation before ingest — "
+                 "answer them in the 'Needs your input' panel", deferred)
+    return out
 
 
 def _quarantine_roots(cfg) -> list:

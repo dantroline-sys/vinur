@@ -187,6 +187,7 @@ INDEX_HTML = """<!doctype html>
   <div class="subtabs" id="subtabs"></div>
   <div class="bar" id="bar"></div>
   <div id="tabhelp"></div>
+  <div id="needsinput"></div>
   <div id="banner"></div>
   <div id="results" class="empty">…</div>
 </main>
@@ -2026,6 +2027,84 @@ async function startCollect(a, answers) {
     : '✗ ' + esc(r.error || 'failed — auth token?')}</div>`;
 }
 
+// ── 'Needs your input' inbox: documents the bulk crawl set aside because they
+// look like scripture/legal and need a confirmation before a structured ingest.
+// Grouped once per profile; answering confirms every file filed under the group.
+let PENDINGQ = [];
+function baseName(p) {
+  const s = String(p); const i = s.lastIndexOf('/');
+  return i >= 0 ? s.slice(i + 1) : s;
+}
+async function loadPending() {
+  const el = $('#needsinput');
+  if (!el) return;
+  let r;
+  try { r = await (await authFetch('/pending')).json(); } catch (e) { r = { ok: false }; }
+  if (!r.ok || !r.count) { PENDINGQ = []; el.innerHTML = ''; return; }
+  PENDINGQ = r.pending || [];
+  let h = `<div class="note" style="text-align:left;border-left:3px solid #e2a33a;max-width:760px">`
+    + `<b>Needs your input</b> — ${r.count} document group(s) look like structured text and were `
+    + `set aside during ingest until you confirm how to read them:`;
+  PENDINGQ.forEach((req, ri) => {
+    const files = (req.docs || []).map(baseName);
+    h += `<div style="margin-top:12px;border-top:1px solid #8883;padding-top:8px">`
+      + `<div><b>${esc(req.kind || '?')}</b> — ${req.doc_count} file(s): `
+      + `${esc(files.slice(0, 4).join(', '))}${files.length > 4 ? ' …' : ''}</div>`;
+    (req.questions || []).forEach((q, qi) => {
+      h += `<div style="margin-top:8px"><div style="font-weight:600">${esc(q.prompt)}</div>`;
+      if (q.detail) h += `<div style="opacity:.6;font-size:.82em;margin:2px 0">${esc(q.detail)}</div>`;
+      if (q.type === 'choice') {
+        (q.options || []).forEach((o) => {
+          const chk = (o.value === q.default) ? ' checked' : '';
+          h += `<label style="display:block;margin:2px 0"><input type="radio" name="pq_${ri}_${qi}" value="${esc(o.value)}"${chk}> ${esc(o.label)}</label>`;
+        });
+      } else {
+        h += `<input id="pq_${ri}_${qi}" value="${esc(q.default || '')}" style="width:300px">`;
+      }
+      h += `</div>`;
+    });
+    h += `<div style="margin-top:10px">`
+      + `<button class="toolbtn" onclick="answerPending(${ri}, true)">Confirm &amp; ingest now</button> `
+      + `<button class="toolbtn" onclick="answerPending(${ri}, false)">Confirm</button> `
+      + `<button class="toolbtn" onclick="dismissPending(${ri})" title="do not ask again unless the file changes">Dismiss</button>`
+      + `</div></div>`;
+  });
+  h += `</div>`;
+  el.innerHTML = h;
+}
+function pendingAnswers(ri) {
+  const req = PENDINGQ[ri]; const out = {};
+  (req.questions || []).forEach((q, qi) => {
+    if (q.type === 'choice') {
+      const sel = document.querySelector(`input[name="pq_${ri}_${qi}"]:checked`);
+      out[q.id] = sel ? sel.value : (q.default || '');
+    } else {
+      const el = document.getElementById(`pq_${ri}_${qi}`);
+      out[q.id] = el ? el.value.trim() : '';
+    }
+  });
+  return out;
+}
+async function answerPending(ri, ingestNow) {
+  const req = PENDINGQ[ri];
+  const body = { id: req.id, answers: pendingAnswers(ri) };
+  if (ingestNow) body.ingest_now = true;
+  const r = await postJSON('/pending/answer', body).catch(e => ({ ok: false, error: netErr(e) }));
+  $('#banner').innerHTML = `<div class="note">${r.ok
+    ? '✓ confirmed ' + esc(r.kind || req.kind || '') + ' (' + (r.docs || req.doc_count) + ' file(s)) — '
+      + (r.ingest_started ? 'ingesting now — watch Operations' : 'they will ingest on the next crawl')
+    : '✗ ' + esc(r.error || 'failed — auth token?')}</div>`;
+  loadPending();
+}
+async function dismissPending(ri) {
+  const req = PENDINGQ[ri];
+  const r = await postJSON('/pending/dismiss', { id: req.id }).catch(e => ({ ok: false, error: netErr(e) }));
+  $('#banner').innerHTML = `<div class="note">${r.ok
+    ? '✓ set aside — it will not be asked again unless the file changes'
+    : '✗ ' + esc(r.error || 'failed')}</div>`;
+  loadPending();
+}
+
 // ── file browser overlay: navigate the host's folders to pick a document
 // ('file' mode) or agree a target .kdb location ('save' mode).  Every clickable
 // item is INDEX-keyed (fbRoot/fbClick), so an untrusted path/filename is never
@@ -3027,6 +3106,7 @@ function abToggle(k) {
 addEventListener('resize', () => { if (active === 'stats' && STATS_DATA) renderStatsCharts(); });
 
 buildTabs(); refreshStats(); setInterval(refreshStats, REFRESH_MS); loadHelp(); go('ask');
+loadPending(); setInterval(loadPending, 15000);   // surface the 'Needs your input' inbox
 </script>
 </body>
 </html>
