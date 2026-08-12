@@ -427,10 +427,19 @@ def _run_collect(cfg, log, args) -> int:
     log.info("collect: %s %s [%s] — added %s; file now holds %s",
              "created" if res["created"] else "updated", res["target"], res["bundle"],
              added, res.get("totals"))
+    if not res.get("complete", True):
+        log.warning("collect: build is INCOMPLETE — re-run the same collect to finish "
+                    "distilling / recovering cards (it resumes; the rest merges in).")
+    if res.get("single_tier"):
+        log.info("collect: distilled single-tier (no independent verify tier was up) — "
+                 "a quality note for a shared bundle, not an error.")
     if not res.get("shareable", True):
         log.warning("collection has unlicensed sources — set a --license before sharing")
     ops_mod.emit_result(True, target=res["target"], bundle=res["bundle"],
-                        created=res["created"], **{f"added_{k}": v for k, v in added.items()})
+                        created=res["created"], complete=bool(res.get("complete", True)),
+                        single_tier=bool(res.get("single_tier")),
+                        recovered_truncated=res.get("recovered_truncated", 0),
+                        **{f"added_{k}": v for k, v in added.items()})
     return 0
 
 

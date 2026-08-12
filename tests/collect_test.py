@@ -35,9 +35,12 @@ def check(label, cond):
 check.failed = 0
 
 
-def fake_pipeline(doc, node, label, *, license="CC-BY-4.0", holder="A. Author"):
+def fake_pipeline(doc, node, label, *, license="CC-BY-4.0", holder="A. Author",
+                  extra_stats=None):
     """A _pipeline stand-in that drops one source + one node + one card (all citing
-    `doc`) into the scratch kb, exactly like a real clean-room build would."""
+    `doc`) into the scratch kb, exactly like a real clean-room build would.
+    `extra_stats` lets a test inject completeness/tier/recard signals the real
+    pipeline would compute (undistilled, single_tier, recard)."""
     def run(scfg, src, say, **_kw):        # absorbs label=/report= that add_to_collection passes
         kb = KB(scfg)
         kb.db.execute(
@@ -52,7 +55,7 @@ def fake_pipeline(doc, node, label, *, license="CC-BY-4.0", holder="A. Author"):
         kb.add_card(node, title="Use " + label, goal="g", steps=["a", "b"], doc_id=doc)
         kb.db.commit()
         kb.close()
-        return {"fake": True}
+        return {"fake": True, **(extra_stats or {})}
     return run
 
 
@@ -89,8 +92,9 @@ def main():
             # (the fake _pipeline skips ingest/distill/link phases; add_to_collection
             #  still drives export + done, which is the wiring under test)
             phases = [p for p, _ in prog]
-            check("progress: reporter fired export → done, steps=5 throughout",
-                  phases == ["export", "done"] and all(k.get("steps") == 5 for _, k in prog))
+            check("progress: reporter fired export(5) → done(6) of 6 steps",
+                  phases == ["export", "done"] and all(k.get("steps") == 6 for _, k in prog)
+                  and dict(prog)["export"].get("step") == 5 and dict(prog)["done"].get("step") == 6)
             check("progress: 'done' carries created + added for the bar",
                   dict(prog)["done"].get("created") is True and dict(prog)["done"].get("added"))
             check("clean room: master kb byte-identical after the build",
@@ -103,6 +107,9 @@ def main():
                   and i1["counts"].get("procedure_cards") == 1)
             check("create: the source is tagged into bundle 'geo'",
                   all(s["bundle"] == "geo" for s in i1["sources"]))
+            check("create: complete build reports complete + removes the scratch",
+                  r1.get("complete") is True
+                  and not os.path.isdir(os.path.join(cfg["pack_build_dir"], "collect-geo")))
 
             # ── add a DIFFERENT document to the SAME file/bundle → merge grows ───
             P._pipeline = fake_pipeline("doc:water", "n_water", "water")
@@ -147,6 +154,26 @@ def main():
             except ValueError as e:
                 check("plain-.kdb-only: compress/encrypt target refused",
                       "plain .kdb" in str(e))
+
+            # ── incompleteness: reported honestly + scratch KEPT for resume ──────
+            P._pipeline = fake_pipeline("doc:part", "n_part", "partial",
+                                        extra_stats={"undistilled": 2})
+            tp = os.path.join(td, "share2", "part.kdb")
+            rp = P.add_to_collection(cfg, str(src1), tp, "partbundle")
+            check("incomplete: complete=False, undistilled surfaced",
+                  rp["complete"] is False and rp["undistilled"] == 2)
+            check("incomplete: the (partial) file was still written", Path(tp).exists())
+            check("incomplete: scratch KEPT so a re-run resumes",
+                  os.path.isdir(os.path.join(cfg["pack_build_dir"], "collect-partbundle")))
+
+            # ── single-tier + truncation-recovery are surfaced honestly ──────────
+            P._pipeline = fake_pipeline("doc:st", "n_st", "single",
+                                        extra_stats={"single_tier": True, "recard": {"chunks": 3}})
+            ts = os.path.join(td, "share3", "st.kdb")
+            rs = P.add_to_collection(cfg, str(src1), ts, "stbundle")
+            check("single-tier flagged, build still complete",
+                  rs["single_tier"] is True and rs["complete"] is True)
+            check("truncation-recovery count surfaced", rs["recovered_truncated"] == 3)
 
             # ── real CLI dispatch (a dry-run — no LM): the parser-builds gate can't
             #    catch a crash at DISPATCH time (e.g. touching an unopened `store`) ─

@@ -227,9 +227,9 @@ def scratch_cfg(cfg: dict, build: Path, src: Path) -> dict:
 
 
 # The phases a clean-room build moves through, in order — shared by _pipeline
-# (ingest/distill/link) and add_to_collection (export/done) so the panel's progress
-# bar has one consistent step sequence.
-_BUILD_STEPS = ("ingest", "distill", "link", "export", "done")
+# (ingest/distill/recard/link) and add_to_collection (export/done) so the panel's
+# progress bar has one consistent step sequence.
+_BUILD_STEPS = ("ingest", "distill", "recard", "link", "export", "done")
 
 
 def _emit(report, phase: str, **extra) -> None:
@@ -283,6 +283,12 @@ def _pipeline(scfg: dict, src: Path, say, *, label: str = "pack", report=None) -
             raise distill_mod.BackendUnavailable(
                 f"no distill endpoint up — start one, then re-run {label} (the "
                 "build resumes from its scratch)")
+        # single-tier note: verify tier absent, or the SAME server+model as extract
+        # (self-verification collapses to single-tier).  Lower quality, not a failure —
+        # a shared build should record it so its provenance is honest.
+        _eid = lambda es: {(getattr(e, "url", None), getattr(e, "model", None)) for e in es}
+        stats["single_tier"] = (not verifiers) or _eid(verifiers) <= _eid(extractors)
+
         _emit(report, "distill", chunks=chunks)
         say(f"{label}: distilling {chunks} chunk(s) into concepts / relations / cards "
             "(the long step — progress lines follow) …")
@@ -291,6 +297,32 @@ def _pipeline(scfg: dict, src: Path, say, *, label: str = "pack", report=None) -
             store, kb, extractors or verifiers, embedder, scfg,
             verifiers=verifiers if extractors else None)
         say(f"{label}: distilled {stats['distill']} ({time.time() - t0:.1f}s)")
+
+        # RECARD RECOVERY — the crux for a thrown-away scratch.  A chunk truncated at
+        # max_tokens keeps its distil stamp but SKIPS its recard stamp, deferring the
+        # rest of its cards to "the recard pass".  On the master that pass runs later;
+        # here the scratch is deleted at export, so those cards would be lost forever.
+        # Run it now (all_families re-mines the truncated chunks; a no-op when nothing
+        # truncated) so the bundle is complete before it ships.
+        _emit(report, "recard")
+        try:
+            stats["recard"] = distill_mod.recard_corpus(
+                store, kb, verifiers or extractors, embedder, scfg, all_families=True)
+            rec = (stats["recard"] or {}).get("chunks", 0)
+            if rec:
+                say(f"{label}: recovered cards for {rec} truncated chunk(s) ({stats['recard']})")
+        except distill_mod.BackendUnavailable as e:
+            stats["recard_incomplete"] = True
+            log.warning("%s: card recovery (recard) could not finish — the bundle may be "
+                        "missing cards from truncated chunks; re-run %s to recover: %s",
+                        label, label, e)
+
+        # completeness safety net (≈0 on the success path — an interruption RAISES and
+        # is handled by the caller; this catches any residual undistilled chunk).
+        try:
+            stats["undistilled"] = max(0, store.count() - kb.counts().get("distilled_chunks", 0))
+        except Exception:
+            stats["undistilled"] = 0
 
         _emit(report, "link", **{k: stats["distill"].get(k) for k in ("concepts", "cards")})
         lm = (verifiers or extractors)[0]
@@ -626,13 +658,32 @@ def add_to_collection(cfg: dict, doc: str, target: str, bundle: str, *,
             srcc.close()
             dst.close()
     os.replace(tmp, tgt)
-    shutil.rmtree(build, ignore_errors=True)
 
-    say(f"collect: {'created' if created else 'updated'} {tgt} "
-        f"[{bundle}] — added {added or 'nothing new'}; file now holds {totals}")
-    _emit(report, "done", created=created, added=added, target=str(tgt), bundle=bundle)
+    undistilled = stats.get("undistilled", 0)
+    recard_incomplete = bool(stats.get("recard_incomplete"))
+    single_tier = bool(stats.get("single_tier"))
+    recovered = (stats.get("recard") or {}).get("chunks", 0)
+    complete = undistilled == 0 and not recard_incomplete
+    # Keep the scratch when the build couldn't finish, so re-running the SAME collect
+    # resumes distil/recard from the checkpoint and the rest merges in idempotently.
+    if complete:
+        shutil.rmtree(build, ignore_errors=True)
+    else:
+        say(f"collect: build INCOMPLETE — "
+            + (f"{undistilled} chunk(s) still undistilled" if undistilled else "card recovery unfinished")
+            + f"; scratch kept at {build}. Re-run the same collect to finish (it resumes); "
+              "the remainder merges into the file.")
+
+    say(f"collect: {'created' if created else 'updated'} {tgt} [{bundle}] — "
+        f"added {added or 'nothing new'}; file now holds {totals}"
+        + (f"; recovered cards for {recovered} truncated chunk(s)" if recovered else "")
+        + ("; distilled SINGLE-TIER (no independent verify — quality note)" if single_tier else ""))
+    _emit(report, "done", created=created, added=added, target=str(tgt), bundle=bundle,
+          complete=complete, single_tier=single_tier)
     return {"ok": True, "target": str(tgt), "bundle": bundle, "created": created,
-            "added": added, "totals": totals, "shareable": g["shareable"], "stats": stats}
+            "added": added, "totals": totals, "shareable": g["shareable"],
+            "complete": complete, "single_tier": single_tier,
+            "recovered_truncated": recovered, "undistilled": undistilled, "stats": stats}
 
 
 def _seal_bytes(src: Path, dst: Path, key: str) -> None:
