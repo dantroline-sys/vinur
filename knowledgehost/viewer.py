@@ -1924,6 +1924,12 @@ function collArgs() {
   if ($('#collunlic').checked) args.allow_unlicensed = true;
   return args;
 }
+let COLLQ = null;   // structured-text questions awaiting the user's answers for the pending build
+function collPreviewUrl(a, withDoc) {
+  let u = '/collection/preview?to=' + encodeURIComponent(a.to) + '&bundle=' + encodeURIComponent(a.bundle);
+  if (withDoc && a.doc) u += '&doc=' + encodeURIComponent(a.doc);
+  return u;
+}
 async function previewCollection() {
   const a = collArgs();
   if (!a.doc || !a.to || !a.bundle) {
@@ -1932,8 +1938,7 @@ async function previewCollection() {
   }
   let r;
   try {
-    r = await (await authFetch('/collection/preview?to=' + encodeURIComponent(a.to)
-      + '&bundle=' + encodeURIComponent(a.bundle))).json();
+    r = await (await authFetch(collPreviewUrl(a, true))).json();
   } catch (e) { r = { ok: false, error: netErr(e) }; }
   if (!r.ok) { $('#banner').innerHTML = `<div class="note">✗ ${esc(r.error || 'preview failed — auth token?')}</div>`; return; }
   if (!r.compatible) { $('#banner').innerHTML = `<div class="note">✗ ${esc(r.error || 'target holds a different bundle')}</div>`; return; }
@@ -1941,17 +1946,81 @@ async function previewCollection() {
   const where = r.exists
     ? `will ADD to existing ${esc(a.to)} — currently bundle '${esc(r.file_bundle || a.bundle)}'${cur ? ' (' + esc(cur) + ')' : ''}`
     : `will CREATE ${esc(a.to)} as a new bundle '${esc(a.bundle)}'`;
-  $('#banner').innerHTML = `<div class="note">✓ ${where}. Distil runs in the background when you Build.</div>`;
+  const s = r.structure || {};
+  const sline = s.needs_confirm
+    ? ` <b>Looks like ${esc(s.kind || '?')}</b> — Build will ask you to confirm its referencing before ingesting it verse/section by verse/section.`
+    : (s.kind && s.kind !== 'unknown' ? ` (detected ${esc(s.kind)} structure)` : '');
+  $('#banner').innerHTML = `<div class="note">✓ ${where}. Distil runs in the background when you Build.${sline}</div>`;
 }
+// Build = analyze first; a structured (scripture/legal) doc surfaces confirm
+// questions BEFORE the clean-room build, so nothing is ingested on a guess.
 async function buildCollection() {
   const a = collArgs();
   if (!a.doc || !a.to || !a.bundle) {
     $('#banner').innerHTML = '<div class="note">✗ fill in the document, bundle name, and target file</div>';
     return;
   }
+  $('#banner').innerHTML = '<div class="note">looking at the document…</div>';
+  let r;
+  try {
+    r = await (await authFetch(collPreviewUrl(a, true))).json();
+  } catch (e) { r = { ok: false, error: netErr(e) }; }
+  if (!r.ok) { $('#banner').innerHTML = `<div class="note">✗ ${esc(r.error || 'failed — auth token?')}</div>`; return; }
+  if (!r.compatible) { $('#banner').innerHTML = `<div class="note">✗ ${esc(r.error || 'target holds a different bundle')}</div>`; return; }
+  const s = r.structure || {};
+  if (s.needs_confirm && (s.questions || []).length) { renderCollQuestions(s, a); return; }
+  startCollect(a, null);
+}
+function renderCollQuestions(s, a) {
+  COLLQ = { qs: s.questions || [], args: a };
+  const unit = s.kind === 'legal' ? 'section' : 'verse';
+  let h = `<div class="note" style="text-align:left;max-width:720px">`
+    + `<b>Before I build:</b> this looks like <b>${esc(s.kind || '?')}</b>`
+    + (s.scheme ? ` — ${esc(s.scheme)}` : '')
+    + `. Confirm a few things so it's ingested one ${esc(unit)} at a time, each with a canonical citation:`;
+  (s.warnings || []).forEach(w => { h += `<div style="opacity:.7;font-size:.85em;margin-top:4px">⚠ ${esc(w)}</div>`; });
+  (COLLQ.qs).forEach((q, i) => {
+    h += `<div style="margin-top:12px"><div style="font-weight:600">${esc(q.prompt)}</div>`;
+    if (q.detail) h += `<div style="opacity:.6;font-size:.82em;margin:2px 0">${esc(q.detail)}</div>`;
+    if (q.type === 'choice') {
+      (q.options || []).forEach((o) => {
+        const chk = (o.value === q.default) ? ' checked' : '';
+        h += `<label style="display:block;margin:3px 0"><input type="radio" name="collq_${i}" value="${esc(o.value)}"${chk}> ${esc(o.label)}</label>`;
+      });
+    } else {
+      h += `<input id="collq_${i}" value="${esc(q.default || '')}" style="width:300px">`;
+    }
+    h += `</div>`;
+  });
+  h += `<div style="margin-top:14px"><button class="toolbtn" onclick="submitCollBuild()">Confirm &amp; build</button> `
+    + `<button class="toolbtn" onclick="cancelCollBuild()">Cancel</button></div></div>`;
+  $('#banner').innerHTML = h;
+}
+function collAnswers() {
+  const out = {};
+  (COLLQ.qs || []).forEach((q, i) => {
+    if (q.type === 'choice') {
+      const sel = document.querySelector(`input[name="collq_${i}"]:checked`);
+      out[q.id] = sel ? sel.value : (q.default || '');
+    } else {
+      const el = document.getElementById(`collq_${i}`);
+      out[q.id] = el ? el.value.trim() : '';
+    }
+  });
+  return out;
+}
+function cancelCollBuild() { COLLQ = null; $('#banner').innerHTML = '<div class="note">build cancelled — nothing was ingested.</div>'; }
+async function submitCollBuild() {
+  if (!COLLQ) return;
+  const a = COLLQ.args, answers = collAnswers();
+  COLLQ = null;
+  startCollect(a, answers);
+}
+async function startCollect(a, answers) {
   $('#banner').innerHTML = '<div class="note">building — clean-room ingest + distil; watch Operations for progress…</div>';
-  const r = await postJSON('/ops/run', { command: 'collect', args: a })
-    .catch(e => ({ ok: false, error: netErr(e) }));
+  const body = { command: 'collect', args: a };
+  if (answers) body.answers = answers;
+  const r = await postJSON('/ops/run', body).catch(e => ({ ok: false, error: netErr(e) }));
   $('#banner').innerHTML = `<div class="note">${r.ok
     ? '✓ collect started — see Operations; when it finishes, ' + esc(a.to) + ' holds bundle ' + esc(a.bundle)
     : '✗ ' + esc(r.error || 'failed — auth token?')}</div>`;

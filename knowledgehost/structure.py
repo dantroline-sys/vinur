@@ -124,8 +124,32 @@ from collections import namedtuple   # noqa: E402
 Ref = namedtuple("Ref", "kind key display work parts")
 
 
+_OSIS_REV = {v: k for k, v in _OSIS.items()}
+
+
 def osis_code(canonical_book: str) -> str:
     return _OSIS.get(canonical_book, canonical_book.replace(" ", ""))
+
+
+def display_for_key(key: str) -> str:
+    """Reverse a canonical key to its human citation ('bible:John.3.16' → 'John 3:16',
+    'usc:17/106/a/1' → '17 U.S.C. § 106(a)(1)').  For friendly rendering of a stored
+    unit whose durable identity is the key; returns the key unchanged if unrecognised."""
+    if key.startswith("bible:"):
+        m = re.match(r"([^.]+)\.(\d+)\.(\d+)(?:-(\d+))?$", key[6:])
+        if m:
+            book = _OSIS_REV.get(m.group(1), m.group(1))
+            rng = f"-{m.group(4)}" if m.group(4) else ""
+            return f"{book} {m.group(2)}:{m.group(3)}{rng}"
+    if key.startswith("usc:"):
+        body = key[4:]
+        if body.startswith("s"):
+            parts = body[1:].split("/")
+            return f"§ {parts[0]}" + "".join(f"({p})" for p in parts[1:])
+        parts = body.split("/")
+        if len(parts) >= 2:
+            return f"{parts[0]} U.S.C. § {parts[1]}" + "".join(f"({p})" for p in parts[2:])
+    return key
 
 
 def scripture_ref(book_canonical: str, chap, verse, verse_end=None) -> Ref:
@@ -202,12 +226,23 @@ def _read_map_file(path: str) -> dict:
         return json.load(f)
 
 
-def load_reference_maps(paths) -> ReferenceMaps:
+def _merge_map(into_books: dict, into_keys: dict, data: dict) -> None:
+    for canon, forms in (data.get("book_aliases") or {}).items():
+        if str(canon).startswith("_"):                  # a doc/comment key, not data
+            continue
+        into_books.setdefault(canon, []).extend(forms if isinstance(forms, list) else [forms])
+    into_keys.update({str(k): str(v) for k, v in (data.get("key_aliases") or {}).items()
+                      if not str(k).startswith("_")})
+
+
+def load_reference_maps(paths, extra: dict | None = None) -> ReferenceMaps:
     """Merge one or more reference-map files (.json / .toml) into a ReferenceMaps.
     Each file may carry ``book_aliases`` ({canonical: [variant, …]}) and
     ``key_aliases`` ({from_key: to_key}); later files win on key_aliases and add to
     book_aliases.  Missing / unreadable files are skipped (never fatal) — a domain
-    pack ships these, and a half-written map must not break ingest."""
+    pack ships these, and a half-written map must not break ingest.  `extra` folds in
+    one more in-memory map of the SAME shape last (a document's ad-hoc, answer-derived
+    aliases), so per-doc confirmations compose with a pack's shipped maps."""
     book_aliases: dict[str, list] = {}
     key_aliases: dict[str, str] = {}
     for p in (paths or []):
@@ -218,13 +253,9 @@ def load_reference_maps(paths) -> ReferenceMaps:
             data = _read_map_file(p)
         except (OSError, ValueError):
             continue
-        for canon, forms in (data.get("book_aliases") or {}).items():
-            if canon.startswith("_"):                   # a doc/comment key, not data
-                continue
-            book_aliases.setdefault(canon, []).extend(
-                forms if isinstance(forms, list) else [forms])
-        key_aliases.update({str(k): str(v) for k, v in (data.get("key_aliases") or {}).items()
-                            if not str(k).startswith("_")})
+        _merge_map(book_aliases, key_aliases, data)
+    if extra:
+        _merge_map(book_aliases, key_aliases, extra)
     return ReferenceMaps(book_aliases, key_aliases)
 
 
@@ -461,3 +492,177 @@ def parse_citations(text: str, profile: dict, *, book: str | None = None,
         if r.key not in seen:
             seen.add(r.key); uniq.append(r)
     return uniq
+
+
+# ── interactive confirm: profile → plain-language questions → confirmed profile ──
+# A structured/ambiguous document is never ingested on a guess.  analyze() PROPOSES;
+# questions_for() turns that proposal into a short list of plain-language questions a
+# human answers; apply_answers() folds the replies into a CONFIRMED profile (kind,
+# how to ingest, book/title context, and any ad-hoc book / versification aliases).
+# Plain prose asks nothing — should_confirm() is False — so the ordinary bulk-ingest
+# workflow is undisturbed; only real canonical structure interrupts.
+
+def _scheme_human(profile: dict) -> str:
+    return {"book-chapter-verse-inline": "each line is 'Book chapter:verse …'",
+            "chapter-verse-lines": "a book header then bare 'chapter:verse' lines",
+            "section-hierarchy": "numbered sections (§ / Section)",
+            }.get(profile.get("scheme"), profile.get("scheme") or "an unfamiliar layout")
+
+
+def should_confirm(profile: dict) -> bool:
+    """True when a document carries enough canonical structure to be worth confirming
+    before ingest — so plain prose (or a stray '§' in an article) never interrupts the
+    normal workflow.  Gated on kind + confidence + a floor of real unit markers."""
+    if profile.get("kind") not in ("scripture", "legal"):
+        return False
+    st = profile.get("stats") or {}
+    strong = st.get("scripture_unit_lines", 0) >= 3 or st.get("legal_markers", 0) >= 3
+    return bool(profile.get("confidence", 0) >= 0.2 or strong)
+
+
+def _unknown_book_tokens(profile: dict) -> list[str]:
+    """The unrecognised book names analyze() surfaced (parsed back out of its warning)."""
+    out: list[str] = []
+    for w in profile.get("warnings", []):
+        if w.startswith("unrecognised book") and ":" in w:
+            for tok in re.findall(r"([^,]+?)\s*[×x]\s*\d+", w.split(":", 1)[1]):
+                name = tok.strip()
+                if name and name not in out:
+                    out.append(name)
+    return out
+
+
+def questions_for(profile: dict) -> list[dict]:
+    """Plain-language questions a human answers before a structured ingest.  Each is
+    {id, prompt, type: choice|text, options?, default, detail?}; returns [] when there
+    is nothing worth asking (should_confirm is False).  Feed the replies (id → value)
+    to apply_answers()."""
+    if not should_confirm(profile):
+        return []
+    kind = profile.get("kind")
+    qs: list[dict] = []
+    if kind == "scripture":
+        books = ", ".join(b["canonical"] for b in profile.get("books", [])[:8]) or "—"
+        qs.append({
+            "id": "kind", "type": "choice", "default": "structured",
+            "prompt": "This looks like scripture — " + _scheme_human(profile)
+                      + ". How should I ingest it?",
+            "detail": "Books detected: " + books,
+            "options": [
+                {"value": "structured", "label": "Structured scripture — one node per verse, with cross-reference links"},
+                {"value": "plain", "label": "Ordinary prose — just chunk it normally"}]})
+        if profile.get("scheme") == "chapter-verse-lines" and not profile.get("book_order"):
+            qs.append({
+                "id": "book", "type": "text", "default": "",
+                "prompt": "The file uses bare 'chapter:verse' lines with no book header — "
+                          "which book is this file? (e.g. 'John')",
+                "detail": "Leave blank if the text already heads several books itself."})
+        apoc = any("apocryphal" in w for w in profile.get("warnings", []))
+        qs.append({
+            "id": "canon", "type": "choice", "default": "as_printed",
+            "prompt": ("Deuterocanonical/apocryphal books are present, so canon and verse "
+                       "numbering vary by tradition — " if apoc else "")
+                      + "which verse numbering should I treat as canonical?",
+            "options": [
+                {"value": "as_printed", "label": "As printed — use the chapter:verse numbers in this file"},
+                {"value": "diverges", "label": "This edition's numbering diverges — I'll supply a mapping file"}]})
+        for name in _unknown_book_tokens(profile):
+            qs.append({
+                "id": "book:" + name, "type": "text", "default": "",
+                "prompt": f"I found references to '{name}', which isn't one of the standard "
+                          "66 books. What is it?",
+                "detail": "Leave blank to ignore it; type a standard book name (e.g. "
+                          "'Revelation') to treat it AS that book; type 'keep' to keep it "
+                          "as its own extra-canonical work."})
+    elif kind == "legal":
+        qs.append({
+            "id": "kind", "type": "choice", "default": "structured",
+            "prompt": "This looks like legal text — " + _scheme_human(profile)
+                      + ". How should I ingest it?",
+            "options": [
+                {"value": "structured", "label": "Structured law — one node per section, with citation links"},
+                {"value": "plain", "label": "Ordinary prose — just chunk it normally"}]})
+        title = (profile.get("work") or {}).get("title", "")
+        qs.append({
+            "id": "work_title", "type": "text", "default": title,
+            "prompt": (f"Which title/code is this document? I detected Title {title}, U.S.C."
+                       if title else
+                       "Which title/code is this document? (e.g. '17' for Title 17, U.S.C.)"),
+            "detail": "Needed so a local '§ 106' gets a cross-document key (usc:17/106). "
+                      + ("Correct it, or clear it if it isn't a single title."
+                         if title else "Leave blank if it isn't a single title.")})
+        if any("cites it" in w.lower() for w in profile.get("warnings", [])):
+            qs.append({
+                "id": "role", "type": "choice", "default": "code",
+                "prompt": "Is this file the law itself, or a document that cites the law?",
+                "options": [
+                    {"value": "code", "label": "The code/statute itself — its sections are the units"},
+                    {"value": "commentary", "label": "A commentary that cites the law — attach it to the sections it cites"}]})
+    return qs
+
+
+def apply_answers(profile: dict, answers: dict) -> dict:
+    """Fold confirmation answers (id → value) into a CONFIRMED profile.  Returns the
+    profile with `confirmed=True`, an `ingest_as` ('structured'|'plain'), any corrected
+    kind / book_order / work / role, and a `reference_map` ({book_aliases, key_aliases})
+    assembled from the ad-hoc answers (other book names, versification choice) — the
+    same shape load_reference_maps() produces, so it merges with a domain pack's maps."""
+    p = dict(profile)
+    ans = {k: (v.strip() if isinstance(v, str) else v) for k, v in (answers or {}).items()}
+    p["confirmed"] = True
+
+    if ans.get("kind") == "plain":
+        p["ingest_as"] = "plain"
+        p["reference_map"] = {"book_aliases": {}, "key_aliases": {}}
+        return p
+    p["ingest_as"] = "structured"
+
+    bk = ans.get("book")
+    if bk:
+        b = match_book(str(bk))
+        if b:
+            p["book_order"] = [b[1]]
+
+    if "work_title" in ans:
+        digits = re.search(r"\d+", str(ans["work_title"] or ""))
+        w = dict(p.get("work") or {})
+        w["title"] = digits.group(0) if digits else ""
+        w.setdefault("scheme", "usc")
+        p["work"] = w
+
+    if ans.get("role") == "commentary":
+        p["role"] = "commentary"
+    if ans.get("canon") == "diverges":
+        p["versification"] = "diverges"          # user will attach a key-alias map file
+
+    book_aliases: dict[str, list] = {}
+    extra_books: list[str] = []
+    for k, v in ans.items():
+        if not k.startswith("book:"):
+            continue
+        token, v = k[5:], str(v or "").strip()
+        if not v or v.lower() == "ignore":
+            continue
+        if v.lower() == "keep":
+            extra_books.append(token)
+            continue
+        b = match_book(v)
+        if b:
+            book_aliases.setdefault(b[1], []).append(token)
+    if extra_books:
+        p["extra_books"] = extra_books
+    p["reference_map"] = {"book_aliases": book_aliases, "key_aliases": {}}
+    return p
+
+
+def profile_signature(profile: dict) -> str:
+    """A stable key for 'ask once per profile' batching in a bulk crawl: documents
+    that would raise the SAME confirmation share a signature (a whole Title-17 folder
+    → one key; a Bible and a legal code → two).  Plain docs collapse to 'plain'."""
+    kind = profile.get("kind", "unknown")
+    if kind == "legal":
+        w = profile.get("work") or {}
+        return f"legal:{w.get('scheme', 'usc')}:{w.get('title', '')}"
+    if kind == "scripture":
+        return f"scripture:{(profile.get('work') or {}).get('scheme', 'bible')}"
+    return "plain"

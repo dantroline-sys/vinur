@@ -435,8 +435,24 @@ def _run_analyze(cfg, log, args) -> int:
             print(f"     {s.get('key', '?')}   [{s['citation']}]  {s['text']}")
     for w in prof.get("warnings", []):
         print(f"  ⚠ {w}")
-    print("\n  → If this looks right, re-run with --save <profile.json>, then a structured "
-          "ingest will use it. If a book/scheme is wrong, tell me what it should be.\n")
+
+    qs = S.questions_for(prof)
+    if qs:
+        print("\n  I need you to confirm a few things before a structured ingest "
+              "(answer these in an --answers-file JSON, id → value):")
+        for q in qs:
+            print(f"\n   • [{q['id']}] {q['prompt']}")
+            if q.get("detail"):
+                print(f"       {q['detail']}")
+            for o in q.get("options", []):
+                mark = "default" if o["value"] == q.get("default") else "      "
+                print(f"       ({mark}) {o['value']}: {o['label']}")
+        example = _json.dumps({q["id"]: q.get("default", "") for q in qs}, ensure_ascii=False)
+        print(f"\n     e.g.  echo '{example}' > answers.json  &&  "
+              "collect <doc> --to out.kdb --bundle mybundle --answers-file answers.json")
+    print("\n  → If this looks right, re-run with --save <profile.json> to keep the profile, "
+          "or answer the questions above for a structured ingest. If a book/scheme is wrong, "
+          "tell me what it should be.\n")
 
     if args.save:
         try:
@@ -454,19 +470,30 @@ def _run_collect(cfg, log, args) -> int:
     """`collect <doc> --to <file.kdb> --bundle <name>`: clean-room ingest+distil of one
     document, ADDED to a shareable .kdb collection (created or merged into).  The master
     kb is never touched.  --dry-run validates + previews without running anything."""
+    import json as _json
     from . import pack as pack_mod
     from .distill import BackendUnavailable as _BU
     doc = (args.args[0] if args.args else None) or args.doc
     target, bundle = args.to, args.bundle
     if not (doc and target and bundle):
         log.error("collect needs: collect <doc> --to <file.kdb> --bundle <name> "
-                  "[--license SPDX] [--allow-unlicensed] [--dry-run]")
+                  "[--license SPDX] [--allow-unlicensed] [--answers-file a.json] [--dry-run]")
         return 1
+    answers = None
+    if args.answers_file:
+        try:
+            with open(os.path.expanduser(args.answers_file), encoding="utf-8") as f:
+                answers = _json.load(f)
+            if not isinstance(answers, dict):
+                raise ValueError("answers file must be a JSON object of id → value")
+        except (OSError, ValueError) as e:
+            log.error("cannot read --answers-file %s: %s", args.answers_file, e)
+            return 1
     try:
         res = pack_mod.add_to_collection(
             cfg, doc, target, bundle, license_override=args.license or "",
             allow_unlicensed=args.allow_unlicensed, force=args.force,
-            dry_run=args.dry_run, log_fn=log.info,
+            dry_run=args.dry_run, log_fn=log.info, answers=answers,
             report=ops_mod.emit_progress)      # live phase bar in the Operations panel
     except ValueError as e:
         log.error("%s", e)
@@ -1264,6 +1291,10 @@ def main(argv=None):
     ap.add_argument("--save", dest="save",
                     help="analyze: write the proposed profile to this JSON file "
                          "(after you've eyeballed it) for a later structured ingest")
+    ap.add_argument("--answers-file", dest="answers_file",
+                    help="collect: JSON file of structured-text confirmation answers "
+                         "(id → value, from `analyze`/the wizard) — ingests the doc "
+                         "unit-by-unit under the confirmed profile")
     ap.add_argument("--allow-unlicensed", action="store_true", dest="allow_unlicensed",
                     help="pack: build despite unlicensed sources — stamped "
                          "shareable:false (private use only; import warns)")

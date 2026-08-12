@@ -175,6 +175,44 @@ def main():
                   rs["single_tier"] is True and rs["complete"] is True)
             check("truncation-recovery count surfaced", rs["recovered_truncated"] == 3)
 
+            # ── STRUCTURED-TEXT: preview analyzes the doc & raises confirm questions ─
+            bib = Path(td) / "kjv.txt"
+            bib.write_text("John 3:16 For God so loved the world, that he gave his Son.\n"
+                           "John 3:17 For God sent not his Son to condemn the world.\n"
+                           "Genesis 1:1 In the beginning God created the heaven and the earth.\n")
+            pvq = P.collection_preview(cfg, os.path.join(td, "s5", "x.kdb"), "scripture", str(bib))
+            st = (pvq.get("structure") or {})
+            check("preview: a scripture doc is analyzed → kind + confirm questions",
+                  st.get("kind") == "scripture" and st.get("needs_confirm")
+                  and any(q["id"] == "kind" for q in st.get("questions", [])))
+            pvp = P.collection_preview(cfg, os.path.join(td, "s5", "x.kdb"), "scripture", str(src1))
+            check("preview: an ordinary doc raises NO questions",
+                  not (pvp.get("structure") or {}).get("needs_confirm"))
+
+            # ── STRUCTURED-TEXT: answers → a confirmed profile reaches the pipeline ─
+            captured = {}
+
+            def capture_pipeline(scfg, src, say, **kw):
+                captured["profile"] = kw.get("profile")
+                return fake_pipeline("doc:bible", "n_bible", "bible")(scfg, src, say, **kw)
+
+            P._pipeline = capture_pipeline
+            tb = os.path.join(td, "s6", "bible.kdb")
+            P.add_to_collection(cfg, str(bib), tb, "scripture", answers={"kind": "structured"})
+            check("answers: a confirmed STRUCTURED profile is threaded into the pipeline",
+                  (captured.get("profile") or {}).get("ingest_as") == "structured"
+                  and captured["profile"].get("kind") == "scripture")
+            captured.clear()
+            tb2 = os.path.join(td, "s7", "plain.kdb")
+            P.add_to_collection(cfg, str(bib), tb2, "scripture", answers={"kind": "plain"})
+            check("answers: choosing 'ordinary prose' threads a plain profile (no structured ingest)",
+                  (captured.get("profile") or {}).get("ingest_as") == "plain")
+            captured.clear()
+            tb3 = os.path.join(td, "s8", "noans.kdb")
+            P.add_to_collection(cfg, str(bib), tb3, "scripture")
+            check("no answers → no profile forced (ordinary ingest, back-compatible)",
+                  captured.get("profile") is None)
+
             # ── real CLI dispatch (a dry-run — no LM): the parser-builds gate can't
             #    catch a crash at DISPATCH time (e.g. touching an unopened `store`) ─
             repo = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))

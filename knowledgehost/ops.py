@@ -42,7 +42,7 @@ COMMANDS: dict = {
     # clean-room ingest+distill of ONE document, ADDED to a shareable .kdb collection
     # under a named bundle (creates the file or merges into it — one bundle per file)
     "collect":    {"doc": "path", "to": "path", "bundle": "str", "license": "str",
-                   "allow_unlicensed": "bool"},
+                   "allow_unlicensed": "bool", "answers_file": "path"},
     # janitor: chunks holding text the corpus already has (no LM involved)
     "dedupe":     {"near": "bool", "threshold": "float", "apply": "bool", "bundle": "str"},
     # hub search: candidates sized + judged against this machine's memory
@@ -230,7 +230,10 @@ HELP: dict = {
                 "to": "the .kdb collection file to create or add to (plain .kdb)",
                 "bundle": "the bundle name to file the knowledge under (one per file)",
                 "license": "SPDX id attested onto sources with no detected license",
-                "allow_unlicensed": "add anyway even if some sources have no license"},
+                "allow_unlicensed": "add anyway even if some sources have no license",
+                "answers_file": "JSON file of structured-text confirmation answers "
+                                "(scripture/legal) — the wizard writes it; a confirmed "
+                                "profile ingests the doc unit-by-unit"},
     "import-bundle": {"_": "Absorb a shipped .kdb brain into the master",
                       "path": "the .kdb file on this box",
                       "name": "bundle name to import under (default: its manifest name)",

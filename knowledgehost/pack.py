@@ -244,11 +244,14 @@ def _emit(report, phase: str, **extra) -> None:
         pass
 
 
-def _pipeline(scfg: dict, src: Path, say, *, label: str = "pack", report=None) -> dict:
+def _pipeline(scfg: dict, src: Path, say, *, label: str = "pack", report=None,
+              profile=None) -> dict:
     """ingest → distill → link inside the scratch.  Module-level so tests can
     patch it; raises BackendUnavailable when no distill endpoint is up (the
     scratch survives — re-running resumes).  `label` prefixes the log lines
-    (so a collect build doesn't say "pack"); `report` gets per-phase progress."""
+    (so a collect build doesn't say "pack"); `report` gets per-phase progress.
+    `profile` is a CONFIRMED structure profile for a single structured document —
+    threaded to ingest_file so a scripture/legal file is ingested unit-by-unit."""
     from . import distill as distill_mod
     from . import embed as embed_mod
     from . import ingest as ingest_mod
@@ -270,8 +273,11 @@ def _pipeline(scfg: dict, src: Path, say, *, label: str = "pack", report=None) -
         say(f"{label}: ingesting {src.name} …")
         t0 = time.time()
         if src.is_file():
-            n = ingest_mod.ingest_file(store, embedder, scfg, str(src))
+            n = ingest_mod.ingest_file(store, embedder, scfg, str(src), profile=profile)
             stats["ingest"] = {"docs": 1 if n else 0, "chunks": n}
+            if profile and profile.get("ingest_as") == "structured":
+                say(f"{label}: ingested {src.name} as structured {profile.get('kind')} "
+                    f"({n} canonical unit(s))")
         else:
             stats["ingest"] = ingest_mod.crawl(store, embedder, scfg)
         chunks = stats["ingest"].get("chunks") or 0
@@ -518,14 +524,36 @@ def _plain_target(target: Path) -> None:
                          "merge) — compress/encrypt when you publish it with `pack`")
 
 
-def collection_preview(cfg: dict, target: str, bundle: str) -> dict:
+def _structure_preview(cfg: dict, doc: str) -> dict:
+    """Analyze a single document and, if it has canonical structure worth confirming,
+    return the plain-language questions for the wizard.  Never writes; never fatal —
+    any problem degrades to 'no questions' so the build can still proceed normally."""
+    try:
+        d = Path(doc).expanduser()
+        if not d.is_file():
+            return {}
+        from . import ingest as ingest_mod, structure as S
+        prof = ingest_mod.analyze_doc(cfg, str(d))
+        qs = S.questions_for(prof)
+        return {"kind": prof.get("kind"), "confidence": prof.get("confidence", 0),
+                "scheme": prof.get("scheme"), "unit": prof.get("unit"),
+                "warnings": prof.get("warnings", []),
+                "needs_confirm": bool(qs), "questions": qs}
+    except Exception as e:                          # analysis is advisory, never a gate
+        return {"error": str(e)}
+
+
+def collection_preview(cfg: dict, target: str, bundle: str, doc: str = "") -> dict:
     """Cheap, side-effect-free look at a collection target for the wizard: does it
     exist, what bundle does it already hold, and is that compatible with `bundle`
-    (one bundle per file)?  Never runs the pipeline."""
+    (one bundle per file)?  When `doc` is given, also analyze it and attach any
+    structured-text confirmation questions.  Never runs the pipeline."""
     tgt = Path(target).expanduser()
     bundle_slug = bundles._slug(bundle)
     out = {"ok": True, "target": str(tgt), "bundle": bundle, "exists": tgt.exists(),
            "compatible": True, "counts": {}, "file_bundle": ""}
+    if doc:
+        out["structure"] = _structure_preview(cfg, doc)
     if not bundle_slug:
         return {"ok": False, "error": "a bundle name is required"}
     try:
@@ -557,7 +585,7 @@ def collection_preview(cfg: dict, target: str, bundle: str) -> dict:
 def add_to_collection(cfg: dict, doc: str, target: str, bundle: str, *,
                       license_override: str = "", allow_unlicensed: bool = False,
                       force: bool = False, dry_run: bool = False, log_fn=None,
-                      report=None) -> dict:
+                      report=None, answers: dict | None = None) -> dict:
     """Clean-room ingest+distill of ONE document (or folder), then ADD its distilled
     closure to a shareable ``.kdb`` collection under ``bundle`` — creating the file
     or merging into it if it already exists (content-hash ids ⇒ idempotent, so
@@ -584,11 +612,25 @@ def add_to_collection(cfg: dict, doc: str, target: str, bundle: str, *,
                 "created": not tgt.exists(), "current": prev.get("counts") or {},
                 "file_bundle": prev.get("file_bundle") or ""}
 
+    # a structured document (scripture/legal) that the user CONFIRMED is ingested one
+    # canonical unit at a time; anything else takes the ordinary heading-chunk path.
+    profile = None
+    if src.is_file() and answers:
+        try:
+            from . import ingest as ingest_mod
+            profile = ingest_mod.confirm_profile(cfg, str(src), answers)
+            if profile.get("ingest_as") == "structured":
+                say(f"collect: will ingest {src.name} as structured {profile.get('kind')} "
+                    "(confirmed) — one node per canonical unit")
+        except Exception as e:
+            say(f"collect: could not apply the confirmation answers ({e}) — ingesting normally")
+            profile = None
+
     build = Path(cfg.get("pack_build_dir") or "var/packs/build") / f"collect-{bundle_slug}"
     build.mkdir(parents=True, exist_ok=True)
     scfg = scratch_cfg(cfg, build, src)
     say(f"collect: clean-room build at {build} (your master KB is untouched)")
-    stats = _pipeline(scfg, src, say, label="collect", report=report)
+    stats = _pipeline(scfg, src, say, label="collect", report=report, profile=profile)
 
     # license gate over the scratch registry (same rules as `pack`), then stamp the
     # whole scratch into the one bundle so `split` emits exactly it.

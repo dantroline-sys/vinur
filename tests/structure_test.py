@@ -169,11 +169,64 @@ def main():
           exmaps.match_book("Johannes") == (43, "John")
           and exmaps.match_book("Apocalypse") == (66, "Revelation"))
 
+    # ── THE INTERACTIVE CONFIRM LAYER: profile → questions → confirmed profile ─
+    pq = S.analyze(KJV)
+    qs = S.questions_for(pq)
+    qids = [q["id"] for q in qs]
+    check("scripture raises a confirm step (should_confirm)", S.should_confirm(pq))
+    check("first question is the kind/how-to-ingest choice", qids and qids[0] == "kind")
+    check("scripture asks the canon/versification question", "canon" in qids)
+    check("every question is well-formed (id, prompt, type)",
+          all(q.get("id") and q.get("prompt") and q.get("type") in ("choice", "text") for q in qs))
+
+    # unrecognised book → a per-book question, and answers route it three ways
+    pn2 = S.analyze("Nephi 3:7 And it came to pass that I, Nephi, said unto my father.\n"
+                    "Nephi 3:8 And it came to pass that I did go.\n")
+    nq = [q["id"] for q in S.questions_for(pn2)]
+    check("an unrecognised book gets its own question", "book:Nephi" in nq)
+    conf_map = S.apply_answers(pn2, {"kind": "structured", "book:Nephi": "Revelation"})
+    check("answer 'it's Revelation' → a book_aliases entry that marries Nephi→Revelation",
+          conf_map["reference_map"]["book_aliases"].get("Revelation") == ["Nephi"])
+    m2 = S.load_reference_maps([])  # built-ins only …
+    m2 = S.ReferenceMaps(conf_map["reference_map"]["book_aliases"], {})
+    check("that ad-hoc alias actually resolves through a ReferenceMaps",
+          m2.match_book("Nephi") == (66, "Revelation"))
+    conf_keep = S.apply_answers(pn2, {"kind": "structured", "book:Nephi": "keep"})
+    check("answer 'keep' → tracked as an extra-canonical book, not an alias",
+          conf_keep.get("extra_books") == ["Nephi"]
+          and not conf_keep["reference_map"]["book_aliases"])
+    conf_ign = S.apply_answers(pn2, {"kind": "structured", "book:Nephi": ""})
+    check("blank answer → ignored (no alias, no extra book)",
+          not conf_ign["reference_map"]["book_aliases"] and "extra_books" not in conf_ign)
+
+    # kind override → plain short-circuits everything
+    conf_plain = S.apply_answers(pq, {"kind": "plain"})
+    check("choosing 'ordinary prose' → ingest_as plain, no structured fields forced",
+          conf_plain["ingest_as"] == "plain" and conf_plain["confirmed"])
+
+    # legal: work-title question + folding the answer into a canonical work
+    pl2 = S.analyze(STATUTE)
+    lq = [q["id"] for q in S.questions_for(pl2)]
+    check("legal raises kind + work_title questions", "kind" in lq and "work_title" in lq)
+    conf_leg = S.apply_answers(pl2, {"kind": "structured", "work_title": "Title 17, U.S.C."})
+    check("work_title answer 'Title 17, U.S.C.' → work.title '17' (digits extracted)",
+          (conf_leg.get("work") or {}).get("title") == "17"
+          and conf_leg["ingest_as"] == "structured")
+
+    # 'ask once per profile' batching signatures
+    check("profile signature groups a Title-17 corpus under one key",
+          S.profile_signature(conf_leg) == "legal:usc:17")
+    check("scripture and legal get distinct signatures; prose collapses to 'plain'",
+          S.profile_signature(pq) == "scripture:bible"
+          and S.profile_signature(S.analyze("Just ordinary prose here, nothing structured.")) == "plain")
+
     # ── unknown / prose ──────────────────────────────────────────────────────
     pn = S.analyze("This is an ordinary paragraph of prose with no structure at all. "
                    "It simply discusses ideas in sentences.")
     check("prose → kind unknown + guidance warning",
           pn["kind"] == "unknown" and pn["warnings"])
+    check("prose asks NO confirmation questions (normal workflow undisturbed)",
+          not S.should_confirm(pn) and S.questions_for(pn) == [])
 
     print()
     if FAIL:

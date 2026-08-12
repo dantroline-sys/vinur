@@ -38,11 +38,13 @@ def _content_hash(path: str) -> str:
     return h.hexdigest()
 
 
-def _embed_and_store(store, embedder, cfg, *, source_type, title,
-                     path_or_url, blocks, version):
-    """Chunk -> (optionally) embed in batches -> upsert.  Returns chunk count."""
+def _store_records(store, embedder, cfg, *, source_type, title, path_or_url, items, version):
+    """Embed (in batches) and upsert one row per item, NO re-chunking.  `items` yields
+    (section, text, tokens) already at the granularity we want stored — heading-chunks
+    for ordinary docs, one addressable unit (a verse / a section) for structured ones.
+    Returns the row count."""
     title = sanitize.clean(title, 300)
-    records, batch_text, batch_rec = [], [], []
+    batch_text, batch_rec = [], []
     n = 0
     # When embedding, the batch is bounded by the embed endpoint / GPU memory.  When NOT
     # embedding (the lexical library), commit in big transactions instead — far fewer fsyncs.
@@ -71,16 +73,16 @@ def _embed_and_store(store, embedder, cfg, *, source_type, title,
         store.add_chunks(batch_rec)
         batch_text, batch_rec = [], []
 
-    for ch in chunk_blocks(blocks, cfg):
-        text = sanitize.clean(ch["text"])
+    for section, text, tokens in items:
+        text = sanitize.clean(text)
         if not text:
             continue
-        section = sanitize.clean(ch["section"], 300)
+        section = sanitize.clean(section, 300)
         rec = {
             "id": chunk_id(path_or_url, section, text),
             "source_type": source_type, "title": title, "section": section,
             "path_or_url": path_or_url, "text": text,
-            "tokens": ch["tokens"], "version": version, "ingested_at": time.time(),
+            "tokens": tokens, "version": version, "ingested_at": time.time(),
         }
         batch_rec.append(rec)
         batch_text.append(text)
@@ -91,10 +93,22 @@ def _embed_and_store(store, embedder, cfg, *, source_type, title,
     return n
 
 
-def ingest_file(store, embedder, cfg, path: str, *, force=False, collection=None) -> int:
+def _embed_and_store(store, embedder, cfg, *, source_type, title,
+                     path_or_url, blocks, version):
+    """Chunk (by heading, ~200-400 tokens) -> embed -> upsert.  Returns chunk count."""
+    items = ((ch["section"], ch["text"], ch["tokens"]) for ch in chunk_blocks(blocks, cfg))
+    return _store_records(store, embedder, cfg, source_type=source_type, title=title,
+                          path_or_url=path_or_url, items=items, version=version)
+
+
+def ingest_file(store, embedder, cfg, path: str, *, force=False, collection=None,
+                profile=None) -> int:
     """Ingest one document if new/changed.  Returns chunks added (0 if skipped).
     `collection` (library ingest) tags the chunks' source_type with a topical bucket
-    (science/fiction/…) instead of the format, so search can filter by it."""
+    (science/fiction/…) instead of the format, so search can filter by it.  `profile`
+    is a CONFIRMED structure profile (structure.apply_answers) — when present and
+    `ingest_as=='structured'` the doc is ingested one canonical unit (verse/section)
+    per chunk instead of by heading; `ingest_as=='plain'` just takes the normal path."""
     ext = os.path.splitext(path)[1].lower()
     vinkona = (collection is None) and research.is_research_doc(path)   # not for library docs
     fn = None if vinkona else extractor_for(path)
@@ -127,6 +141,15 @@ def ingest_file(store, embedder, cfg, path: str, *, force=False, collection=None
         if chash is None:
             chash = _content_hash(path)
         return _ingest_research_doc(store, embedder, cfg, path, version, chash, st)
+
+    if profile and profile.get("confirmed") and profile.get("ingest_as") == "structured":
+        if chash is None:
+            chash = _content_hash(path)
+        n = _ingest_structured_doc(store, embedder, cfg, path, version, chash, st, profile)
+        if n is not None:
+            return n
+        # 0 units parsed under the confirmed profile — fall through to normal ingest so
+        # the document isn't silently lost (a mis-confirmation shouldn't drop content).
 
     try:
         title, blocks = fn(path, cfg)
@@ -371,6 +394,88 @@ def _ingest_research_doc(store, embedder, cfg, path, version, chash, st) -> int:
     })
     store.manifest.set(path, chash, st.st_mtime, version, "ok")
     log.info("research drop ingested: %s (%d chunk(s))", os.path.basename(path), n)
+    return n
+
+
+def _structured_text(path, cfg) -> str:
+    """Raw text for structure parsing.  Scripture/legal editions are line-oriented, so
+    for text formats read the file directly (preserving line structure); otherwise fall
+    back to the format extractor's blocks, joined (best-effort)."""
+    ext = os.path.splitext(path)[1].lower()
+    if ext in {".txt", ".text", ".md", ".markdown"}:
+        try:
+            with open(path, encoding="utf-8", errors="replace") as f:
+                return f.read()
+        except OSError:
+            return ""
+    fn = extractor_for(path)
+    if fn is None:
+        return ""
+    try:
+        _title, blocks = fn(path, cfg)
+    except Exception:
+        return ""
+    return "\n".join(b.get("text", "") for b in blocks)
+
+
+def _profile_maps(cfg, profile):
+    """Reference maps for a structured ingest: the config's shipped maps plus the
+    document's own ad-hoc, answer-derived aliases (structure.apply_answers)."""
+    from . import structure
+    return structure.load_reference_maps(cfg.get("reference_maps") or [],
+                                         extra=(profile or {}).get("reference_map"))
+
+
+def analyze_doc(cfg, path: str, *, kind_hint=None) -> dict:
+    """Read a document and PROPOSE a structure profile (structure.analyze) using the
+    config's reference maps — the shared entry point for the collect wizard's preview
+    and the bulk-ingest confirm gate.  Read-only; never writes."""
+    from . import structure
+    text = _structured_text(path, cfg)
+    maps = structure.load_reference_maps(cfg.get("reference_maps") or [])
+    return structure.analyze(text, kind_hint=kind_hint, maps=maps)
+
+
+def confirm_profile(cfg, path: str, answers: dict) -> dict:
+    """analyze_doc → apply the user's confirmation answers → a CONFIRMED profile ready
+    to pass to ingest_file(profile=…)."""
+    from . import structure
+    return structure.apply_answers(analyze_doc(cfg, path), answers or {})
+
+
+def _ingest_structured_doc(store, embedder, cfg, path, version, chash, st, profile):
+    """Ingest a CONFIRMED scripture/legal document one canonical unit at a time: each
+    verse / section becomes a single chunk whose `section` is its canonical key
+    (bible:John.3.16 / usc:17/106), tagged source_type='scripture'|'legal'.  That key is
+    the stable node identity a later citation-graph pass builds edges on, so units from
+    DIFFERENT documents that name the same passage converge.  Returns the unit count, or
+    None if nothing parsed (caller falls back to normal ingest — content is never lost)."""
+    from . import structure
+    text = _structured_text(path, cfg)
+    if not text.strip():
+        return None
+    maps = _profile_maps(cfg, profile)
+    kind = profile.get("kind")
+    source_type = "scripture" if kind == "scripture" else "legal" if kind == "legal" else "text"
+    units = list(structure.parse_units(text, profile, maps=maps))
+    if not units:
+        log.warning("structured ingest of %s parsed 0 units under the confirmed profile "
+                    "— falling back to normal ingest", os.path.basename(path))
+        return None
+    store.delete_by_path(path)
+    title = os.path.splitext(os.path.basename(path))[0]
+    items = ((r.key, t, max(1, len(t.split()))) for r, t in units)
+    n = _store_records(store, embedder, cfg, source_type=source_type, title=title,
+                       path_or_url=path, items=items, version=version)
+    store.set_doc_meta(path, {
+        "structured": True, "kind": kind, "scheme": profile.get("scheme"),
+        "work": profile.get("work"), "book_order": profile.get("book_order"),
+        "reference_map": profile.get("reference_map") or {},
+        "extra_books": profile.get("extra_books") or [],
+    })
+    store.manifest.set(path, chash, st.st_mtime, version, "ok")
+    log.info("structured %s ingest: %s (%d unit(s), keyed canonically)",
+             kind, os.path.basename(path), n)
     return n
 
 

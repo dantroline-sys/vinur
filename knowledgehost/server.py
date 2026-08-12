@@ -181,6 +181,22 @@ def _fs_list(cfg: dict, raw: str) -> dict:
             "exts": [str(x).lower() for x in (cfg.get("extensions") or [])]}
 
 
+def _write_answers_file(cfg: dict, answers: dict) -> str:
+    """Persist the wizard's structured-text confirmation answers to a scratch JSON file
+    the collect subprocess reads (the answers are too structured for a CLI flag).  Kept
+    under the control dir so it lives with the run, not the user's data."""
+    import json
+    import tempfile
+    from pathlib import Path
+    ctrl = cfg.get("control_dir") or str(Path(__file__).resolve().parent.parent / "var")
+    d = Path(ctrl).expanduser() / "run"
+    d.mkdir(parents=True, exist_ok=True)
+    fd, name = tempfile.mkstemp(prefix="collect-answers-", suffix=".json", dir=str(d))
+    with os.fdopen(fd, "w", encoding="utf-8") as f:
+        json.dump(answers, f, ensure_ascii=False)
+    return name
+
+
 class Handler(BaseHTTPRequestHandler):
     server_version = f"knowledgehost/{__version__}"
     protocol_version = "HTTP/1.1"
@@ -578,10 +594,11 @@ class Handler(BaseHTTPRequestHandler):
             from . import pack as pack_mod
             tgt = (q.get("to") or [""])[0]
             bundle = (q.get("bundle") or [""])[0]
+            doc = (q.get("doc") or [""])[0]        # optional: analyze it → confirm questions
             if not tgt or not bundle:
                 return self._send_json({"ok": False, "error": "to and bundle required"}, 400)
             try:
-                return self._send_json(pack_mod.collection_preview(self.cfg, tgt, bundle))
+                return self._send_json(pack_mod.collection_preview(self.cfg, tgt, bundle, doc))
             except Exception as e:
                 return self._send_json({"ok": False, "error": str(e)}, 400)
         if path == "/fs/list":                     # file browser: list one directory
@@ -1068,8 +1085,13 @@ class Handler(BaseHTTPRequestHandler):
                 return self._send_json({"ok": False, "error": f"write failed: {e}"}, 500)
         if path == "/ops/run":                         # launch a maintenance verb
             try:
-                return self._send_json(
-                    self.server.ops.start(req.get("command", ""), req.get("args") or {}))
+                command = req.get("command", "")
+                run_args = dict(req.get("args") or {})
+                answers = req.get("answers")           # collect: structured-text confirmations
+                if command == "collect" and isinstance(answers, dict) and answers:
+                    # too structured for a CLI flag — persist it and pass the path
+                    run_args["answers_file"] = _write_answers_file(self.cfg, answers)
+                return self._send_json(self.server.ops.start(command, run_args))
             except ValueError as e:                    # unknown verb / bad option
                 return self._send_json({"ok": False, "error": str(e)}, 400)
         if path == "/ops/stop":
