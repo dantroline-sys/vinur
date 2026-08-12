@@ -96,15 +96,26 @@ REASON_TOOL = {
         "to B, typed chains) · about (one node's relation picture) · effects (signed "
         "causal reach: what increases/decreases downstream/upstream of X) · siblings "
         "(what is like X: is_a co-children + relational analogues) · contradictions "
-        "(the same relation asserted with opposite polarity). Use it whenever the "
-        "question is about how KNOWN things relate, differ, or influence each other; "
-        "use kb_ask for open questions answered from cards/passages."),
+        "(the same relation asserted with opposite polarity) · verify (CHECK a claimed "
+        "statement: decompose it into subject a, object b, the claimed relation and "
+        "polarity — verdicts supported/contradicted/mixed/related_but_different/"
+        "supported_indirectly/unsupported, with the graph's actual edges as evidence; "
+        "'unsupported' means the graph is SILENT, never that the claim is false). Use "
+        "it whenever the question is about how KNOWN things relate, differ, or "
+        "influence each other, or to fact-check a statement; use kb_ask for open "
+        "questions answered from cards/passages."),
     "parameters": {"type": "object", "properties": {
         "op": {"type": "string",
                "enum": ["compare", "paths", "about", "effects", "siblings",
-                        "contradictions"]},
+                        "contradictions", "verify"]},
         "a": {"type": "string", "description": "first (or only) concept, by name"},
-        "b": {"type": "string", "description": "second concept (compare/paths)"},
+        "b": {"type": "string", "description": "second concept (compare/paths/verify)"},
+        "relation": {"type": "string", "description":
+                     "verify: the claimed relation type (causes/treats/is_a/…); "
+                     "omit to accept any"},
+        "polarity": {"type": "string", "description":
+                     "verify: claimed direction of effect — positive (increases/"
+                     "promotes) | negative (decreases/suppresses); omit if unsigned"},
         "direction": {"type": "string", "description":
                       "effects only: down (consequences, default) | up (causes)"},
         "max_hops": {"type": "integer", "description": "traversal bound (default 3)"},

@@ -417,9 +417,121 @@ def op_contradictions(g: GraphView, cfg, args) -> dict:
             "contradictions": out[:25]}
 
 
+def _signed_reach(g, a, b, mode, hops):
+    """Net sign of the causal chains a→…→b within `hops`, or None if unreachable.
+    Returns (sign, chain) — sign 0 = conflicting routes.  Mirrors op_effects' walk."""
+    frontier = {a: (1, [])}
+    best = None
+    for _hop in range(hops):
+        nxt = {}
+        for n, (sign, path) in frontier.items():
+            for other, e in g.out[n]:
+                fam, typ, pol, derived, _n, _ = g.eattr[e]
+                if fam not in ("causal", "derived") or not g.use(e, mode):
+                    continue
+                s2 = sign * _SIGN.get(pol, 0)
+                if s2 == 0:
+                    continue
+                p2 = path + [(n, other, e)]
+                if other == b:
+                    if best is None:
+                        best = {"sign": s2, "path": p2}
+                    elif best["sign"] != s2:
+                        best["sign"] = 0                   # conflicting routes
+                elif other not in frontier and other not in nxt:
+                    nxt[other] = (s2, p2)
+        frontier = nxt
+        if not frontier:
+            break
+    if best is None:
+        return None, []
+    chain = [(g.labels[s], f"{g.eattr[e][1]}({g.eattr[e][2] or '?'})", g.labels[d])
+             for s, d, e in best["path"]]
+    return best["sign"], chain
+
+
+def op_verify(g: GraphView, cfg, args) -> dict:
+    """Check a CLAIMED relation against the graph.  The claim arrives decomposed —
+    a (subject), b (object), optional relation type ('causes', 'treats', 'is_a', …) and
+    polarity ('positive'=increases/promotes, 'negative'=decreases/suppresses).  Verdicts:
+      supported / contradicted / mixed  — a direct edge of the claimed kind (mixed = the
+                                          graph itself asserts BOTH signs);
+      supported_indirectly / contradicted_indirectly — no direct edge, but the net sign
+                                          of the causal chain a→…→b (dis)agrees;
+      related_but_different — a and b are directly related, just not as claimed;
+      unsupported — the graph is SILENT.  Absence of evidence, never evidence of
+                                          absence: the answer must say 'not recorded',
+                                          not 'false'."""
+    mode = _mode(cfg, args)
+    a, err = _resolve_or_err(g, args.get("a") or "")
+    if err:
+        return err
+    b, err = _resolve_or_err(g, args.get("b") or "")
+    if err:
+        return err
+    claimed_rel = _norm(args.get("relation") or "") or None
+    claimed_pol = (args.get("polarity") or "").strip().lower() or None
+    base = {"ok": True, "op": "verify", "a": g.labels[a], "b": g.labels[b], "mode": mode,
+            "claim": {"relation": claimed_rel or "(any)", "polarity": claimed_pol or "(any)"}}
+
+    direct = []                                           # every a↔b edge, both directions
+    for d, e in g.out[a]:
+        if d == b and g.use(e, mode):
+            direct.append(("a→b", e))
+    for s, e in g.inc[a]:
+        if s == b and g.use(e, mode):
+            direct.append(("b→a", e))
+    graph_says = [dict(g.edge_dict(e, a, b) if way == "a→b" else g.edge_dict(e, b, a),
+                       direction=way) for way, e in direct]
+
+    def matches(e):                                       # claimed type ⊆ edge type, so
+        return claimed_rel is None or claimed_rel in _norm(g.eattr[e][1])   # 'causes' hits
+                                                          # inherited_/composed_causes too
+    matched = [(way, e) for way, e in direct if way == "a→b" and matches(e)]
+    if matched:
+        signs = {g.eattr[e][2] for _w, e in matched if g.eattr[e][2] in _SIGN}
+        inferred = any(g.eattr[e][3] for _w, e in matched)
+        if len(signs) > 1:
+            verdict = "mixed"
+        elif claimed_pol and signs and claimed_pol not in signs:
+            verdict = "contradicted"
+        else:
+            verdict = "supported"
+        return {**base, "verdict": verdict, "graph_says": graph_says,
+                **({"inferred": True} if inferred else {}),
+                **({"note": "the graph asserts BOTH polarities — genuinely contested"}
+                   if verdict == "mixed" else {})}
+
+    # no direct edge of the claimed kind — try the signed causal chain
+    hops = min(int(args.get("max_hops") or cfg.get("reasoning_max_depth", 3)), 4)
+    sign, chain = _signed_reach(g, a, b, mode, hops)
+    if sign is not None and (claimed_rel is None or "caus" in claimed_rel
+                             or claimed_rel in ("increases", "decreases", "affects")):
+        if sign == 0:
+            verdict = "mixed"
+        elif claimed_pol:
+            verdict = ("supported_indirectly" if _SIGN_LABEL[sign] == claimed_pol
+                       else "contradicted_indirectly")
+        else:
+            verdict = "supported_indirectly"
+        return {**base, "verdict": verdict, "graph_says": graph_says,
+                "chain": chain, "net": {1: "positive", -1: "negative", 0: "conflicted"}[sign],
+                **({"inferred": True} if any("inherited" in c[1] or "composed" in c[1]
+                                             for c in chain) else {})}
+
+    if graph_says:                                        # related, just not as claimed
+        return {**base, "verdict": "related_but_different", "graph_says": graph_says,
+                "note": "a and b ARE directly related, but not by the claimed relation"}
+    ps = _paths(g, a, b, mode, hops, tuple(_TRAVERSE_DEFAULT), cap=2)
+    return {**base, "verdict": "unsupported",
+            "note": ("the graph records NOTHING for this claim — absence of evidence, "
+                     "not evidence of absence; do not report the claim as false"),
+            **({"nearest_context": [_render_path(g, p) for p in ps]} if ps else {})}
+
+
 OPS = {"about": op_about, "compare": op_compare, "paths": op_paths,
        "siblings": op_siblings, "effects": op_effects,
-       "contradictions": op_contradictions}
+       "contradictions": op_contradictions, "verify": op_verify}
 
 
 def query(kb, cfg, args: dict) -> dict:

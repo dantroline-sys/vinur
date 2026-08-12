@@ -164,6 +164,47 @@ def main():
     check("one DELETE reverses the layer entirely (permissive falls back to observed)",
           not any(k.startswith("derived:") for k in perm3["relations"]))
 
+    # ── verify: statement checking ────────────────────────────────────────────
+    # (the derived layer was deleted above; rebuild it for the mode-contrast check)
+    R.derive(kb, cfg)
+
+    def verify(a, b, rel=None, pol=None, mode=None):
+        q = {"op": "verify", "a": a, "b": b}
+        if rel: q["relation"] = rel
+        if pol: q["polarity"] = pol
+        if mode: q["mode"] = mode
+        return R.query(kb, cfg, q)
+
+    v = verify("aspirin", "platelet aggregation", "causes", "negative")
+    check("verify: a true signed claim is SUPPORTED with the edge as evidence",
+          v["verdict"] == "supported" and v["graph_says"])
+    v = verify("aspirin", "platelet aggregation", "causes", "positive")
+    check("verify: the opposite sign is CONTRADICTED", v["verdict"] == "contradicted")
+    v = verify("coffee", "alertness", "causes")
+    check("verify: a genuinely contested relation is MIXED, flagged as contested",
+          v["verdict"] == "mixed" and "contested" in v.get("note", ""))
+    v = verify("aspirin", "stroke risk", "causes", "negative")
+    check("verify: an indirect claim is SUPPORTED_INDIRECTLY with the signed chain",
+          v["verdict"] == "supported_indirectly" and v.get("net") == "negative"
+          and len(v.get("chain", [])) == 3)
+    v = verify("aspirin", "stroke risk", "causes", "positive")
+    check("verify: the wrong sign on the chain is CONTRADICTED_INDIRECTLY",
+          v["verdict"] == "contradicted_indirectly")
+    v = verify("aspirin", "NSAID", "causes")
+    check("verify: related-but-not-as-claimed says what the graph DOES record",
+          v["verdict"] == "related_but_different"
+          and any("is_a" in d["relation"] for d in v["graph_says"]))
+    v = verify("warfarin", "fever", "treats")
+    check("verify: a silent graph is UNSUPPORTED — explicitly not 'false'",
+          v["verdict"] == "unsupported" and "not evidence of absence" in v["note"])
+    # mode contrast: ibuprofen→stomach irritation exists only via the derived layer
+    vc = verify("ibuprofen", "stomach irritation", "causes", "positive", mode="conservative")
+    vp = verify("ibuprofen", "stomach irritation", "causes", "positive", mode="permissive")
+    check("verify: conservative mode won't lean on a derived edge (unsupported)",
+          vc["verdict"] == "unsupported")
+    check("verify: permissive mode supports it, MARKED inferred",
+          vp["verdict"] == "supported" and vp.get("inferred") is True)
+
     kb.close()
     print()
     if FAIL:
