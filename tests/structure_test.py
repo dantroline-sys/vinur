@@ -61,6 +61,20 @@ def main():
     check("book match: 'Song of Solomon'", S.match_book("Song of Solomon") == (22, "Song of Solomon"))
     check("book match: unknown → None", S.match_book("Nephi") is None)
 
+    # ── deuterocanon (Catholic/Orthodox) is first-class: resolves + canonical keys ─
+    check("deuterocanon: 'Tobit'/'Tobias' → the same book (67)",
+          S.match_book("Tobit") == (67, "Tobit") and S.match_book("Tobias") == (67, "Tobit"))
+    check("deuterocanon: 'Ecclesiasticus' → Sirach (not Ecclesiastes)",
+          S.match_book("Ecclesiasticus") == (71, "Sirach")
+          and S.match_book("Ecclesiastes") == (21, "Ecclesiastes"))
+    check("deuterocanon: numbered '1 Machabees' → 1 Maccabees",
+          S.match_book("1 Machabees") == (78, "1 Maccabees"))
+    check("deuterocanon: canonical OSIS keys (Tob/Sir/1Macc/Wis/Bar)",
+          S.scripture_ref("Tobit", 1, 1).key == "bible:Tob.1.1"
+          and S.scripture_ref("Sirach", 2, 3).key == "bible:Sir.2.3"
+          and S.scripture_ref("1 Maccabees", 4, 5).key == "bible:1Macc.4.5"
+          and S.display_for_key("bible:Sir.2.3") == "Sirach 2:3")
+
     # ── THE MARRYING PROPERTY: any spelling → one canonical (OSIS) key ────────
     def ckey(s, **kw):
         r = S.parse_citations(s, {"kind": "scripture"}, **kw)
@@ -153,6 +167,21 @@ Section 3. Information about Donations to the Foundation.
     check("shipped Douay-Rheims map resolves 'Isaias' → canonical Isaiah keys",
           [r.key for r, _ in S.parse_units(ISAIAS, {"kind": "scripture"}, maps=drmaps)]
           == ["bible:Isa.1.1", "bible:Isa.1.2"])
+
+    # a Catholic Bible with deuterocanon ingests whole + flags the tradition/versification
+    CATH = ("Tobit Chapter 1\n"
+            "1:1. The book of the words of Tobit, son of Tobiel.\n"
+            "Ecclesiasticus Chapter 1\n"
+            "1:1. All wisdom is from the Lord God, and hath been always with him.\n"
+            "1 Machabees Chapter 1\n"
+            "1:1. Now it came to pass, after that Alexander the Macedonian reigned.\n")
+    pc = S.analyze(CATH)
+    check("deuterocanon detected as scripture with canonical keys across books",
+          pc["kind"] == "scripture"
+          and [r.key for r, _ in S.parse_units(CATH, pc)]
+          == ["bible:Tob.1.1", "bible:Sir.1.1", "bible:1Macc.1.1"])
+    check("deuterocanon presence surfaces the canon/versification warning",
+          any("deuterocanonical" in w for w in pc["warnings"]))
 
     # ── unknown-book warning ─────────────────────────────────────────────────
     pu = S.analyze("Nephi 3:7 And it came to pass that I, Nephi, said unto my father.\n"

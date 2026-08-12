@@ -57,12 +57,39 @@ _BOOKS: list[tuple[int, str, list[str]]] = [
     (61, "2 Peter", ["2pet", "2pe", "2pt"]), (62, "1 John", ["1jn", "1jo", "1joh"]),
     (63, "2 John", ["2jn", "2jo", "2joh"]), (64, "3 John", ["3jn", "3jo", "3joh"]),
     (65, "Jude", ["jud", "jd"]), (66, "Revelation", ["rev", "re", "apocalypse", "apoc"]),
+    # ── Deuterocanonical / apocryphal books (Catholic + Orthodox canons) ──────
+    # So a Catholic/Orthodox Bible ingests WHOLE.  Orders 67+ (display only — they sort
+    # after the 66, which keeps every protocanonical order number stable).  Names that
+    # genuinely DIVERGE between traditions (the Esdras numbering, Vulgate Kings=Samuel)
+    # are left to the per-document reference map + confirm step, never auto-mapped here.
+    (67, "Tobit", ["tob", "tb", "tobias"]),
+    (68, "Judith", ["jdt", "jdth"]),
+    (69, "Additions to Esther", ["addesth", "greek esther", "rest of esther"]),
+    (70, "Wisdom", ["wis", "wisd", "wisdom of solomon"]),
+    (71, "Sirach", ["sir", "ecclus", "ecclesiasticus", "ben sira", "wisdom of sirach"]),
+    (72, "Baruch", ["bar"]),
+    (73, "Letter of Jeremiah", ["epjer", "epistle of jeremy", "letter of jeremy"]),
+    (74, "Prayer of Azariah", ["praz", "prazar", "song of the three holy children",
+                               "song of the three", "song of three children"]),
+    (75, "Susanna", ["sus"]),
+    (76, "Bel and the Dragon", ["bel"]),
+    (77, "Prayer of Manasseh", ["prman", "manasses", "prayer of manasses"]),
+    (78, "1 Maccabees", ["1macc", "1mac", "1ma", "1 machabees"]),
+    (79, "2 Maccabees", ["2macc", "2mac", "2ma", "2 machabees"]),
+    (80, "3 Maccabees", ["3macc", "3mac", "3ma", "3 machabees"]),
+    (81, "4 Maccabees", ["4macc", "4mac", "4ma", "4 machabees"]),
+    (82, "1 Esdras", ["1esd", "1esdr"]),
+    (83, "2 Esdras", ["2esd", "2esdr"]),
+    (84, "Psalm 151", ["ps151"]),
 ]
 
-# Books commonly present ONLY in editions with the Apocrypha/Deuterocanon — their
-# presence is a flag worth surfacing (canon/versification differs).
-_APOCRYPHA = {"tobit", "judith", "wisdom", "sirach", "ecclesiasticus", "baruch",
-              "1 maccabees", "2 maccabees", "1 esdras", "2 esdras", "manasseh"}
+# The deuterocanonical books (Catholic + Orthodox).  Now first-class in the canon, but
+# their PRESENCE is still worth surfacing — it pins the tradition (Catholic/Orthodox)
+# and warns that the versification (esp. Vulgate Psalm numbering) may diverge.
+_DEUTERO = {"Tobit", "Judith", "Additions to Esther", "Wisdom", "Sirach", "Baruch",
+            "Letter of Jeremiah", "Prayer of Azariah", "Susanna", "Bel and the Dragon",
+            "Prayer of Manasseh", "1 Maccabees", "2 Maccabees", "3 Maccabees",
+            "4 Maccabees", "1 Esdras", "2 Esdras", "Psalm 151"}
 
 _ROMAN = {"i": "1", "ii": "2", "iii": "3"}
 _WORDNUM = {"first": "1", "second": "2", "third": "3"}
@@ -116,6 +143,13 @@ _OSIS = {
     "2 Timothy": "2Tim", "Titus": "Titus", "Philemon": "Phlm", "Hebrews": "Heb",
     "James": "Jas", "1 Peter": "1Pet", "2 Peter": "2Pet", "1 John": "1John",
     "2 John": "2John", "3 John": "3John", "Jude": "Jude", "Revelation": "Rev",
+    # deuterocanon (standard OSIS interchange codes)
+    "Tobit": "Tob", "Judith": "Jdt", "Additions to Esther": "AddEsth", "Wisdom": "Wis",
+    "Sirach": "Sir", "Baruch": "Bar", "Letter of Jeremiah": "EpJer",
+    "Prayer of Azariah": "PrAzar", "Susanna": "Sus", "Bel and the Dragon": "Bel",
+    "Prayer of Manasseh": "PrMan", "1 Maccabees": "1Macc", "2 Maccabees": "2Macc",
+    "3 Maccabees": "3Macc", "4 Maccabees": "4Macc", "1 Esdras": "1Esd",
+    "2 Esdras": "2Esd", "Psalm 151": "AddPs",
 }
 
 from collections import namedtuple   # noqa: E402
@@ -396,9 +430,11 @@ def analyze(text: str, *, kind_hint: str | None = None, maps: ReferenceMaps | No
             prof["warnings"].append("bare 'C:V' lines with no detected book headers — "
                                     "the book per unit is ambiguous; confirm the book or its header pattern")
         low = [b["canonical"] for b in prof["books"] if b["verses_seen"] and b["verses_seen"] < 3]
-        if any(_norm_book_token(b) in {_norm_book_token(x) for x in _APOCRYPHA} for b in found):
-            prof["warnings"].append("apocryphal/deuterocanonical book(s) present — canon & "
-                                    "versification differ across traditions; confirm the reference system")
+        deutero = [b for b in found if b in _DEUTERO]
+        if deutero:
+            prof["warnings"].append("deuterocanonical book(s) present (" + ", ".join(sorted(deutero)[:6])
+                                    + ") — Catholic/Orthodox canon; confirm the versification "
+                                    "(e.g. Vulgate Psalm numbering can differ by one for much of the Psalter)")
         prof["work"] = {"scheme": "bible"}
         for ln in nonblank:
             m = _RE_LINE_BOOKCV.match(ln)
@@ -597,7 +633,7 @@ def questions_for(profile: dict) -> list[dict]:
                 "prompt": "The file uses bare 'chapter:verse' lines with no book header — "
                           "which book is this file? (e.g. 'John')",
                 "detail": "Leave blank if the text already heads several books itself."})
-        apoc = any("apocryphal" in w for w in profile.get("warnings", []))
+        apoc = any("deuterocanonical" in w for w in profile.get("warnings", []))
         qs.append({
             "id": "canon", "type": "choice", "default": "as_printed",
             "prompt": ("Deuterocanonical/apocryphal books are present, so canon and verse "
