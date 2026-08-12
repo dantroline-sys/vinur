@@ -85,6 +85,35 @@ CATALOGUE = [
     },
 ]
 
+# Advertised whenever a KB is wired in (Tools.catalogue) — deterministic graph
+# reasoning: the model picks the question SHAPE, the engine does the reasoning.
+REASON_TOOL = {
+    "name": "kb_reason",
+    "description": (
+        "Reason DETERMINISTICALLY over the knowledge graph — no generation, every "
+        "relation in the answer is an auditable edge. Ops: compare (two things: shared "
+        "relations, meeting nodes, contrasts, connecting paths) · paths (how A relates "
+        "to B, typed chains) · about (one node's relation picture) · effects (signed "
+        "causal reach: what increases/decreases downstream/upstream of X) · siblings "
+        "(what is like X: is_a co-children + relational analogues) · contradictions "
+        "(the same relation asserted with opposite polarity). Use it whenever the "
+        "question is about how KNOWN things relate, differ, or influence each other; "
+        "use kb_ask for open questions answered from cards/passages."),
+    "parameters": {"type": "object", "properties": {
+        "op": {"type": "string",
+               "enum": ["compare", "paths", "about", "effects", "siblings",
+                        "contradictions"]},
+        "a": {"type": "string", "description": "first (or only) concept, by name"},
+        "b": {"type": "string", "description": "second concept (compare/paths)"},
+        "direction": {"type": "string", "description":
+                      "effects only: down (consequences, default) | up (causes)"},
+        "max_hops": {"type": "integer", "description": "traversal bound (default 3)"},
+        "mode": {"type": "string", "description":
+                 "conservative (observed edges only, default) | permissive (bounded "
+                 "derivations included, marked 'inferred' with parent chains)"}},
+        "required": ["op", "a"]},
+}
+
 # Advertised only when the serving host wires itself in (Tools.catalogue) —
 # load/unload needs the live server's hot-swap, so the bare CLI can't offer it.
 BRAIN_TOOL = {
@@ -156,6 +185,8 @@ class Tools:
 
     def catalogue(self):
         tools = list(CATALOGUE)
+        if self.kb is not None:                   # deterministic graph reasoning needs the KB
+            tools = tools + [REASON_TOOL]
         if self.library_store is not None:        # only advertise it when a library is loaded
             tools = tools + [LIBRARY_TOOL]
         if self.brain_host is not None:           # only under a live server (needs hot-swap)
@@ -369,6 +400,14 @@ class Tools:
                                   facets=facets_arg,
                                   exclude_facets=self._ask_exclusions(facets_arg))
         return {"ok": True, "result": json.dumps(bundle, ensure_ascii=False)}
+
+    def _t_kb_reason(self, args):
+        """Deterministic graph reasoning (reason.py): the model names the op + concepts,
+        the engine does the traversal/derivation, nothing is generated."""
+        if self.kb is None:
+            return {"ok": False, "error": "structured KB not available"}
+        from . import reason as reason_mod
+        return reason_mod.query(self.kb, self.cfg, args)
 
     def _t_ops_annotate(self, args):
         """VINUR-OPS-01 §3 — batch id-join annotation for an external oracle's

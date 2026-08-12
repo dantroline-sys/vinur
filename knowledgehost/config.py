@@ -274,6 +274,16 @@ DEFAULTS = {
     # deterministic cross-reference graph automatically (knowledgehost.citations).  The
     # per-document confirm step can still opt out; this is the master switch for the crawl.
     "auto_citations": True,
+    # ── deterministic graph reasoning (kb_reason / the derive idle op) ──────
+    # conservative = answers use observed edges only (derived material surfaces
+    # only as review questions/gaps); permissive = bounded derivations join
+    # results, always marked 'inferred' with their parent chain.  Per-call
+    # override supported, so A/B needs no global flip.
+    "reasoning_mode": "conservative",
+    "reasoning_max_depth": 3,          # traversal bound for paths/effects
+    "derive_max_edges": 20000,         # cap per derive run (wipe-and-rebuild)
+    "derive_max_children": 40,         # is_a hubs above this don't inherit (over-general)
+    "derive_sibling_frac": 0.8,        # siblings needing a relation before its absence is a gap
     # Before the graph, align a Vulgate-numbered edition's Psalms (e.g. the Douay-Rheims)
     # onto the Hebrew frame of a reference edition (e.g. KJV) already ingested, recovering
     # the per-psalm verse offset from the two texts (knowledgehost.psalms).  No-op unless

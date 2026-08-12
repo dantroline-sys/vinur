@@ -1227,6 +1227,44 @@ def _run_psalms(cfg, log, args) -> int:
     return 0
 
 
+def _run_reason(cfg, log, args) -> int:
+    """`reason <op> <a> [<b>]`: deterministic graph reasoning from the CLI —
+    e.g. `reason compare aspirin warfarin` · `reason effects inflation` ·
+    `reason about photosynthesis --mode permissive`.  Read-only."""
+    import json
+    from . import reason as reason_mod
+    pos = list(args.args or [])
+    op = (pos[0] if pos else "").lower()
+    if op not in reason_mod.OPS:
+        log.error("reason needs an op: %s", " | ".join(sorted(reason_mod.OPS)))
+        return 1
+    q = {"op": op, "a": pos[1] if len(pos) > 1 else "",
+         "b": pos[2] if len(pos) > 2 else ""}
+    if getattr(args, "reasoning_mode", None):
+        q["mode"] = args.reasoning_mode
+    kb = KB(cfg)
+    try:
+        res = reason_mod.query(kb, cfg, q)
+    finally:
+        kb.close()
+    print(json.dumps(res, indent=2, ensure_ascii=False))
+    return 0 if res.get("ok") else 1
+
+
+def _run_derive(cfg, log) -> int:
+    """`derive`: rebuild the quarantined derived-reasoning layer + mine contradictions
+    and sibling-completion gaps.  No LM; deterministic; safe to re-run."""
+    from . import reason as reason_mod
+    kb = KB(cfg)
+    try:
+        stats = reason_mod.derive(kb, cfg, log=log)
+        log.info("derive: %s", stats)
+        ops_mod.emit_result(True, **stats)
+    finally:
+        kb.close()
+    return 0
+
+
 def _run_reconcile(cfg, log, *, anchors="corpus", limit=None, top_k=None) -> int:
     """Queue merge candidates between your existing nodes and the imported commonsense
     sets, then point the user at `adjudicate` to resolve them with the big LM."""
@@ -1279,7 +1317,8 @@ def main(argv=None):
                              "optimize", "edge-audit", "stats", "reset", "bump-version", "migrate-vocab",
                              "bundles", "split", "source", "scenario", "eval", "facetize",
                              "ingest-library", "rebuild-fts", "import-bundle", "eject-bundle",
-                             "collect", "analyze", "citations", "psalms", "read", "clear-queue"])
+                             "collect", "analyze", "citations", "psalms", "read",
+                             "reason", "derive", "clear-queue"])
     # positional args for the modular-bundle verbs:
     #   source <doc_id> [--title ..] [--bundle ..]   scenario [name]   split [dir]
     #   import-bundle <file.kdb>     eject-bundle <bundle>
@@ -1381,6 +1420,11 @@ def main(argv=None):
                     help="collect: JSON file of structured-text confirmation answers "
                          "(id → value, from `analyze`/the wizard) — ingests the doc "
                          "unit-by-unit under the confirmed profile")
+    ap.add_argument("--reasoning-mode", dest="reasoning_mode",
+                    choices=["conservative", "permissive"],
+                    help="reason: consumption mode for this call (conservative = "
+                         "observed edges only; permissive = derivations included, "
+                         "marked inferred)")
     ap.add_argument("--edition", dest="edition",
                     help="psalms: the Vulgate-numbered edition id to reconcile "
                          "(default: every known one, e.g. douay-rheims)")
@@ -1507,6 +1551,10 @@ def main(argv=None):
         return _run_psalms(cfg, log, args)
     if args.command == "read":                # parallel scripture reading across editions
         return _run_read(cfg, log, args)
+    if args.command == "reason":              # deterministic graph reasoning (no LM)
+        return _run_reason(cfg, log, args)
+    if args.command == "derive":              # rebuild the quarantined derived layer
+        return _run_derive(cfg, log)
 
     if args.command == "import-bundle":       # absorb a shipped brain into the master
         import json as _json

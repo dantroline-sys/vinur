@@ -47,6 +47,8 @@ COMMANDS: dict = {
     "citations":  {},
     # align a Vulgate-numbered edition's Psalms onto the Hebrew frame of a reference (no LM)
     "psalms":     {"edition": "str", "reference": "path"},
+    # rebuild the derived-reasoning layer + mine contradictions/sibling gaps (no LM)
+    "derive":     {},
     # janitor: chunks holding text the corpus already has (no LM involved)
     "dedupe":     {"near": "bool", "threshold": "float", "apply": "bool", "bundle": "str"},
     # hub search: candidates sized + judged against this machine's memory
@@ -135,6 +137,16 @@ HELP: dict = {
                     "converge the editions. Deterministic, no LM, idempotent.",
                "edition": "Vulgate edition id (default: every known one)",
                "reference": "path of the Hebrew reference edition (default: auto)"},
+    "derive": {"_": "Rebuild the derived-reasoning layer (no LM, wipe-and-rebuild, "
+                    "deterministic): taxonomic inheritance (a child inherits its "
+                    "class's causal/functional relations) + causal sign composition "
+                    "(A increases B, B suppresses C ⇒ A suppresses C), each written as "
+                    "a QUARANTINED family='derived' status='proposed' edge carrying its "
+                    "full parent chain — consumed only by kb_reason in permissive mode, "
+                    "invisible to every other read path. Also mines contradictions "
+                    "(opposite-polarity assertions → surface questions) and sibling-"
+                    "completion gaps (→ knowledge gaps, feeding the research loop). "
+                    "Safe to re-run; one DELETE reverses the whole layer."},
     "dedupe": {"_": "Janitor (no LM): find chunks holding text the corpus already "
                     "has. A chunk id is sha1(path+section+text), so the same text "
                     "arriving by another route — a research drop re-exported under "
