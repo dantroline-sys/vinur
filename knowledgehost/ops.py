@@ -45,6 +45,8 @@ COMMANDS: dict = {
                    "allow_unlicensed": "bool", "answers_file": "path"},
     # deterministic cross-reference graph over structured (scripture/legal) docs (no LM)
     "citations":  {},
+    # align a Vulgate-numbered edition's Psalms onto the Hebrew frame of a reference (no LM)
+    "psalms":     {"edition": "str", "reference": "path"},
     # janitor: chunks holding text the corpus already has (no LM involved)
     "dedupe":     {"near": "bool", "threshold": "float", "apply": "bool", "bundle": "str"},
     # hub search: candidates sized + judged against this machine's memory
@@ -124,6 +126,15 @@ HELP: dict = {
                        "documents: one node per canonical unit (verse/section), a "
                        "'citation' edge per reference its text makes. Deterministic, no "
                        "LM, idempotent (safe to re-run — new documents just add edges)."},
+    "psalms": {"_": "Line a Vulgate-numbered edition's Psalms (e.g. the Douay-Rheims) up "
+                    "with a Hebrew-numbered reference (e.g. KJV) already ingested. The "
+                    "psalm numbers and per-verse offsets differ (the Douay counts the Latin "
+                    "titles as verses); the offset is RECOVERED from the two texts by "
+                    "wording, not guessed — low-confidence psalms are left alone and listed. "
+                    "Writes the Vulgate→Hebrew key aliases so the graph + parallel reading "
+                    "converge the editions. Deterministic, no LM, idempotent.",
+               "edition": "Vulgate edition id (default: every known one)",
+               "reference": "path of the Hebrew reference edition (default: auto)"},
     "dedupe": {"_": "Janitor (no LM): find chunks holding text the corpus already "
                     "has. A chunk id is sha1(path+section+text), so the same text "
                     "arriving by another route — a research drop re-exported under "

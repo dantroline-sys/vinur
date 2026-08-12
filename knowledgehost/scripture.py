@@ -40,12 +40,49 @@ def _node_id(kb, label: str, kind: str = "passage"):
     return r["id"] if r else None
 
 
-def verse_view(store, kb, key: str) -> dict:
+def alias_views(store) -> tuple:
+    """The versification-alias lens over the raw store, built once per reading:
+    (inverse, per_doc) where inverse = {canonical_key: [(stored_key, path), …]} — which
+    document's chunk at which stored key RENDERS this canonical verse — and per_doc =
+    {path: key_aliases} — each document's own alias map.  A Vulgate-numbered edition's
+    verses are STORED under its printed keys (the store is never rewritten); its doc_meta
+    key_aliases (the Psalm reconciliation) say where each one belongs.  Both directions are
+    PER DOCUMENT: another edition's chunk sitting at the same printed key must not be
+    dragged along, and a chunk whose key is aliased away no longer answers for it."""
+    inv: dict[str, list] = {}
+    per_doc: dict[str, dict] = {}
+    try:
+        metas = store.all_doc_meta()
+    except Exception:
+        return inv, per_doc
+    for path, meta in metas.items():
+        ka = ((meta or {}).get("reference_map") or {}).get("key_aliases") or {}
+        if not ka:
+            continue
+        per_doc[path] = ka
+        for src, dst in ka.items():
+            inv.setdefault(dst, []).append((src, path))
+    return inv, per_doc
+
+
+def verse_view(store, kb, key: str, *, aliases: tuple | None = None) -> dict:
     """The aligned material for ONE canonical verse: every translation's text, the verses
-    it cross-references, and the commentary notes attached to it."""
-    editions = [{"translation": c["title"] or "?", "text": c["text"]}
-                for c in store.chunks_for_section(key)
-                if c.get("source_type") in ("scripture", "legal")]
+    it cross-references, and the commentary notes attached to it.  `aliases` (from
+    alias_views) folds versification-aliased editions in: their rendering of this verse is
+    pulled from its stored key, and their chunk at THIS key is skipped when it belongs
+    elsewhere."""
+    inv, per_doc = aliases or ({}, {})
+    editions = []
+    for c in store.chunks_for_section(key):
+        if c.get("source_type") not in ("scripture", "legal"):
+            continue
+        if per_doc.get(c.get("path_or_url"), {}).get(key):
+            continue                                     # this doc's verse here is aliased away
+        editions.append({"translation": c["title"] or "?", "text": c["text"]})
+    for src, path in inv.get(key, []):
+        for c in store.chunks_for_section(src):
+            if c.get("path_or_url") == path and c.get("source_type") in ("scripture", "legal"):
+                editions.append({"translation": c["title"] or "?", "text": c["text"]})
     cross: list = []
     commentary: list = []
     nid = _node_id(kb, key)
@@ -72,4 +109,6 @@ def parallel_reading(store, kb, cfg, ref_text: str) -> dict:
     {reference, verses: [verse_view, …]}."""
     maps = structure.load_reference_maps(cfg.get("reference_maps") or [])
     keys = resolve_reference(ref_text, maps)
-    return {"reference": ref_text, "verses": [verse_view(store, kb, k) for k in keys]}
+    aliases = alias_views(store)
+    return {"reference": ref_text,
+            "verses": [verse_view(store, kb, k, aliases=aliases) for k in keys]}

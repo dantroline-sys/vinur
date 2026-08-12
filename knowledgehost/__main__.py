@@ -1195,6 +1195,38 @@ def _run_citations(cfg, log) -> int:
     return 0
 
 
+def _run_psalms(cfg, log, args) -> int:
+    """`psalms`: align a Vulgate-numbered edition's Psalms (e.g. the Douay-Rheims) onto the
+    Hebrew frame of a reference edition (e.g. KJV) already ingested — recovering each
+    psalm's verse offset from the two texts, so they line up verse-for-verse.  No LM, no
+    external table; low-confidence psalms are left on their own keys and listed.  Re-run
+    `citations` afterwards (or it runs automatically at ingest) to converge the graph."""
+    from . import psalms as psalms_mod
+    editions = [args.edition] if getattr(args, "edition", None) else sorted(psalms_mod.VULGATE_EDITIONS)
+    store = make_store(cfg)
+    any_applied = False
+    try:
+        for edition in editions:
+            r = psalms_mod.reconcile(store, cfg, edition=edition,
+                                     reference_path=getattr(args, "reference", None), log=log)
+            if r.get("note"):
+                log.info("psalms (%s): %s", edition, r["note"])
+                continue
+            any_applied = any_applied or r["applied"]
+            print(f"\n\033[1m{edition}\033[0m → reference {os.path.basename(r['reference'] or '?')}: "
+                  f"{r['psalms_aligned']} psalm(s) aligned, {r['aliases']} verse alias(es)")
+            if r["low_confidence"]:
+                print("  psalms left on their own keys for review: "
+                      + ", ".join(str(p) for p in r["low_confidence"]))
+            else:
+                print("  every divergent psalm aligned with confidence")
+        print()
+    finally:
+        store.close()
+    ops_mod.emit_result(any_applied)
+    return 0
+
+
 def _run_reconcile(cfg, log, *, anchors="corpus", limit=None, top_k=None) -> int:
     """Queue merge candidates between your existing nodes and the imported commonsense
     sets, then point the user at `adjudicate` to resolve them with the big LM."""
@@ -1247,7 +1279,7 @@ def main(argv=None):
                              "optimize", "edge-audit", "stats", "reset", "bump-version", "migrate-vocab",
                              "bundles", "split", "source", "scenario", "eval", "facetize",
                              "ingest-library", "rebuild-fts", "import-bundle", "eject-bundle",
-                             "collect", "analyze", "citations", "read", "clear-queue"])
+                             "collect", "analyze", "citations", "psalms", "read", "clear-queue"])
     # positional args for the modular-bundle verbs:
     #   source <doc_id> [--title ..] [--bundle ..]   scenario [name]   split [dir]
     #   import-bundle <file.kdb>     eject-bundle <bundle>
@@ -1349,6 +1381,12 @@ def main(argv=None):
                     help="collect: JSON file of structured-text confirmation answers "
                          "(id → value, from `analyze`/the wizard) — ingests the doc "
                          "unit-by-unit under the confirmed profile")
+    ap.add_argument("--edition", dest="edition",
+                    help="psalms: the Vulgate-numbered edition id to reconcile "
+                         "(default: every known one, e.g. douay-rheims)")
+    ap.add_argument("--reference", dest="reference",
+                    help="psalms: path of the Hebrew-numbered reference edition to align "
+                         "against (default: the ingested non-Vulgate edition with the most Psalms)")
     ap.add_argument("--allow-unlicensed", action="store_true", dest="allow_unlicensed",
                     help="pack: build despite unlicensed sources — stamped "
                          "shareable:false (private use only; import warns)")
@@ -1465,6 +1503,8 @@ def main(argv=None):
         return _run_analyze(cfg, log, args)
     if args.command == "citations":           # deterministic cross-reference graph (no LM)
         return _run_citations(cfg, log)
+    if args.command == "psalms":              # Vulgate→Hebrew Psalm alignment (no LM)
+        return _run_psalms(cfg, log, args)
     if args.command == "read":                # parallel scripture reading across editions
         return _run_read(cfg, log, args)
 

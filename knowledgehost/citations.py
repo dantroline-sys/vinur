@@ -68,6 +68,7 @@ def build(store, kb, cfg, *, log=log) -> dict:
         for key, text in d["units"]:
             if not key:
                 continue
+            key = maps.apply_key(key)                     # versification alias → converge on the shared node
             unit = kb._new_node(key, node_kind, (text or "")[:_SUMMARY_CAP], None, [])
             kb.add_node_support(unit, path, summary=(text or "")[:_SUMMARY_CAP])
             n_units += 1
@@ -86,6 +87,7 @@ def build(store, kb, cfg, *, log=log) -> dict:
         for anchor_key, note in d["notes"]:
             if not anchor_key or not note:
                 continue
+            anchor_key = maps.apply_key(anchor_key)       # note anchors follow the same aliasing
             verse = kb._new_node(anchor_key, node_kind, "", None, [])     # ensure the anchor exists
             nid_label = "note:%s:%s" % (anchor_key,
                                         hashlib.sha1(note.encode("utf-8")).hexdigest()[:10])

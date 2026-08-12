@@ -77,12 +77,35 @@ John 3:16
 - **Semantic cards** (when you run `distill` with an LM) — per-verse *theme* and
   *parallel* cards; for legal corpora, *definition* / *obligation* / *exception* cards.
 
+## The Psalms — reconciled automatically
+
+The Vulgate (Douay) and Hebrew (KJV) traditions number the Psalms differently — Vulgate 9
+is Hebrew 9+10, Vulgate 10–112 are Hebrew 11–113, and so on — and the *verse* numbers
+drift too, because the Douay counts the Latin titles as verses (Douay 50:3 *"Have mercy
+on me"* is KJV 51:1).  vinur does **not** guess any of this from a table: after both
+editions are in, it recovers each psalm's exact verse offset **from the two texts
+themselves** (matching the wording — they translate the same content), then writes the
+Vulgate→Hebrew key aliases into the Douay document's reference map.  This runs
+automatically at ingest (config `auto_reconcile`), or by hand:
+
+```
+./vinur.sh psalms
+```
+
+- Numbered Latin titles move to a **verse-0 superscription slot** (`Psalm 51:0`), so a
+  title never masquerades as the Hebrew psalm that shares its number.
+- A psalm whose offset can't be established with confidence is **left on its own keys
+  and listed** — never guessed.
+- On the real Gutenberg files this aligns all 144 divergent psalms (the split Vulgate 9,
+  the combined 113, the joined 114+115 and 146+147, and every titled psalm) — so
+  `read Psalms 23:1` shows the KJV's *"The LORD is my shepherd"* beside the Douay's
+  *"The Lord ruleth me"*, with the Challoner note attached.
+
 ## Notes & limits
 
-- **Gospels, Epistles, most of the OT** line up cleanly across editions.
-- **Psalms 10–146** diverge between the Vulgate (Douay) and Hebrew (KJV) numbering; those
-  are ingested **as printed**, so a Douay Psalm and its KJV counterpart may sit on
-  neighbouring keys until a Vulgate↔Hebrew Psalm table is supplied (the edition map's
-  `key_aliases` is where it goes).
+- Verified against the complete Gutenberg texts: the KJV ingests **31,102 verses in 66
+  books** (the exact canonical count) and the Douay-Rheims **35,630 units in 73 books**,
+  with no duplicate keys — flowed verse paragraphs, wrapped lines, alternate book titles
+  ("Otherwise Called: …") and the Vulgate Psalm 9 restart are all handled.
 - **Deuterocanon** (Tobit, Sirach, 1–2 Maccabees, …) is first-class, so a Catholic edition
   ingests whole; a KJV simply has no verses on those keys.

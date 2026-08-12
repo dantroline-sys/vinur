@@ -228,6 +228,9 @@ class SqliteStore:
     def get_doc_meta(self, path_or_url: str):
         return _doc_meta_get(self.db, path_or_url)
 
+    def all_doc_meta(self) -> dict:
+        return _doc_meta_all(self.db)
+
     # ---- writes ----------------------------------------------------------
     def delete_by_path(self, path_or_url: str):
         self.db.execute("DELETE FROM chunks WHERE path_or_url=?", (path_or_url,))
@@ -691,6 +694,9 @@ class LanceStore:
 
     def get_doc_meta(self, path_or_url: str):
         return _doc_meta_get(self._mdb, path_or_url)
+
+    def all_doc_meta(self) -> dict:
+        return _doc_meta_all(self._mdb)
 
     def _open_or_none(self):
         try:

@@ -256,6 +256,12 @@ class ReferenceMaps:
     def apply(self, ref: Ref) -> Ref:
         return apply_alias(ref, self.key_aliases)
 
+    def apply_key(self, key: str) -> str:
+        """Fold a bare canonical key onto its alias target (identity if none) — for
+        rewriting a STORED unit key (not a parsed Ref), so a versification-aliased edition's
+        units converge on the same node as the edition they're being lined up with."""
+        return self.key_aliases.get(key, key)
+
     @property
     def stats(self) -> dict:
         return {"book_aliases": len(self._books), "key_aliases": len(self.key_aliases),
@@ -332,12 +338,22 @@ _EDITIONS = {
 def detect_edition(text: str) -> dict | None:
     """Recognise a known whole-Bible edition from its own vocabulary, so it can be
     ingested on a sensible default instead of a book-by-book interrogation.  Returns
-    {id, name, note} or None."""
+    {id, name, note} or None.
+
+    A book signal counts only in a TITLE position — at a line start, optionally behind a
+    title prefix ('The Prophecy of Abdias', 'Osee Chapter 1', '1 Paralipomenon') — because
+    other editions MENTION these names in running prose (the KJV's own New Testament says
+    'as he saith also in Osee' and 'others, Jeremias'), and a prose mention must not
+    reclothe a KJV as the Douay-Rheims."""
     low = text.lower()
     for eid, spec in _EDITIONS.items():
         strong = any(re.search(r"\b" + re.escape(s) + r"\b", low) for s in spec["name_signals"])
-        cluster = sum(1 for s in spec["book_signals"] if s in low) >= 3
-        if strong or cluster:
+        titled = sum(
+            1 for s in spec["book_signals"]
+            if re.search(r"^\s*(?:[1-4]\s+)?(?:the\s+(?:first|second|third|fourth)?\s*"
+                         r"(?:holy\s+)?(?:book|prophecy|epistle|gospel)\s+of\s+(?:the\s+)?)?"
+                         + re.escape(s) + r"\b", low, re.M))
+        if strong or titled >= 3:
             return {"id": eid, "name": spec["name"], "note": spec["note"]}
     return None
 
@@ -377,14 +393,113 @@ _RE_BARE_CV = re.compile(r"\b(\d+)[:.](\d+)\b")
 # "Genesis Chapter 1", "Psalms Chapter 3", "Psalm 23"; and a table-of-contents / section
 # title "The Book of Genesis", "Book of Exodus".
 _RE_CHAP_HEADER = re.compile(r"^\s*(.+?)\s+(?:chapter|chap\.?|psalm)\s+\d+\.?\s*$", re.I)
-_RE_BOOK_OF = re.compile(r"^\s*(?:the\s+)?book\s+of\s+(.+?)\s*$", re.I)
+_RE_BOOK_OF = re.compile(r"^\s*(?:the\s+)?book\s+of\s+(?:the\s+prophet\s+)?(.+?)\s*$", re.I)
+
+# ── whole-Bible title pages — the header grammar real printed editions use ───
+# A KJV has NO per-chapter headers: its book-title lines ("The Proverbs", "The Epistle of
+# Paul the Apostle to the Romans") are the ONLY book context, so failing to resolve one
+# would file the next book's verses under the previous book.  These cover the King James
+# and Douay-Rheims (Gutenberg) title forms; each yields candidate book NAMES which still
+# have to resolve via the canon/maps — an unmatched candidate never invents a book.
+_ORD_WORD = {"first": "1", "second": "2", "third": "3", "fourth": "4", "fifth": "5"}
+_RE_TITLE_CALLED = re.compile(r"\bcalled\s+(.+?)\.?$", re.I)   # "…of Moses: Called Genesis"
+_RE_TITLE_GOSPEL = re.compile(
+    r"^(?:the\s+)?(?:holy\s+)?gospel\s+(?:of\s+jesus\s+christ\s+)?"
+    r"according\s+to\s+(?:saint|st\.?)\s+(.+?)\.?$", re.I)
+_RE_TITLE_EPISTLE = re.compile(
+    r"^the\s+(first|second|third)?\s*(?:catholic\s+|general\s+)?epistle\s+(?:general\s+)?"
+    r"of\s+(?:st\.?\s+|saint\s+)?(?:paul(?:\s+the\s+apostle)?\s+to\s+(?:the\s+)?)?"
+    r"(.+?)(?:\s+the\s+apostle)?\.?$", re.I)
+_RE_TITLE_NBOOK = re.compile(
+    r"^the\s+(first|second|third|fourth|fifth)\s+book\s+of\s+(?:the\s+)?(.+?)\.?$", re.I)
+_RE_TITLE_PROPHECY = re.compile(r"^the\s+prophecy\s+of\s+(.+?)\.?$", re.I)
+_RE_TITLE_LAM = re.compile(r"^the\s+lamentations\b", re.I)
+_RE_TITLE_ACTS = re.compile(r"^the\s+acts\s+of\s+the\s+apostles\.?$", re.I)
+_RE_TITLE_REV = re.compile(r"^the\s+(apocalypse|revelation)\b", re.I)
+_TITLE_SHAPES = (_RE_TITLE_GOSPEL, _RE_TITLE_EPISTLE, _RE_TITLE_NBOOK,
+                 _RE_TITLE_PROPHECY, _RE_TITLE_LAM, _RE_TITLE_ACTS, _RE_TITLE_REV)
+# the connector a printed title page uses to stack an ALTERNATE title under the real one
+# ("The First Book of Samuel" / "Otherwise Called:" / "The First Book of the Kings") —
+# the line after it is an alias of the book just named, never a context switch.
+_RE_ALT_CONNECTOR = re.compile(r"^\s*(?:otherwise|commonly|sometimes|also)\s+called[:.]?\s*$", re.I)
+# a verse marker EMBEDDED in flowing text ("…upon the earth, 1:18 And to rule…") — the
+# KJV (Gutenberg #10) runs several verses per paragraph.  Colon form only: the dot form is
+# how Douay notes CITE verses ("See Gen. 20.12."), which must never split anything.  The
+# marker may also sit at END of line ("…Methuselah: 5:22⏎And Enoch walked…") — the verse
+# opens empty and its text arrives on the continuation line.
+_RE_INLINE_CV = re.compile(r"(?:^|(?<=\s))(\d+):(\d+)\.?(?:\s+|$)")
+
+
+def _flow_split(seg: str, last):
+    """Split a verse-flow segment at embedded SEQUENTIAL verse markers.  `last` is the
+    printed (chapter, verse) the flow continues from; a marker splits only when it is the
+    NEXT verse (or the next chapter's verse 1), so an in-text citation ('see 4:9') stays
+    text.  Returns (lead, parts): the text before the first split, then [(chap, verse,
+    body), …] — each split chains `last` forward, so a whole flowed paragraph unrolls."""
+    if last is None:
+        return seg.strip(), []
+    cuts = []
+    cl = last
+    for m in _RE_INLINE_CV.finditer(seg):
+        c, v = int(m.group(1)), int(m.group(2))
+        if (c == cl[0] and v == cl[1] + 1) or (c == cl[0] + 1 and v == 1):
+            cuts.append((m, c, v))
+            cl = (c, v)
+    if not cuts:
+        return seg.strip(), []
+    lead = seg[:cuts[0][0].start()].strip()
+    parts = []
+    for i, (m, c, v) in enumerate(cuts):
+        end = cuts[i + 1][0].start() if i + 1 < len(cuts) else len(seg)
+        parts.append((str(c), str(v), seg[m.end():end].strip()))
+    return lead, parts
+
+
+def _title_candidates(s: str) -> list[str]:
+    """Candidate book names a printed title line may be naming — resolved (or not) by
+    the caller against the canon + maps."""
+    out: list[str] = []
+    seg = s.split(",")[0].strip()          # "…of Samuel, Otherwise Called…" → first segment
+    for c in dict.fromkeys((s, seg)):      # ordered, de-duplicated
+        m = _RE_TITLE_CALLED.search(c)
+        if m:
+            out.append(m.group(1))
+        m = _RE_TITLE_GOSPEL.match(c)
+        if m:
+            out.append(m.group(1))
+        m = _RE_TITLE_EPISTLE.match(c)
+        if m:
+            n = _ORD_WORD.get((m.group(1) or "").lower(), "")
+            out.append(f"{n} {m.group(2)}".strip())
+        m = _RE_TITLE_NBOOK.match(c)
+        if m:
+            n = _ORD_WORD.get(m.group(1).lower(), "")
+            out.extend((f"{n} {m.group(2)}".strip(), m.group(2)))
+        m = _RE_TITLE_PROPHECY.match(c)
+        if m:
+            out.append(m.group(1))
+        if _RE_TITLE_LAM.match(c):
+            out.append("Lamentations")
+        if _RE_TITLE_ACTS.match(c):
+            out.append("Acts")
+        m = _RE_TITLE_REV.match(c)
+        if m:
+            out.append(m.group(1))
+        if c.lower().startswith("the "):   # "The Proverbs" / "The Song of Solomon"
+            out.append(c[4:])
+        i = c.lower().find("'s ")          # "Solomon's Canticle of Canticles"
+        if i >= 0:
+            out.append(c[i + 3:])
+    return out
 
 
 def _header_book(ln: str, maps):
     """Resolve a header line to a book: the bare name, a 'Book Chapter N' / 'Psalm N'
-    chapter header, or a 'Book of X' title.  None if it isn't a recognisable header."""
+    chapter header, a 'Book of X' title, or a printed title-page form ('The First Book of
+    Moses: Called Genesis', 'The Epistle of Paul the Apostle to the Romans').  None if it
+    isn't a recognisable header."""
     s = ln.strip()
-    if not s or len(s.split()) > 8:
+    if not s or len(s.split()) > 14:
         return None
     b = _match(maps, s)
     if b:
@@ -395,6 +510,10 @@ def _header_book(ln: str, maps):
             b = _match(maps, m.group(1))
             if b:
                 return b
+    for cand in _title_candidates(s):
+        b = _match(maps, cand)
+        if b:
+            return b
     return None
 
 
@@ -403,7 +522,10 @@ def _looks_like_header(ln: str) -> bool:
     so an unrecognised header (a Vulgate name with no map) DROPS the book context
     instead of silently attributing its verses to the previous book."""
     s = ln.strip()
-    return bool(_RE_CHAP_HEADER.match(s) or _RE_BOOK_OF.match(s))
+    if len(s.split()) > 14:
+        return False
+    return bool(_RE_CHAP_HEADER.match(s) or _RE_BOOK_OF.match(s)
+                or any(rx.match(s) for rx in _TITLE_SHAPES))
 
 # legal: "§ 106", "Sec. 501(a)(1)", "Section 230", "17 U.S.C. § 106", "Article III"
 _RE_SECTION = re.compile(r"(?:§+|\bSec(?:tion)?s?\.?)\s*(\d+[A-Za-z]?(?:[.\-]\d+)*)((?:\([0-9a-zA-Z]+\))*)")
@@ -430,33 +552,59 @@ def analyze(text: str, *, kind_hint: str | None = None, maps: ReferenceMaps | No
     lines = _sample_lines(text)
     nonblank = [ln for ln in lines if ln.strip()]
     n = max(1, len(nonblank))
+    # paragraph-structured text (blank-line separated): a verse's hard-wrapped continuation
+    # lines are part of the verse — not annotations, and NEVER header-checked (a wrapped
+    # line ending 'wisdom.' must not read as the book of Wisdom).  Same model as
+    # _walk_scripture; a compact no-blank-line paste falls back to the line model.
+    paragraphs = any(not ln.strip() for ln in lines[1:-1])
 
     # ── scripture signals ────────────────────────────────────────────────────
     inline = cv_lines = annot_lines = 0
     seen_verse = False
+    par = None                                           # None | 'verse' | 'prose' (open paragraph)
+    last = None                                          # (chap, verse) of the last verse line
     found: dict[str, int] = {}
     unknown_books: dict[str, int] = {}
-    for ln in nonblank:
+
+    def _seq(c, v):                                      # the walker's sequential rule
+        return last and ((int(c) == last[0] and int(v) == last[1] + 1)
+                         or (int(c) == last[0] + 1 and int(v) == 1))
+
+    for ln in lines:
+        if not ln.strip():
+            par = None
+            continue
+        at_start = (par is None) or not paragraphs
         m = _RE_LINE_BOOKCV.match(ln)
-        if m:
+        if m and (at_start or _seq(m.group(2), m.group(3))):
             b = _match(maps, m.group(1))
             if b:
-                inline += 1; seen_verse = True
+                inline += 1; seen_verse = True; par = "verse"
+                last = (int(m.group(2)), int(m.group(3)))
                 found[b[1]] = found.get(b[1], 0) + 1
             else:
                 unknown_books[m.group(1).strip()] = unknown_books.get(m.group(1).strip(), 0) + 1
             continue
-        if _RE_LINE_CV.match(ln):
-            cv_lines += 1; seen_verse = True
+        m = _RE_LINE_CV.match(ln)
+        if m and (at_start or _seq(m.group(1), m.group(2))):
+            cv_lines += 1; seen_verse = True; par = "verse"
+            last = (int(m.group(1)), int(m.group(2)))
+            continue
+        if not at_start:                                 # a continuation line of its paragraph —
+            if par == "prose" and seen_verse:            # more note mass; NEVER header-checked
+                annot_lines += 1                         # (a wrapped 'wisdom.' is not a book)
             continue
         hb = _header_book(ln, maps)                      # "Genesis Chapter 1" / "Book of Exodus"
         if hb:
             found.setdefault(hb[1], 0)
+            par = "prose"
             continue
         if _looks_like_header(ln):
+            par = "prose"
             continue
-        # prose that sits AFTER a verse and isn't a header = an interleaved annotation /
-        # commentary block (Douay-Rheims/Challoner notes) — a signal for the layer step.
+        # a prose PARAGRAPH after a verse (not a verse's own wrapped lines) = an interleaved
+        # annotation / commentary block (Douay-Rheims/Challoner notes) — the layer signal.
+        par = "prose"
         if seen_verse:
             annot_lines += 1
     # book-header + "C:V lines" layout: bare C:V lines dominate AND some book headers seen
@@ -571,35 +719,152 @@ def analyze(text: str, *, kind_hint: str | None = None, maps: ReferenceMaps | No
     return prof
 
 
+class _VerseRun:
+    """Track (book, chapter) verse numbering and CONTINUE it across a mid-chapter verse
+    RESTART.  Some editions print a Vulgate 'combined' psalm — e.g. Psalm 9 = Hebrew 9 +
+    Hebrew 10 — as two halves, BOTH numbered chapter 9 with the verse count restarting at
+    1 (a divider like '(Psalm Chapter 10 according to the Hebrews.)' between them).  Keyed
+    naively that collides the two halves on one canonical key and loses a verse; here the
+    second run is renumbered to continue after the first, so every verse keeps a unique
+    key (Vulgate Ps 9 becomes a clean 1..39) and the reconciler can map it to the split
+    Hebrew psalms.  Only fires on an actual decrease within the SAME book+chapter, so a
+    normal ascending text is untouched."""
+
+    def __init__(self):
+        self.book = self.chap = None
+        self.cmax = self.base = 0
+
+    def number(self, book, chap, printed_verse) -> int:
+        chap, pv = int(chap), int(printed_verse)
+        if book != self.book or chap != self.chap:       # new book/chapter — plain numbering
+            self.book, self.chap, self.base, self.cmax = book, chap, 0, pv
+            return pv
+        sv = pv + self.base
+        if sv <= self.cmax:                              # restart within the chapter → continue
+            self.base = self.cmax
+            sv = pv + self.base
+        self.cmax = max(self.cmax, sv)
+        return sv
+
+
+def _walk_scripture(text: str, profile: dict, maps):
+    """The shared line-walker for scripture parsing — yields typed events:
+        ('verse', book, chapter, verse, first_line)   a verse begins (numbering continued
+                                                      over a mid-chapter restart, _VerseRun)
+        ('cont', line)                                a continuation of the OPEN verse
+        ('note', line)                                prose that is NOT part of a verse
+        ('book', canonical_or_None)                   the book context switched (None=unknown)
+
+    Real texts are paragraph-structured (blank-line separated), and the paragraph is the
+    unit of meaning: a verse (with its hard-wrapped continuation lines), a note, a header —
+    each is ONE paragraph.  So only a paragraph-START line can begin a verse or a header;
+    a continuation line belongs to its paragraph, whatever it happens to look like — a
+    wrapped line ending 'wisdom.' must never flip the book context to the book of Wisdom,
+    and a wrapped citation ('…as we learn from Osee⏎12.4. He is called…') must never
+    become verse 12:4 (both real Gutenberg failures).  One exception: a verse-shaped line
+    mid-paragraph that CONTINUES the sequence (next verse / next chapter) starts a verse,
+    so editions that stack verses without blank lines still split correctly.  A printed
+    alternate title ('Otherwise Called:' + a second title line) never switches the book.
+    A text with no blank lines at all (a compact paste) falls back to the line model:
+    every prose line after a verse is a note, headers recognised anywhere."""
+    paragraphs = bool(re.search(r"\n[ \t]*\n", text))
+    cur_book = (profile.get("book_order") or [None])[0]
+    run = _VerseRun()
+    par = None                                           # None | 'verse' | 'prose' — open paragraph
+    last = None                                          # (book, chap, verse) as printed
+    alt_title = False                                    # the NEXT title line is an alias
+    for raw in text.split("\n"):
+        ln = raw.rstrip("\r")
+        if not ln.strip():
+            par = None                                   # paragraph ended
+            continue
+        at_start = (par is None) or not paragraphs
+        if alt_title:                                    # the alternate title under a real one
+            alt_title = False
+            par = "prose"
+            continue
+        if _RE_ALT_CONNECTOR.match(ln):
+            alt_title = True
+            par = "prose"
+            continue
+        m = _RE_LINE_BOOKCV.match(ln)
+        b = _match(maps, m.group(1)) if m else None
+        mcv = None if b else _RE_LINE_CV.match(ln)
+        if b or (mcv and cur_book):
+            bk = b[1] if b else cur_book
+            ch, pv = (m.group(2), m.group(3)) if b else (mcv.group(1), mcv.group(2))
+            body = (m.group(4) if b else mcv.group(3)).strip()
+            seq = last and bk == last[0] and (
+                (int(ch) == last[1] and int(pv) == last[2] + 1)
+                or (int(ch) == last[1] + 1 and int(pv) == 1))
+            if at_start or seq:                          # mid-paragraph: sequential only
+                cur_book = bk
+                lead, parts = _flow_split(body, (int(ch), int(pv)))
+                v = run.number(cur_book, ch, pv)
+                yield ("verse", cur_book, ch, v, lead)
+                last = (cur_book, int(ch), int(pv))
+                for c2, v2, b2 in parts:                 # verses flowed into the same line
+                    yield ("verse", cur_book, c2, run.number(cur_book, c2, v2), b2)
+                    last = (cur_book, int(c2), int(v2))
+                par = "verse"
+                continue
+        if not at_start:                                 # continuation of the open paragraph
+            lead, parts = _flow_split(
+                ln.strip(), (last[1], last[2]) if last and last[0] == cur_book else None)
+            if lead:
+                yield ("cont" if par == "verse" else "note", lead)
+            for c2, v2, b2 in parts:                     # a flowed verse mid-continuation —
+                yield ("verse", cur_book, c2, run.number(cur_book, c2, v2), b2)
+                last = (cur_book, int(c2), int(v2))      # (a verse spanning two paragraphs
+                par = "verse"                            #  hides the next markers in 'prose')
+            continue
+        hb = _header_book(ln, maps)                      # "Genesis Chapter 1" / "Book of Exodus"
+        if hb:
+            cur_book = hb[1]                             # switch the book context
+            yield ("book", cur_book)
+            par = "prose"
+            continue
+        if _looks_like_header(ln):
+            cur_book = None                              # unresolved book header — drop, don't mislabel
+            yield ("book", None)
+            par = "prose"
+            continue
+        lead, parts = _flow_split(                       # a prose paragraph can also carry a
+            ln.strip(), (last[1], last[2]) if last and last[0] == cur_book else None)
+        par = "prose"                                    # flowed sequential verse (KJV prints a
+        if lead:                                         # long verse as two paragraphs)
+            yield ("note", lead)
+        for c2, v2, b2 in parts:
+            yield ("verse", cur_book, c2, run.number(cur_book, c2, v2), b2)
+            last = (cur_book, int(c2), int(v2))
+            par = "verse"
+
+
 def parse_units(text: str, profile: dict, *, maps: ReferenceMaps | None = None):
     """Yield (Ref, unit_text) for each addressable unit under a CONFIRMED profile —
-    the Ref carries the canonical key (node identity) + display form.  Verse-per-line
-    for scripture; section-delimited blocks for legal.  `maps` resolves multilingual
-    book names and applies key aliases so units land on the canonical frame."""
+    the Ref carries the canonical key (node identity) + display form.  A verse's text is
+    its WHOLE paragraph (hard-wrapped continuation lines included); section-delimited
+    blocks for legal.  `maps` resolves multilingual book names and applies key aliases so
+    units land on the canonical frame."""
     def _fix(r):
         return maps.apply(r) if maps else r
     kind = profile.get("kind")
     if kind == "scripture":
-        cur_book = (profile.get("book_order") or [None])[0]
-        for raw in text.split("\n"):
-            ln = raw.rstrip("\r")
-            if not ln.strip():
-                continue
-            m = _RE_LINE_BOOKCV.match(ln)
-            b = _match(maps, m.group(1)) if m else None
-            if b:
-                cur_book = b[1]
-                yield _fix(scripture_ref(cur_book, m.group(2), m.group(3))), m.group(4).strip()
-                continue
-            m = _RE_LINE_CV.match(ln)
-            if m and cur_book:
-                yield _fix(scripture_ref(cur_book, m.group(1), m.group(2))), m.group(3).strip()
-                continue
-            hb = _header_book(ln, maps)                  # "Genesis Chapter 1" / "Book of Exodus"
-            if hb:
-                cur_book = hb[1]                         # switch the book context
-            elif _looks_like_header(ln):
-                cur_book = None                          # unresolved book header — drop, don't mislabel
+        open_ref, buf = None, []
+        for ev in _walk_scripture(text, profile, maps):
+            if ev[0] == "verse":
+                if open_ref:
+                    yield open_ref, " ".join(x for x in buf if x)
+                _, bk, ch, v, first = ev
+                open_ref, buf = _fix(scripture_ref(bk, ch, v)), [first]
+            elif ev[0] == "cont":
+                buf.append(ev[1])
+            elif ev[0] == "book":
+                if open_ref:
+                    yield open_ref, " ".join(x for x in buf if x)
+                open_ref, buf = None, []
+        if open_ref:
+            yield open_ref, " ".join(x for x in buf if x)
     elif kind == "legal":
         title = (profile.get("work") or {}).get("title", "")
         cur, buf = None, []
@@ -627,7 +892,6 @@ def parse_annotations(text: str, profile: dict, *, maps: ReferenceMaps | None = 
         return []
     def _fix(r):
         return maps.apply(r) if maps else r
-    cur_book = (profile.get("book_order") or [None])[0]
     out: list = []
     last = None                                          # the verse the current block annotates
     buf: list = []
@@ -638,30 +902,16 @@ def parse_annotations(text: str, profile: dict, *, maps: ReferenceMaps | None = 
             if note:
                 out.append((last, note))
 
-    for raw in text.split("\n"):
-        ln = raw.rstrip("\r")
-        if not ln.strip():
-            continue
-        m = _RE_LINE_BOOKCV.match(ln)
-        b = _match(maps, m.group(1)) if m else None
-        if b:
-            commit(); buf = []; cur_book = b[1]
-            last = _fix(scripture_ref(cur_book, m.group(2), m.group(3)))
-            continue
-        m = _RE_LINE_CV.match(ln)
-        if m and cur_book:
+    for ev in _walk_scripture(text, profile, maps):
+        if ev[0] == "verse":
             commit(); buf = []
-            last = _fix(scripture_ref(cur_book, m.group(1), m.group(2)))
-            continue
-        hb = _header_book(ln, maps)
-        if hb:
-            commit(); buf = []; cur_book = hb[1]; last = None   # new chapter — no anchor yet
-            continue
-        if _looks_like_header(ln):
-            commit(); buf = []; cur_book = None; last = None
-            continue
-        if last:                                         # prose after a verse = its note
-            buf.append(ln.strip())
+            _, bk, ch, v, _first = ev
+            last = _fix(scripture_ref(bk, ch, v))
+        elif ev[0] == "book":
+            commit(); buf = []; last = None              # new chapter/section — no anchor yet
+        elif ev[0] == "note" and last:                   # prose paragraph after a verse = its note
+            buf.append(ev[1])
+        # 'cont' lines belong to the verse's own text, never to a note
     commit()
     return out
 

@@ -274,6 +274,11 @@ DEFAULTS = {
     # deterministic cross-reference graph automatically (knowledgehost.citations).  The
     # per-document confirm step can still opt out; this is the master switch for the crawl.
     "auto_citations": True,
+    # Before the graph, align a Vulgate-numbered edition's Psalms (e.g. the Douay-Rheims)
+    # onto the Hebrew frame of a reference edition (e.g. KJV) already ingested, recovering
+    # the per-psalm verse offset from the two texts (knowledgehost.psalms).  No-op unless
+    # both are present; low-confidence psalms are left on their own keys and reported.
+    "auto_reconcile": True,
     "extensions": [".pdf", ".epub", ".html", ".htm", ".txt", ".md"],
     # Where `clear-queue` MOVES the source files of documents it drops from the
     # distillation queue — with their tree relative to each source root preserved,

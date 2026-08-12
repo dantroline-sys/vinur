@@ -607,19 +607,33 @@ def crawl(store, embedder, cfg, *, force=False) -> dict:
         if pend:
             pend.close()
     out = {"docs": docs, "chunks": chunks}
-    # a structured doc was ingested and asked for the graph → build it now (idempotent)
-    if want_graph and cfg.get("auto_citations", True):
-        try:
-            from . import citations as citations_mod
-            from .kb import KB
-            kb = KB(cfg)
+    # a structured doc was ingested and asked for the graph → build it now (idempotent).
+    if want_graph:
+        # First reconcile any Vulgate-numbered edition's Psalms onto the Hebrew frame of a
+        # reference edition present in the store, so the graph converges the two on ONE key.
+        if cfg.get("auto_reconcile", True):
             try:
-                out["citations"] = citations_mod.build(store, kb, cfg, log=log)
-                log.info("cross-reference graph built: %s", out["citations"])
-            finally:
-                kb.close()
-        except Exception as e:                     # the graph is a bonus, never fails the crawl
-            log.warning("citations pass skipped: %s", e)
+                from . import psalms as psalms_mod
+                for edition in psalms_mod.VULGATE_EDITIONS:
+                    r = psalms_mod.reconcile(store, cfg, edition=edition, log=log)
+                    if r.get("applied"):
+                        out.setdefault("reconciled", {})[edition] = {
+                            "psalms": r["psalms_aligned"], "aliases": r["aliases"],
+                            "low_confidence": r["low_confidence"]}
+            except Exception as e:                 # reconciliation is a bonus, never fails the crawl
+                log.warning("psalm reconciliation skipped: %s", e)
+        if cfg.get("auto_citations", True):
+            try:
+                from . import citations as citations_mod
+                from .kb import KB
+                kb = KB(cfg)
+                try:
+                    out["citations"] = citations_mod.build(store, kb, cfg, log=log)
+                    log.info("cross-reference graph built: %s", out["citations"])
+                finally:
+                    kb.close()
+            except Exception as e:                 # the graph is a bonus, never fails the crawl
+                log.warning("citations pass skipped: %s", e)
     if deferred:
         out["needs_confirm"] = deferred
         log.info("%d document group(s) need your confirmation before ingest — "
