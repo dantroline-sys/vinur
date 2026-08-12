@@ -165,6 +165,17 @@ def osis_code(canonical_book: str) -> str:
     return _OSIS.get(canonical_book, canonical_book.replace(" ", ""))
 
 
+def book_of_key(key: str):
+    """The canonical book name for a scripture key ('bible:Rom.9.16' → 'Romans'), so a
+    bare 'C:V' cross-reference in that verse resolves within its own book.  None for a
+    non-scripture key."""
+    if key.startswith("bible:"):
+        m = re.match(r"([^.]+)\.", key[6:])
+        if m:
+            return _OSIS_REV.get(m.group(1), m.group(1))
+    return None
+
+
 def display_for_key(key: str) -> str:
     """Reverse a canonical key to its human citation ('bible:John.3.16' → 'John 3:16',
     'usc:17/106/a/1' → '17 U.S.C. § 106(a)(1)').  For friendly rendering of a stored
@@ -347,6 +358,11 @@ def _looks_like_header(ln: str) -> bool:
 _RE_SECTION = re.compile(r"(?:§+|\bSec(?:tion)?s?\.?)\s*(\d+[A-Za-z]?(?:[.\-]\d+)*)((?:\([0-9a-zA-Z]+\))*)")
 _RE_USC = re.compile(r"\b(\d+)\s+([A-Z][A-Za-z.]{1,12})\s*§+\s*(\d+[A-Za-z]?(?:[.\-]\d+)*)((?:\([0-9a-zA-Z]+\))*)")
 _RE_ARTICLE = re.compile(r"\bArticle\s+([IVXLC]+|\d+)\b")
+# the PROSE cross-reference form: "section 106 of title 17", "§ 230(c)(1) of title 47"
+# — a title-qualified citation that resolves to usc:<title>/<section><subpath>.
+_RE_SECTION_OF_TITLE = re.compile(
+    r"(?:§+|\bSec(?:tion)?s?\.?)\s*(\d+[A-Za-z]?(?:[.\-]\d+)*)((?:\([0-9a-zA-Z]+\))*)"
+    r"\s+of\s+title\s+(\d+)", re.I)
 
 
 def _sample_lines(text: str, cap: int = 6000) -> list[str]:
@@ -558,10 +574,14 @@ def parse_citations(text: str, profile: dict, *, book: str | None = None,
         title = (profile.get("work") or {}).get("title", "")
         for m in _RE_USC.finditer(text):
             out.append(_fix(legal_ref(m.group(1), m.group(3), m.group(4))))   # explicit N U.S.C. § M
-        # local "§ M" / "section M" resolve against the document's own title
-        usc_spans = [m.span() for m in _RE_USC.finditer(text)]
+        # "section M of title N" prose form — the title comes from the phrase, not the doc
+        covered = [m.span() for m in _RE_USC.finditer(text)]
+        for m in _RE_SECTION_OF_TITLE.finditer(text):
+            out.append(_fix(legal_ref(m.group(3), m.group(1), m.group(2))))
+            covered.append(m.span())
+        # remaining local "§ M" / "section M" resolve against the document's own title
         for m in _RE_SECTION.finditer(text):
-            if not any(a <= m.start() < b2 for a, b2 in usc_spans):
+            if not any(a <= m.start() < b2 for a, b2 in covered):
                 out.append(_fix(legal_ref(title, m.group(1), m.group(2))))
     seen, uniq = set(), []
     for r in out:

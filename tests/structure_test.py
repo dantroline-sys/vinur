@@ -201,6 +201,12 @@ Section 3. Information about Donations to the Foundation.
           "usc:17/106" in lrefs and "usc:17/106A" in lrefs and "usc:17/501" in lrefs)
     check("legal: a local '§ 106' and an explicit '17 U.S.C. § 106' would share a key",
           S.legal_ref("17", "106").key == "usc:17/106")
+    # the PROSE cross-reference form: the title comes from the phrase, not the document
+    prose_refs = [r.key for r in S.parse_citations(
+        "as provided in section 230(c)(1) of title 47, and see section 106 of title 17",
+        {"kind": "legal", "work": {"title": "99"}})]
+    check("legal prose 'section M of title N' → usc:N/M (phrase title beats the doc's)",
+          "usc:47/230/c/1" in prose_refs and "usc:17/106" in prose_refs)
 
     # ── the REFERENCE-MAP LOADER: multilingual books + versification aliases ─
     with tempfile.TemporaryDirectory() as td:

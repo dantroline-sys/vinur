@@ -43,6 +43,8 @@ COMMANDS: dict = {
     # under a named bundle (creates the file or merges into it — one bundle per file)
     "collect":    {"doc": "path", "to": "path", "bundle": "str", "license": "str",
                    "allow_unlicensed": "bool", "answers_file": "path"},
+    # deterministic cross-reference graph over structured (scripture/legal) docs (no LM)
+    "citations":  {},
     # janitor: chunks holding text the corpus already has (no LM involved)
     "dedupe":     {"near": "bool", "threshold": "float", "apply": "bool", "bundle": "str"},
     # hub search: candidates sized + judged against this machine's memory
@@ -118,6 +120,10 @@ HELP: dict = {
                         "on/after this date/time REGARDLESS of stamp, to recover "
                         "cards truncated after a chunk was stamped current "
                         "(idempotent — the title gate folds already-carded chunks)"},
+    "citations": {"_": "Build the cross-reference graph over structured scripture/legal "
+                       "documents: one node per canonical unit (verse/section), a "
+                       "'citation' edge per reference its text makes. Deterministic, no "
+                       "LM, idempotent (safe to re-run — new documents just add edges)."},
     "dedupe": {"_": "Janitor (no LM): find chunks holding text the corpus already "
                     "has. A chunk id is sha1(path+section+text), so the same text "
                     "arriving by another route — a research drop re-exported under "

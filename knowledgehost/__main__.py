@@ -1141,6 +1141,27 @@ def _run_build_ann(cfg, log) -> int:
     return 0
 
 
+def _run_citations(cfg, log) -> int:
+    """`citations`: build the deterministic cross-reference graph over structured
+    (scripture/legal) documents — one node per canonical unit (verse/section), a
+    'citation' edge per reference its text makes.  No LM; idempotent (safe to re-run)."""
+    from . import citations as cite_mod
+    store = make_store(cfg)
+    kb = KB(cfg)
+    try:
+        stats = cite_mod.build(store, kb, cfg, log=log)
+        log.info("citations: %s", stats)
+        log.info("kb: %s", kb.counts())
+        if not stats.get("units"):
+            log.info("citations: no structured (scripture/legal) documents found — "
+                     "ingest one first (collect or the confirm gate), then re-run.")
+        ops_mod.emit_result(stats.get("units", 0) > 0, **stats)
+    finally:
+        kb.close()
+        store.close()
+    return 0
+
+
 def _run_reconcile(cfg, log, *, anchors="corpus", limit=None, top_k=None) -> int:
     """Queue merge candidates between your existing nodes and the imported commonsense
     sets, then point the user at `adjudicate` to resolve them with the big LM."""
@@ -1193,7 +1214,7 @@ def main(argv=None):
                              "optimize", "edge-audit", "stats", "reset", "bump-version", "migrate-vocab",
                              "bundles", "split", "source", "scenario", "eval", "facetize",
                              "ingest-library", "rebuild-fts", "import-bundle", "eject-bundle",
-                             "collect", "analyze", "clear-queue"])
+                             "collect", "analyze", "citations", "clear-queue"])
     # positional args for the modular-bundle verbs:
     #   source <doc_id> [--title ..] [--bundle ..]   scenario [name]   split [dir]
     #   import-bundle <file.kdb>     eject-bundle <bundle>
@@ -1409,6 +1430,8 @@ def main(argv=None):
         return _run_collect(cfg, log, args)   # clean-room: opens its own scratch store
     if args.command == "analyze":             # propose a structure profile (no ingest)
         return _run_analyze(cfg, log, args)
+    if args.command == "citations":           # deterministic cross-reference graph (no LM)
+        return _run_citations(cfg, log)
 
     if args.command == "import-bundle":       # absorb a shipped brain into the master
         import json as _json
