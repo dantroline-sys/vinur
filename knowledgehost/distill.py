@@ -1350,6 +1350,14 @@ def distill_chunk(kb, lm, embedder, chunk: dict, extraction=None,
                                    chunk.get("context_features") or {},
                                    nodemap if nodemap is not None else {},
                                    doc_id, claim_regime, claim_scope)
+        # Domain card lenses (Slice 3): a structured scripture/legal unit yields its
+        # domain shapes (theme/parallel ; definition/obligation/exception), grounded in
+        # the verse/section text and located by its canonical citation key.
+        stype = (chunk.get("source_type") or "").strip().lower()
+        if stype in DOMAIN_CARD_TYPES:
+            ncard += _distil_domain(kb, lm, embedder, chunk, DOMAIN_CARD_TYPES[stype],
+                                    nodemap if nodemap is not None else {},
+                                    doc_id, claim_regime, claim_scope)
         # Loop-closer (research §6.2): a card grounded the question this drop answered →
         # close the knowledge_gap the original kb miss opened.
         if ncard and vinkona and chunk.get("kb_query"):
@@ -1918,6 +1926,35 @@ TYPED_CARD_SCHEMAS = {
         "outcome": {"type": "string"},
         "lesson": {"type": "string"},
     }, ["situation", "action", "lesson"]),
+    # ── domain lenses for structured corpora (Slice 3) ───────────────────────
+    # legal: definition / obligation / exception ; scripture: theme / parallel.
+    "definition": _typed_schema({
+        "term": {"type": "string"},
+        "definition": {"type": "string"},
+        "scope": {"type": "string"},
+        "applies_to": {"type": "array", "items": {"type": "string"}},
+    }, ["term", "definition"]),
+    "obligation": _typed_schema({
+        "subject": {"type": "string"},
+        "modality": {"type": "string"},
+        "action": {"type": "string"},
+        "conditions": {"type": "array", "items": {"type": "string"}},
+        "exceptions": {"type": "array", "items": {"type": "string"}},
+    }, ["subject", "action"]),
+    "exception": _typed_schema({
+        "rule": {"type": "string"},
+        "condition": {"type": "string"},
+        "effect": {"type": "string"},
+    }, ["condition", "effect"]),
+    "theme": _typed_schema({
+        "theme": {"type": "string"},
+        "statement": {"type": "string"},
+        "support": {"type": "string"},
+    }, ["theme", "statement"]),
+    "parallel": _typed_schema({
+        "relationship": {"type": "string"},
+        "parallels": {"type": "array", "items": {"type": "string"}},
+    }, ["parallels"]),
 }
 
 _TYPED_LENS = {
@@ -1936,6 +1973,23 @@ _TYPED_LENS = {
     "case": ("A CASE card is a worked example: `situation` (what was going on), "
              "`action` (what was done or said), `outcome` (what happened), and "
              "`lesson` (the reusable takeaway)."),
+    "definition": ("A DEFINITION card captures a term the text defines: `term`, its "
+                   "`definition` (as stated), `scope` (where/when it applies), and "
+                   "`applies_to` (the provisions or context it governs)."),
+    "obligation": ("An OBLIGATION card captures a duty, right, or prohibition the text "
+                   "creates: `subject` (who is bound), `modality` (must / may / shall "
+                   "not), `action` (what is required or permitted), `conditions` (when it "
+                   "applies), and any `exceptions` (carve-outs)."),
+    "exception": ("An EXCEPTION card captures a limitation or carve-out to a rule: `rule` "
+                  "(the general provision it limits), `condition` (when the exception "
+                  "applies), and `effect` (what it permits or forbids instead)."),
+    "theme": ("A THEME card captures a theme or teaching the passage conveys: `theme` "
+              "(the topic), `statement` (what the passage asserts about it), and `support` "
+              "(a short grounding phrase copied from the text)."),
+    "parallel": ("A PARALLEL card captures a cross-passage relationship the text implies "
+                 "beyond an explicit citation: `parallels` (the related passages or "
+                 "references) and `relationship` (quotes / alludes to / fulfils / "
+                 "contrasts with / retells)."),
 }
 
 _TYPED_SYSTEM = (
@@ -1992,6 +2046,27 @@ def _clean_typed_payload(card_type: str, obj: dict):
         pay = {"situation": s(obj.get("situation"), 300), "action": s(obj.get("action"), 300),
                "outcome": s(obj.get("outcome"), 300), "lesson": s(obj.get("lesson"), 300)}
         ok = bool(title and pay["situation"] and pay["lesson"])
+    elif card_type == "definition":
+        pay = {"term": s(obj.get("term"), 160), "definition": s(obj.get("definition"), 300),
+               "scope": s(obj.get("scope"), 200), "applies_to": sl(obj.get("applies_to"), 6)}
+        ok = bool(title and pay["term"] and pay["definition"])
+    elif card_type == "obligation":
+        pay = {"subject": s(obj.get("subject"), 160), "modality": s(obj.get("modality"), 40),
+               "action": s(obj.get("action"), 300), "conditions": sl(obj.get("conditions"), 6),
+               "exceptions": sl(obj.get("exceptions"), 6)}
+        ok = bool(title and pay["subject"] and pay["action"])
+    elif card_type == "exception":
+        pay = {"rule": s(obj.get("rule"), 200), "condition": s(obj.get("condition"), 300),
+               "effect": s(obj.get("effect"), 300)}
+        ok = bool(title and pay["condition"] and pay["effect"])
+    elif card_type == "theme":
+        pay = {"theme": s(obj.get("theme"), 160), "statement": s(obj.get("statement"), 300),
+               "support": s(obj.get("support"), 200)}
+        ok = bool(title and pay["theme"] and pay["statement"])
+    elif card_type == "parallel":
+        pay = {"relationship": s(obj.get("relationship"), 120),
+               "parallels": sl(obj.get("parallels"), 12, 120)}
+        ok = bool(title and pay["parallels"])
     pay = {k: v for k, v in pay.items() if v}
     return (title if ok else ""), pay, disc, concept, evidence
 
@@ -2038,6 +2113,63 @@ def _distil_typed(kb, lm, embedder, chunk, card_type: str, hint_feats, nodemap: 
     qv = _embed_all(embedder, [q])[0]
     kb.add_surface_question("card", cid, q, qv)
     return 1
+
+
+# ── domain card lenses for structured corpora (Slice 3) ─────────────────────────
+# A structured unit (a verse / a section) supports domain-specific card shapes: legal
+# text yields definitions, obligations and exceptions; scripture yields themes and
+# parallels.  These run over a scripture/legal chunk (source_type), each grounded ONLY
+# in the unit text (empty title = the unit doesn't support that shape), and land on the
+# canonical unit via `locator` (its citation key) so a card cites the passage precisely.
+DOMAIN_CARD_TYPES = {
+    "scripture": ("theme", "parallel"),
+    "legal": ("definition", "obligation", "exception"),
+}
+
+_TYPED_QUESTION = {
+    "definition": lambda t, c, p: f"What does '{p.get('term') or c}' mean here?",
+    "obligation": lambda t, c, p: (f"What {(p.get('modality') or 'must').lower()} "
+                                   f"{p.get('subject') or 'one'} do regarding {c}?"),
+    "exception": lambda t, c, p: f"When does the exception to {p.get('rule') or c} apply?",
+    "theme": lambda t, c, p: f"What does this passage teach about {p.get('theme') or c}?",
+    "parallel": lambda t, c, p: f"What passages parallel {c}?",
+}
+
+
+def _distil_domain(kb, lm, embedder, chunk, card_types, nodemap, doc_id,
+                   claim_regime, claim_scope) -> int:
+    """Extract the domain cards a structured unit supports (theme/parallel for scripture;
+    definition/obligation/exception for legal).  Returns the number of cards stored; a
+    type the text doesn't support yields nothing.  BackendUnavailable propagates."""
+    locator = (chunk.get("section") or "").strip()       # the canonical key (bible:… / usc:…)
+    made = 0
+    for card_type in card_types:
+        try:
+            obj = lm.extract_typed(chunk, card_type)      # may raise BackendUnavailable
+        except BackendUnavailable:
+            raise
+        except Exception:
+            continue
+        title, pay, disc, concept, evidence = _clean_typed_payload(card_type, obj)
+        if not title:
+            continue
+        lab = (concept or title).strip()
+        node_id = nodemap.get(lab.lower())
+        if not node_id:
+            vec = _embed_all(embedder, [lab])[0]
+            node_id, _ = kb.link_to_node(lab, "concept", vec)
+            nodemap[lab.lower()] = node_id
+        creg = claim_regime({})
+        cv = _embed_all(embedder, [_typed_card_text(card_type, title, lab, pay, disc)])[0]
+        cid, _ = kb.add_card(node_id, title=title, card_type=card_type, criteria=pay,
+                             discriminators=disc, regime=creg, scope=claim_scope(creg),
+                             doc_id=doc_id, evidence=evidence or locator,
+                             locator=locator, embedding=cv)
+        qfn = _TYPED_QUESTION.get(card_type)
+        q = sanitize.clean(qfn(title, lab, pay) if qfn else f"What about {lab}?", 200)
+        kb.add_surface_question("card", cid, q, _embed_all(embedder, [q])[0])
+        made += 1
+    return made
 
 
 def healthy_endpoints(cfg, urls=None, overrides=None, log=None) -> list:
