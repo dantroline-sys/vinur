@@ -152,9 +152,29 @@ INDEX_HTML = """<!doctype html>
   .fmt-no { color: #d9534f; font-weight: 600; }
   #fmtbox { margin: 10px 0 14px; }
   #fmtbox .fmt-h { font-size: 12px; text-transform: uppercase; opacity: .55; margin-bottom: 4px; }
+  /* ── file browser overlay (pick a document / a target .kdb location) ── */
+  #fbwrap { position: fixed; inset: 0; background: #0007; z-index: 50; display: none; }
+  #fbwrap.on { display: flex; align-items: center; justify-content: center; }
+  #fbpanel { background: Canvas; color: CanvasText; width: min(780px, 94vw);
+             max-height: 84vh; border: 1px solid #8886; border-radius: 10px;
+             display: flex; flex-direction: column; box-shadow: 0 10px 44px #0008; }
+  #fbhead { padding: 10px 14px 8px; border-bottom: 1px solid #8883; }
+  #fbhead h4 { margin: 0 0 6px; font-size: 14px; }
+  #fbroots { display: flex; gap: 6px; flex-wrap: wrap; margin-bottom: 6px; }
+  .fbroot { font-size: 12px; padding: 2px 9px; cursor: pointer; }
+  #fbpath { font-size: 12px; opacity: .7; word-break: break-all; }
+  #fblist { overflow: auto; padding: 4px 6px; min-height: 180px; }
+  .fbrow { display: flex; gap: 8px; align-items: center; padding: 5px 8px;
+           border-radius: 6px; cursor: pointer; font-size: 13px; }
+  .fbrow:hover { background: #8881; }
+  .fbrow .fbsz { margin-left: auto; opacity: .5; font-size: 11px; font-variant-numeric: tabular-nums; }
+  .fbrow.dim { opacity: .42; }
+  .fbfoot { padding: 10px 14px; border-top: 1px solid #8883; display: flex;
+            gap: 8px; align-items: center; flex-wrap: wrap; }
 </style>
 </head>
 <body>
+<div id="fbwrap" onclick="if(event.target===this)fbClose()"><div id="fbpanel"></div></div>
 <header>
   <div class="hwrap">
     <h1>Knowledge Host — viewer</h1>
@@ -1816,6 +1836,25 @@ async function loadBundles() {
     + ` <button class="toolbtn" onclick="importBrain()">import brain…</button></div></div>`
     + `<div><h4 style="margin:4px 0">Scenarios</h4><table><tr><th>name</th><th>rule</th></tr>${scenRows}</table></div>`
     + `</div>`
+    + `<div style="margin-top:16px;border-top:1px solid #8883;padding-top:12px">`
+    + `<h4 style="margin:4px 0">Build a shareable collection</h4>`
+    + `<div style="opacity:.6;font-size:.85em;max-width:660px;margin-bottom:6px">Clean-room `
+    + `ingest + distil ONE document and add it to a shareable <code>.kdb</code> file under a `
+    + `named bundle — your master KB is never touched. Point it at a NEW file to create it, or `
+    + `an EXISTING one to add to it (one bundle per file). Build a share-file up one document at `
+    + `a time; recipients load it with “import brain”. Runs in the background (needs a distil LM up).</div>`
+    + `<div style="display:flex;gap:8px;flex-wrap:wrap;align-items:center">`
+    + `<span style="display:inline-flex;gap:4px"><input id="colldoc" placeholder="document to add (Browse…)" style="width:250px">`
+    + `<button class="toolbtn" onclick="fbPickInto('colldoc','file')" title="find the document on the host">Browse…</button></span>`
+    + `<input id="collbundle" placeholder="bundle name" list="blist" style="width:120px">`
+    + `<span style="display:inline-flex;gap:4px"><input id="collto" placeholder="target .kdb (Browse…)" style="width:220px">`
+    + `<button class="toolbtn" onclick="fbPickInto('collto','save')" title="choose where the shareable file goes">Browse…</button></span>`
+    + `<input id="colllicense" placeholder="licence (optional)" list="spdxlist" style="width:140px">`
+    + `<label style="font-size:12px" title="add even if a source has no detected licence">`
+    + `<input type="checkbox" id="collunlic"> allow unlicensed</label>`
+    + `<button class="toolbtn" onclick="previewCollection()">Preview</button>`
+    + `<button class="toolbtn" onclick="buildCollection()">Build collection…</button>`
+    + `</div></div>`
     + `<h4 style="margin:14px 0 4px">Sources — rename, assign a bundle, set the licence &amp; licensor (writes to master)</h4>`
     + `<table><tr><th>doc_id</th><th>title</th><th>bundle</th><th>licence</th><th>licensor (to whom)</th><th></th></tr>${srcRows}</table>`;
 }
@@ -1849,6 +1888,137 @@ async function importBrain() {
     ? '✓ import started — see Operations; when it finishes, the brain appears here (load it to serve it)'
     : '✗ ' + esc(r.error || 'failed')}</div>`;
 }
+// Build-a-collection wizard: clean-room ingest+distil one doc, added to a shareable
+// .kdb under a named bundle (create or merge).  Preview validates the target;
+// Build kicks the background `collect` op (watch it under Operations).
+function collArgs() {
+  const args = { doc: $('#colldoc').value.trim(), to: $('#collto').value.trim(),
+                 bundle: $('#collbundle').value.trim() };
+  const lic = $('#colllicense').value.trim();
+  if (lic) args.license = lic;
+  if ($('#collunlic').checked) args.allow_unlicensed = true;
+  return args;
+}
+async function previewCollection() {
+  const a = collArgs();
+  if (!a.doc || !a.to || !a.bundle) {
+    $('#banner').innerHTML = '<div class="note">✗ fill in the document, bundle name, and target file</div>';
+    return;
+  }
+  let r;
+  try {
+    r = await (await authFetch('/collection/preview?to=' + encodeURIComponent(a.to)
+      + '&bundle=' + encodeURIComponent(a.bundle))).json();
+  } catch (e) { r = { ok: false, error: netErr(e) }; }
+  if (!r.ok) { $('#banner').innerHTML = `<div class="note">✗ ${esc(r.error || 'preview failed — auth token?')}</div>`; return; }
+  if (!r.compatible) { $('#banner').innerHTML = `<div class="note">✗ ${esc(r.error || 'target holds a different bundle')}</div>`; return; }
+  const cur = Object.entries(r.counts || {}).map(([k, v]) => `${k} ${fmtCompact(v)}`).join(', ');
+  const where = r.exists
+    ? `will ADD to existing ${esc(a.to)} — currently bundle '${esc(r.file_bundle || a.bundle)}'${cur ? ' (' + esc(cur) + ')' : ''}`
+    : `will CREATE ${esc(a.to)} as a new bundle '${esc(a.bundle)}'`;
+  $('#banner').innerHTML = `<div class="note">✓ ${where}. Distil runs in the background when you Build.</div>`;
+}
+async function buildCollection() {
+  const a = collArgs();
+  if (!a.doc || !a.to || !a.bundle) {
+    $('#banner').innerHTML = '<div class="note">✗ fill in the document, bundle name, and target file</div>';
+    return;
+  }
+  $('#banner').innerHTML = '<div class="note">building — clean-room ingest + distil; watch Operations for progress…</div>';
+  const r = await postJSON('/ops/run', { command: 'collect', args: a })
+    .catch(e => ({ ok: false, error: netErr(e) }));
+  $('#banner').innerHTML = `<div class="note">${r.ok
+    ? '✓ collect started — see Operations; when it finishes, ' + esc(a.to) + ' holds bundle ' + esc(a.bundle)
+    : '✗ ' + esc(r.error || 'failed — auth token?')}</div>`;
+}
+
+// ── file browser overlay: navigate the host's folders to pick a document
+// ('file' mode) or agree a target .kdb location ('save' mode).  Every clickable
+// item is INDEX-keyed (fbRoot/fbClick), so an untrusted path/filename is never
+// interpolated into an onclick attribute.
+let FB = { mode: 'file', target: '', path: '', parent: null, roots: [], entries: [],
+           exts: [], truncated: false, filename: '' };
+function fmtBytes(n) {
+  if (n == null) return '';
+  if (n >= 1e9) return (n / 1e9).toFixed(1) + ' GB';
+  if (n >= 1e6) return (n / 1e6).toFixed(1) + ' MB';
+  if (n >= 1e3) return Math.round(n / 1e3) + ' KB';
+  return n + ' B';
+}
+function fbPickInto(inputId, mode) {
+  FB.mode = mode; FB.target = inputId;
+  FB.filename = mode === 'save' ? 'collection.kdb' : '';
+  $('#fbwrap').classList.add('on');
+  $('#fbpanel').innerHTML = '<div class="fbfoot">loading…</div>';
+  fbLoad(($('#' + inputId).value || '').trim());     // server resolves '' → home
+}
+async function fbLoad(path) {
+  let r;
+  try { r = await (await authFetch('/fs/list?path=' + encodeURIComponent(path))).json(); }
+  catch (e) { r = { ok: false, error: netErr(e) }; }
+  if (!r.ok) {
+    $('#fbpanel').innerHTML = `<div class="fbfoot">✗ ${esc(r.error || 'cannot list')}`
+      + ` <button class="toolbtn" onclick="fbClose()" style="margin-left:auto">Close</button></div>`;
+    return;
+  }
+  FB.path = r.path; FB.parent = r.parent; FB.roots = r.roots || [];
+  FB.entries = r.entries || []; FB.exts = r.exts || []; FB.truncated = !!r.truncated;
+  fbRender();
+}
+function fbPickable(e) {
+  if (e.dir) return true;
+  const exts = FB.mode === 'save' ? ['.kdb'] : (FB.exts.length ? FB.exts : null);
+  if (!exts) return true;
+  const n = e.name.toLowerCase();
+  return exts.some(x => n.endsWith(x));
+}
+function fbRender() {
+  const title = FB.mode === 'save'
+    ? 'Choose where to save the collection (.kdb)'
+    : 'Choose the document to add';
+  const roots = FB.roots.map((rt, i) =>
+    `<button class="toolbtn fbroot" title="${esc(rt.path)}" onclick="fbRoot(${i})">${esc(rt.label)}</button>`).join('');
+  const up = FB.parent
+    ? `<div class="fbrow" onclick="fbUp()">⬆ <b>..</b></div>` : '';
+  const rows = FB.entries.map((e, i) => {
+    const sz = (!e.dir && e.size != null) ? `<span class="fbsz">${esc(fmtBytes(e.size))}</span>` : '';
+    return `<div class="fbrow${fbPickable(e) ? '' : ' dim'}" onclick="fbClick(${i})">`
+      + `${e.dir ? '📁' : '📄'} <span>${esc(e.name)}</span>${sz}</div>`;
+  }).join('') || '<div style="opacity:.5;padding:12px">（empty）</div>';
+  const foot = FB.mode === 'save'
+    ? `<span style="opacity:.7;font-size:12px">save as</span>`
+      + `<input id="fbfn" value="${esc(FB.filename)}" placeholder="collection.kdb" style="width:220px">`
+      + `<button class="toolbtn" onclick="fbSave()">Save here</button>`
+      + `<button class="toolbtn" onclick="fbClose()" style="margin-left:auto">Cancel</button>`
+    : `<span style="opacity:.6;font-size:12px">click a file to choose it — dimmed files aren't a configured ingest type</span>`
+      + `<button class="toolbtn" onclick="fbClose()" style="margin-left:auto">Cancel</button>`;
+  $('#fbpanel').innerHTML =
+    `<div id="fbhead"><h4>${esc(title)}</h4><div id="fbroots">${roots}</div>`
+    + `<div id="fbpath">${esc(FB.path)}${FB.truncated ? ' — first 2000 shown' : ''}</div></div>`
+    + `<div id="fblist">${up}${rows}</div>`
+    + `<div class="fbfoot">${foot}</div>`;
+}
+function fbJoin(dir, name) { return dir.replace(/[/]+$/, '') + '/' + name; }
+function fbRoot(i) { const rt = FB.roots[i]; if (rt) fbLoad(rt.path); }
+function fbUp() { if (FB.parent) fbLoad(FB.parent); }
+function fbClick(i) {
+  const e = FB.entries[i]; if (!e) return;
+  if (e.dir) return fbLoad(fbJoin(FB.path, e.name));
+  if (FB.mode === 'save') {                       // add-to: adopt the clicked file's name
+    FB.filename = e.name; const fn = $('#fbfn'); if (fn) fn.value = e.name; return;
+  }
+  $('#' + FB.target).value = fbJoin(FB.path, e.name);   // file mode: choose it
+  fbClose();
+}
+function fbSave() {
+  let fn = (($('#fbfn') && $('#fbfn').value) || '').trim();
+  if (!fn) { $('#fbfn').focus(); return; }
+  if (!fn.toLowerCase().endsWith('.kdb')) fn += '.kdb';
+  $('#' + FB.target).value = fbJoin(FB.path, fn);
+  fbClose();
+}
+function fbClose() { $('#fbwrap').classList.remove('on'); }
+
 async function ejectBundle(name) {
   if (!confirm(`Eject '${name}' from the master?\n\nIts closure is exported to ${name}.kdb first, `
     + `so re-importing that file undoes this. Shared rows survive with the ejected provenance `

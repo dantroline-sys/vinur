@@ -391,6 +391,48 @@ def _run_pack(cfg, log, args) -> int:
     return 0
 
 
+def _run_collect(cfg, log, args) -> int:
+    """`collect <doc> --to <file.kdb> --bundle <name>`: clean-room ingest+distil of one
+    document, ADDED to a shareable .kdb collection (created or merged into).  The master
+    kb is never touched.  --dry-run validates + previews without running anything."""
+    from . import pack as pack_mod
+    from .distill import BackendUnavailable as _BU
+    doc = (args.args[0] if args.args else None) or args.doc
+    target, bundle = args.to, args.bundle
+    if not (doc and target and bundle):
+        log.error("collect needs: collect <doc> --to <file.kdb> --bundle <name> "
+                  "[--license SPDX] [--allow-unlicensed] [--dry-run]")
+        return 1
+    try:
+        res = pack_mod.add_to_collection(
+            cfg, doc, target, bundle, license_override=args.license or "",
+            allow_unlicensed=args.allow_unlicensed, force=args.force,
+            dry_run=args.dry_run, log_fn=log.info)
+    except ValueError as e:
+        log.error("%s", e)
+        ops_mod.emit_result(False, error=str(e))
+        return 1
+    except _BU as e:
+        log.error("aborted (no distil endpoint up — start one and re-run): %s", e)
+        ops_mod.emit_result(False, error=str(e))
+        return 1
+    if res.get("dry_run"):
+        verb = "create" if res["created"] else "add to"
+        log.info("collect (dry-run): would %s %s under bundle '%s'%s — nothing written.",
+                 verb, res["target"], res["bundle"],
+                 (f" (file currently holds {res['current']})" if res.get("current") else ""))
+        return 0
+    added = res.get("added") or {}
+    log.info("collect: %s %s [%s] — added %s; file now holds %s",
+             "created" if res["created"] else "updated", res["target"], res["bundle"],
+             added, res.get("totals"))
+    if not res.get("shareable", True):
+        log.warning("collection has unlicensed sources — set a --license before sharing")
+    ops_mod.emit_result(True, target=res["target"], bundle=res["bundle"],
+                        created=res["created"], **{f"added_{k}": v for k, v in added.items()})
+    return 0
+
+
 def _run_recard(cfg, store, embedder, log, *, limit=None, bundle=None,
                 all_families=False, before=None, since=None) -> int:
     """Cards-only sweep over already-distilled chunks: harvest the card families
@@ -1055,7 +1097,7 @@ def main(argv=None):
                              "optimize", "edge-audit", "stats", "reset", "bump-version", "migrate-vocab",
                              "bundles", "split", "source", "scenario", "eval", "facetize",
                              "ingest-library", "rebuild-fts", "import-bundle", "eject-bundle",
-                             "clear-queue"])
+                             "collect", "clear-queue"])
     # positional args for the modular-bundle verbs:
     #   source <doc_id> [--title ..] [--bundle ..]   scenario [name]   split [dir]
     #   import-bundle <file.kdb>     eject-bundle <bundle>
@@ -1144,6 +1186,10 @@ def main(argv=None):
     ap.add_argument("--pack-version", default="1.0.0", dest="pack_version",
                     help="pack: semver for the artifact name + manifest (default 1.0.0)")
     ap.add_argument("--describe", help="pack: one-line description for the manifest")
+    ap.add_argument("--doc", help="collect: the document (or folder) to ingest + distil "
+                                  "(or pass it positionally)")
+    ap.add_argument("--to", dest="to",
+                    help="collect: the .kdb collection file to create or add to")
     ap.add_argument("--allow-unlicensed", action="store_true", dest="allow_unlicensed",
                     help="pack: build despite unlicensed sources — stamped "
                          "shareable:false (private use only; import warns)")
@@ -1253,8 +1299,9 @@ def main(argv=None):
     if args.command in ("bundles", "split", "source", "scenario"):   # modular §16, KB-only
         return _run_bundles(cfg, args, log)
     if args.command == "pack":                # clean-room pack producer (PACK-01 §3)
-        store.close()
-        return _run_pack(cfg, log, args)
+        return _run_pack(cfg, log, args)      # clean-room: opens its own scratch store
+    if args.command == "collect":             # add one doc to a shareable .kdb collection
+        return _run_collect(cfg, log, args)   # clean-room: opens its own scratch store
 
     if args.command == "import-bundle":       # absorb a shipped brain into the master
         import json as _json

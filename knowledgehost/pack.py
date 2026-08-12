@@ -448,6 +448,159 @@ def build_pack(cfg: dict, path: str, *, name: str | None = None, title: str = ""
             "manifest": man, "stats": stats}
 
 
+def _plain_target(target: Path) -> None:
+    """A collection file is a plain, mergeable .kdb — reject compress/encrypt
+    wrappers (those are for `pack`, the one-shot publish artifact)."""
+    if target.suffix in (".gz", ".enc") or target.name.endswith((".gz", ".enc")):
+        raise ValueError("a collection target must be a plain .kdb (it grows by "
+                         "merge) — compress/encrypt when you publish it with `pack`")
+
+
+def collection_preview(cfg: dict, target: str, bundle: str) -> dict:
+    """Cheap, side-effect-free look at a collection target for the wizard: does it
+    exist, what bundle does it already hold, and is that compatible with `bundle`
+    (one bundle per file)?  Never runs the pipeline."""
+    tgt = Path(target).expanduser()
+    bundle_slug = bundles._slug(bundle)
+    out = {"ok": True, "target": str(tgt), "bundle": bundle, "exists": tgt.exists(),
+           "compatible": True, "counts": {}, "file_bundle": ""}
+    if not bundle_slug:
+        return {"ok": False, "error": "a bundle name is required"}
+    try:
+        _plain_target(tgt)
+    except ValueError as e:
+        return {"ok": False, "error": str(e)}
+    if not tgt.exists():
+        return out
+    try:
+        info = bundles.inspect_bundle_file(str(tgt))
+    except ValueError as e:
+        return {"ok": False, "error": f"{tgt.name} exists but is not a readable "
+                f"knowledge bundle: {e}"}
+    held = sorted({bundles._slug(s.get("bundle") or "") for s in info.get("sources", [])
+                   if s.get("bundle")})
+    file_bundle = (info.get("manifest") or {}).get("name") or (held[0] if held else "")
+    out["counts"] = info.get("counts") or {}
+    out["file_bundle"] = file_bundle
+    # one bundle per file: any held group other than this one blocks the add
+    others = [h for h in held if h and h != bundle_slug]
+    if others:
+        out["compatible"] = False
+        out["error"] = (f"{tgt.name} already holds bundle "
+                        f"'{others[0]}' — one bundle per file; choose a different "
+                        "file, or match that bundle name")
+    return out
+
+
+def add_to_collection(cfg: dict, doc: str, target: str, bundle: str, *,
+                      license_override: str = "", allow_unlicensed: bool = False,
+                      force: bool = False, dry_run: bool = False, log_fn=None) -> dict:
+    """Clean-room ingest+distill of ONE document (or folder), then ADD its distilled
+    closure to a shareable ``.kdb`` collection under ``bundle`` — creating the file
+    or merging into it if it already exists (content-hash ids ⇒ idempotent, so
+    re-adding the same doc is a no-op).  One bundle per file: a target that already
+    holds a different bundle is refused.  The master kb is NEVER touched (a scratch
+    build, like `pack`).  ``dry_run`` validates + previews without running anything.
+
+    Returns {ok, target, bundle, created, added, totals, shareable, stats}."""
+    say = log_fn or log.info
+    src = Path(doc).expanduser()
+    if not src.exists():
+        raise ValueError(f"no such file or folder: {doc}")
+    bundle_slug = bundles._slug(bundle)
+    if not bundle_slug:
+        raise ValueError("a bundle name is required (it groups the shared knowledge)")
+    tgt = Path(target).expanduser()
+    _plain_target(tgt)
+
+    prev = collection_preview(cfg, str(tgt), bundle)
+    if not prev.get("ok") or not prev.get("compatible"):
+        raise ValueError(prev.get("error", "target is not compatible"))
+    if dry_run:
+        return {"ok": True, "dry_run": True, "target": str(tgt), "bundle": bundle,
+                "created": not tgt.exists(), "current": prev.get("counts") or {},
+                "file_bundle": prev.get("file_bundle") or ""}
+
+    build = Path(cfg.get("pack_build_dir") or "var/packs/build") / f"collect-{bundle_slug}"
+    build.mkdir(parents=True, exist_ok=True)
+    scfg = scratch_cfg(cfg, build, src)
+    say(f"collection build: clean-room at {build} (master untouched)")
+    stats = _pipeline(scfg, src, say)
+
+    # license gate over the scratch registry (same rules as `pack`), then stamp the
+    # whole scratch into the one bundle so `split` emits exactly it.
+    con = bundles._connect(scfg["kb_path"])
+    try:
+        rows = [dict(r) for r in con.execute(
+            "SELECT doc_id,title,license,license_holder,license_url FROM source_registry")]
+        if not rows:
+            raise ValueError("nothing was ingested — no sources in the scratch kb "
+                             f"(is {src} a supported format?)")
+        g = gate(rows, override=license_override, allow_unlicensed=allow_unlicensed)
+        if not g["ok"]:
+            raise ValueError("license gate refused the collection:\n" + gate_table(g))
+        if g["filled"]:
+            ph = ",".join("?" for _ in g["filled"])
+            con.execute(f"UPDATE source_registry SET license=? WHERE doc_id IN ({ph}) "
+                        "AND (license IS NULL OR license='')",
+                        (license_override, *g["filled"]))
+            say(f"license --{license_override} attested onto {len(g['filled'])} source(s)")
+        if not g["shareable"]:
+            say("collection carries unlicensed sources — mark a --license before you share")
+        con.execute("UPDATE source_registry SET bundle=?", (bundle,))
+        con.commit()
+    finally:
+        con.close()
+
+    exported = bundles.split(scfg, out_dir=str(build), force=True, only={bundle})
+    entry = exported.get(bundle) or {}
+    kdb = entry.get("file")
+    if not kdb or "counts" not in entry:
+        raise ValueError("clean-room export produced nothing to add "
+                         "(the document distilled to no shareable knowledge)")
+    kdb = Path(kdb)
+
+    tgt.parent.mkdir(parents=True, exist_ok=True)
+    tmp = tgt.with_suffix(tgt.suffix + ".tmp")
+    if tmp.exists():
+        tmp.unlink()
+    created = not tgt.exists()
+    if created:
+        shutil.copyfile(kdb, tmp)                       # fresh file = the export itself
+        dst = bundles._connect(str(tmp))
+        try:
+            totals = {t: dst.execute(f"SELECT COUNT(*) FROM {t}").fetchone()[0]
+                      for t in bundles.KNOWLEDGE_TABLES if bundles._has_table(dst, t)}
+            bundles.write_manifest(dst, bundle, totals, cfg)   # re-stamp name=bundle
+            dst.commit()
+        finally:
+            dst.close()
+        added = dict(totals)
+    else:
+        shutil.copyfile(tgt, tmp)                       # merge into a copy, then swap
+        dst = bundles._connect(str(tmp))
+        srcc = bundles._connect(str(kdb))
+        try:
+            tabs = [t for t in bundles.KNOWLEDGE_TABLES if bundles._has_table(dst, t)]
+            before = {t: dst.execute(f"SELECT COUNT(*) FROM {t}").fetchone()[0] for t in tabs}
+            bundles.merge_db(srcc, dst, intersect=True)   # INSERT OR IGNORE (content-hash)
+            totals = {t: dst.execute(f"SELECT COUNT(*) FROM {t}").fetchone()[0] for t in tabs}
+            # honest "added" = rows that were actually NEW (re-adding a doc → {} )
+            added = {t: totals[t] - before[t] for t in tabs if totals[t] - before[t] > 0}
+            bundles.write_manifest(dst, bundle, totals, cfg)
+            dst.commit()
+        finally:
+            srcc.close()
+            dst.close()
+    os.replace(tmp, tgt)
+    shutil.rmtree(build, ignore_errors=True)
+
+    say(f"collection {'created' if created else 'updated'}: {tgt} "
+        f"[{bundle}] added={added} totals={totals}")
+    return {"ok": True, "target": str(tgt), "bundle": bundle, "created": created,
+            "added": added, "totals": totals, "shareable": g["shareable"], "stats": stats}
+
+
 def _seal_bytes(src: Path, dst: Path, key: str) -> None:
     """Encrypt an arbitrary file's bytes into a one-table SQLCipher container
     (used for compressed artifacts, whose bytes aren't a database)."""

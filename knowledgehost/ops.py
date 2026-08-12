@@ -39,6 +39,10 @@ COMMANDS: dict = {
                    "pack_version": "str", "describe": "str", "license": "str",
                    "allow_unlicensed": "bool", "compress": "bool",
                    "keep_build": "bool", "force": "bool"},
+    # clean-room ingest+distill of ONE document, ADDED to a shareable .kdb collection
+    # under a named bundle (creates the file or merges into it — one bundle per file)
+    "collect":    {"doc": "path", "to": "path", "bundle": "str", "license": "str",
+                   "allow_unlicensed": "bool"},
     # janitor: chunks holding text the corpus already has (no LM involved)
     "dedupe":     {"near": "bool", "threshold": "float", "apply": "bool", "bundle": "str"},
     # hub search: candidates sized + judged against this machine's memory
@@ -216,6 +220,17 @@ HELP: dict = {
              "compress": "gzip the artifact (import auto-detects)",
              "keep_build": "keep the scratch workspace after success",
              "force": "replace an existing same-version artifact"},
+    "collect": {"_": "ADD one document to a shareable .kdb collection under a named "
+                     "bundle: clean-room ingest+distil in a scratch (the master is "
+                     "never touched), then create the target file or MERGE into it if "
+                     "it already exists (content-hash ids ⇒ idempotent; re-adding the "
+                     "same doc is a no-op).  One bundle per file.  Build a share-file "
+                     "up one document at a time; import it elsewhere with import-bundle.",
+                "doc": "the document (or folder) to ingest + distil",
+                "to": "the .kdb collection file to create or add to (plain .kdb)",
+                "bundle": "the bundle name to file the knowledge under (one per file)",
+                "license": "SPDX id attested onto sources with no detected license",
+                "allow_unlicensed": "add anyway even if some sources have no license"},
     "import-bundle": {"_": "Absorb a shipped .kdb brain into the master",
                       "path": "the .kdb file on this box",
                       "name": "bundle name to import under (default: its manifest name)",

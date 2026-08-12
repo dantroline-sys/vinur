@@ -59,6 +59,8 @@ run "broker battery"    ""     "$PY" tests/amiga_net_test.py
 run "model finder"      ""     "$PY" tests/modelfind_test.py
 run "posture scan"      ""     "$PY" tests/posture_test.py
 run "pack battery"      ""     "$PY" tests/pack_test.py
+run "collect battery"   ""     "$PY" tests/collect_test.py
+run "fs-browse battery" ""     "$PY" tests/fs_browse_test.py
 run "ship battery"      ""     "$PY" tests/ship_test.py
 run "minimal battery"   ""     "$PY" tests/minimal_test.py
 run "G-8 broker size"   ""     "$PY" - <<'EOF'

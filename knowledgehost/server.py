@@ -116,6 +116,71 @@ def _help_payload(cfg: dict, kb=None) -> dict:
             "datasets": _external_datasets(cfg, kb)}
 
 
+def _fs_roots(cfg: dict) -> list:
+    """Curated jump-off points for the file browser: home + the box's configured
+    roots (sources, library, quarantine, drops, pack/bundle output).  Shortcuts
+    only — the browser can still navigate up to '/'."""
+    roots, seen = [], set()
+
+    def add(label, p):
+        if not p:
+            return
+        rp = os.path.realpath(os.path.expanduser(str(p)))
+        if rp not in seen and os.path.isdir(rp):
+            seen.add(rp)
+            roots.append({"label": label, "path": rp})
+
+    add("Home", os.path.expanduser("~"))
+    for s in (cfg.get("sources") or []):
+        add("source", s)
+    for s in (cfg.get("library_sources") or []):
+        add("library", s)
+    add("library root", cfg.get("library_root"))
+    add("quarantine", cfg.get("quarantine_dir"))
+    add("drops", cfg.get("research_solved_dir"))
+    add("packs", cfg.get("pack_dir") or "packs")
+    add("bundles", cfg.get("bundle_dir"))
+    return roots
+
+
+def _fs_list(cfg: dict, raw: str) -> dict:
+    """List one directory for the browser: dirs first, dotfiles hidden, capped.
+    An empty/at-a-file path resolves to the nearest readable directory."""
+    roots = _fs_roots(cfg)
+    base = (os.path.realpath(os.path.expanduser(raw)) if raw.strip()
+            else (roots[0]["path"] if roots else os.path.expanduser("~")))
+    while base and not os.path.isdir(base) and base != "/":
+        base = os.path.dirname(base)                       # a file / gone → nearest dir
+    entries, cap, truncated = [], 2000, False
+    try:
+        with os.scandir(base) as it:
+            for e in it:
+                if e.name.startswith("."):
+                    continue
+                try:
+                    isdir = e.is_dir()
+                except OSError:
+                    isdir = False
+                size = None
+                if not isdir:
+                    try:
+                        size = e.stat().st_size
+                    except OSError:
+                        size = None
+                entries.append({"name": e.name, "dir": isdir, "size": size})
+                if len(entries) >= cap:
+                    truncated = True
+                    break
+    except OSError as ex:
+        return {"ok": False, "error": f"cannot read {base}: {ex}"}
+    entries.sort(key=lambda r: (not r["dir"], r["name"].lower()))
+    parent = os.path.dirname(base)
+    return {"ok": True, "path": base,
+            "parent": (parent if parent and parent != base else None),
+            "roots": roots, "entries": entries, "truncated": truncated,
+            "exts": [str(x).lower() for x in (cfg.get("extensions") or [])]}
+
+
 class Handler(BaseHTTPRequestHandler):
     server_version = f"knowledgehost/{__version__}"
     protocol_version = "HTTP/1.1"
@@ -507,6 +572,23 @@ class Handler(BaseHTTPRequestHandler):
                 "working": self.cfg.get("kb_path"),
                 "modular": B.is_modular(self.cfg),
                 "encrypted_bundles": self.cfg.get("encrypted_bundles") or []})
+        if path == "/collection/preview":          # wizard: is a target file compatible?
+            if not self._authed():
+                return self._send_json({"ok": False, "error": "unauthorized"}, 401)
+            from . import pack as pack_mod
+            tgt = (q.get("to") or [""])[0]
+            bundle = (q.get("bundle") or [""])[0]
+            if not tgt or not bundle:
+                return self._send_json({"ok": False, "error": "to and bundle required"}, 400)
+            try:
+                return self._send_json(pack_mod.collection_preview(self.cfg, tgt, bundle))
+            except Exception as e:
+                return self._send_json({"ok": False, "error": str(e)}, 400)
+        if path == "/fs/list":                     # file browser: list one directory
+            if not self._authed():
+                return self._send_json({"ok": False, "error": "unauthorized"}, 401)
+            res = _fs_list(self.cfg, (q.get("path") or [""])[0])
+            return self._send_json(res, 200 if res.get("ok") else 400)
         if path == "/ops/autopilot":                # Prioritizer tab: the plan + live state
             if not self._authed():
                 return self._send_json({"ok": False, "error": "unauthorized"}, 401)
