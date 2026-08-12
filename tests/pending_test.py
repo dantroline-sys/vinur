@@ -78,6 +78,7 @@ def gate_side():
         _write(src, "notes.txt", PROSE)
         cfg = load_config(None)
         cfg["db_path"] = os.path.join(td, "index.db")
+        cfg["kb_path"] = os.path.join(td, "kb.db")
         cfg["backend"] = "sqlite"
         cfg["sources"] = [src]
         cfg["pending_db"] = os.path.join(td, "pending.db")
@@ -108,6 +109,8 @@ def gate_side():
               secs == ["bible:Gen.1.1", "bible:John.3.16", "bible:John.3.17"])
         check("the ordinary note is untouched on re-crawl (unchanged skip)",
               not r2.get("needs_confirm"))
+        check("the crawl AUTO-builds the cross-reference graph (confirm default on)",
+              r2.get("citations") and r2["citations"]["units"] == 3)
         store.close()
 
 

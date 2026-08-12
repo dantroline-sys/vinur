@@ -270,6 +270,10 @@ DEFAULTS = {
     "structured_confirm_exts": [".txt", ".text", ".md", ".markdown"],
     # Where the deferred-ingest inbox lives (empty => <control_dir>/run/pending.db).
     "pending_db": "",
+    # After a bulk crawl that ingested structured (scripture/legal) documents, build the
+    # deterministic cross-reference graph automatically (knowledgehost.citations).  The
+    # per-document confirm step can still opt out; this is the master switch for the crawl.
+    "auto_citations": True,
     "extensions": [".pdf", ".epub", ".html", ".htm", ".txt", ".md"],
     # Where `clear-queue` MOVES the source files of documents it drops from the
     # distillation queue — with their tree relative to each source root preserved,

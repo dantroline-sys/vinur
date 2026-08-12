@@ -339,6 +339,17 @@ def _pipeline(scfg: dict, src: Path, say, *, label: str = "pack", report=None,
             say(f"{label}: linked {stats['link']} ({time.time() - t0:.1f}s)")
         except Exception as e:                  # linkage is a bonus, not a gate
             say(f"{label}: link skipped: {e}")
+
+        # cross-reference graph for a structured (scripture/legal) doc, if confirmed —
+        # built here so a shared bundle ships WITH its citation/commentary edges.
+        if (profile and profile.get("ingest_as") == "structured"
+                and profile.get("build_citations", True)):
+            try:
+                from . import citations as cite_mod
+                stats["citations"] = cite_mod.build(store, kb, scfg, log=log)
+                say(f"{label}: cross-reference graph — {stats['citations']}")
+            except Exception as e:              # the graph is a bonus, not a gate
+                say(f"{label}: citations skipped: {e}")
     finally:
         kb.close()
         store.close()

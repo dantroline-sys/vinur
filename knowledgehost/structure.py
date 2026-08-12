@@ -381,7 +381,8 @@ def analyze(text: str, *, kind_hint: str | None = None, maps: ReferenceMaps | No
     n = max(1, len(nonblank))
 
     # ── scripture signals ────────────────────────────────────────────────────
-    inline = cv_lines = 0
+    inline = cv_lines = annot_lines = 0
+    seen_verse = False
     found: dict[str, int] = {}
     unknown_books: dict[str, int] = {}
     for ln in nonblank:
@@ -389,17 +390,24 @@ def analyze(text: str, *, kind_hint: str | None = None, maps: ReferenceMaps | No
         if m:
             b = _match(maps, m.group(1))
             if b:
-                inline += 1
+                inline += 1; seen_verse = True
                 found[b[1]] = found.get(b[1], 0) + 1
             else:
                 unknown_books[m.group(1).strip()] = unknown_books.get(m.group(1).strip(), 0) + 1
             continue
         if _RE_LINE_CV.match(ln):
-            cv_lines += 1
+            cv_lines += 1; seen_verse = True
             continue
         hb = _header_book(ln, maps)                      # "Genesis Chapter 1" / "Book of Exodus"
         if hb:
             found.setdefault(hb[1], 0)
+            continue
+        if _looks_like_header(ln):
+            continue
+        # prose that sits AFTER a verse and isn't a header = an interleaved annotation /
+        # commentary block (Douay-Rheims/Challoner notes) — a signal for the layer step.
+        if seen_verse:
+            annot_lines += 1
     # book-header + "C:V lines" layout: bare C:V lines dominate AND some book headers seen
     header_books = [b for b, c in found.items() if c == 0]
     # a 'Book C:V' shape with an UNRECOGNISED book still signals scripture structure
@@ -452,6 +460,11 @@ def analyze(text: str, *, kind_hint: str | None = None, maps: ReferenceMaps | No
                                     + ") — Catholic/Orthodox canon; confirm the versification "
                                     "(e.g. Vulgate Psalm numbering can differ by one for much of the Psalter)")
         prof["work"] = {"scheme": "bible"}
+        # interleaved commentary/notes (Challoner annotations etc.): a run of prose
+        # between the verses.  Flag it so the confirm step can offer to LAYER it onto
+        # the passages it annotates (structure.parse_annotations).
+        prof["has_commentary"] = annot_lines >= 3
+        prof["stats"]["annotation_lines"] = annot_lines
         for ln in nonblank:
             m = _RE_LINE_BOOKCV.match(ln)
             b = _match(maps, m.group(1)) if m else None
@@ -546,6 +559,55 @@ def parse_units(text: str, profile: dict, *, maps: ReferenceMaps | None = None):
                 buf.append(ln)
         if cur is not None:
             yield cur, "\n".join(buf).strip()
+
+
+def parse_annotations(text: str, profile: dict, *, maps: ReferenceMaps | None = None) -> list:
+    """Interleaved commentary/notes anchored to the verse they follow — the layer step
+    for editions (Douay-Rheims / Challoner) that print notes BETWEEN the verses.  Returns
+    [(anchor_Ref, note_text), …]; a note is the prose block sitting after a verse and
+    before the next verse/header, anchored to that verse.  Prose before the first verse
+    of a chapter (a preface / chapter summary) is skipped.  Scripture only."""
+    if profile.get("kind") != "scripture":
+        return []
+    def _fix(r):
+        return maps.apply(r) if maps else r
+    cur_book = (profile.get("book_order") or [None])[0]
+    out: list = []
+    last = None                                          # the verse the current block annotates
+    buf: list = []
+
+    def commit():
+        if last and buf:
+            note = " ".join(x for x in buf if x).strip()
+            if note:
+                out.append((last, note))
+
+    for raw in text.split("\n"):
+        ln = raw.rstrip("\r")
+        if not ln.strip():
+            continue
+        m = _RE_LINE_BOOKCV.match(ln)
+        b = _match(maps, m.group(1)) if m else None
+        if b:
+            commit(); buf = []; cur_book = b[1]
+            last = _fix(scripture_ref(cur_book, m.group(2), m.group(3)))
+            continue
+        m = _RE_LINE_CV.match(ln)
+        if m and cur_book:
+            commit(); buf = []
+            last = _fix(scripture_ref(cur_book, m.group(1), m.group(2)))
+            continue
+        hb = _header_book(ln, maps)
+        if hb:
+            commit(); buf = []; cur_book = hb[1]; last = None   # new chapter — no anchor yet
+            continue
+        if _looks_like_header(ln):
+            commit(); buf = []; cur_book = None; last = None
+            continue
+        if last:                                         # prose after a verse = its note
+            buf.append(ln.strip())
+    commit()
+    return out
 
 
 def parse_citations(text: str, profile: dict, *, book: str | None = None,
@@ -694,6 +756,27 @@ def questions_for(profile: dict) -> list[dict]:
                 "options": [
                     {"value": "code", "label": "The code/statute itself — its sections are the units"},
                     {"value": "commentary", "label": "A commentary that cites the law — attach it to the sections it cites"}]})
+
+    # after-ingest steps the user should SEE and okay (defaults on): build the cross-
+    # reference graph, and (scripture) layer any interleaved commentary onto its verses.
+    qs.append({
+        "id": "graph", "type": "choice", "default": "build",
+        "prompt": "After ingesting, build the cross-reference graph — linking every "
+                  "citation between " + ("passages" if kind == "scripture" else "sections") + "?",
+        "detail": "Deterministic, no AI. You can also run it later from Operations → citations.",
+        "options": [
+            {"value": "build", "label": "Yes — build the cross-reference graph as part of ingest"},
+            {"value": "skip", "label": "No — just ingest the text; I'll build it later"}]})
+    if kind == "scripture" and profile.get("has_commentary"):
+        qs.append({
+            "id": "commentary", "type": "choice", "default": "layer",
+            "prompt": "This edition has commentary/notes between the verses. Layer them onto "
+                      "the passages they annotate (as linked notes in the graph)?",
+            "detail": "Each note becomes a node that 'annotates' its verse; the note's own "
+                      "scripture references become links too.",
+            "options": [
+                {"value": "layer", "label": "Yes — capture the notes and link them to their verses"},
+                {"value": "skip", "label": "No — ingest only the verse text"}]})
     return qs
 
 
@@ -730,6 +813,11 @@ def apply_answers(profile: dict, answers: dict) -> dict:
         p["role"] = "commentary"
     if ans.get("canon") == "diverges":
         p["versification"] = "diverges"          # user will attach a key-alias map file
+
+    # after-ingest steps (default ON so a bare structured confirm still gets the graph)
+    p["build_citations"] = ans.get("graph", "build") != "skip"
+    p["layer_commentary"] = (bool(profile.get("has_commentary"))
+                             and ans.get("commentary", "layer") != "skip")
 
     book_aliases: dict[str, list] = {}
     extra_books: list[str] = []

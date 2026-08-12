@@ -106,9 +106,35 @@ def main():
     check("the earlier citation edge still points at that one node",
           cites("bible:Rom.5.8", "passage", "bible:John.3.16", "passage"))
 
+    # ── commentary layering: notes become nodes that annotate + cite ─────────
+    COMMENTED = ("Genesis Chapter 1\n"
+                 "1:6. And God said: Let there be a firmament made amidst the waters.\n"
+                 "A firmament. By this name is understood the whole space; see Job 26:7.\n"
+                 "It divideth the waters upon the earth from those above.\n"
+                 "1:7. And God made a firmament, and divided the waters.\n"
+                 "1:8. And God called the firmament Heaven.\n"
+                 "And the evening and morning were the second day, note the Fathers.\n")
+    ingest("genesis.txt", COMMENTED, {"kind": "structured"})   # layer_commentary defaults on
+    cite_mod.build(store, kb, cfg)
+    note = kb.db.execute("SELECT id, summary FROM nodes WHERE kind='commentary' "
+                        "AND label LIKE 'note:bible:Gen.1.6:%'").fetchone()
+    check("an interleaved note becomes its own commentary node",
+          note is not None and note["summary"].startswith("A firmament"))
+    g16 = node("bible:Gen.1.6", "passage")
+    check("the note --annotates--> the verse it explains (Gen 1:6)",
+          note and g16 and bool(kb.db.execute(
+              "SELECT 1 FROM edges WHERE src_id=? AND dst_id=? AND family='commentary' "
+              "AND type='annotates' AND status='active'", (note["id"], g16["id"])).fetchone()))
+    job = node("bible:Job.26.7", "passage")
+    check("the note's OWN reference becomes a citation edge (note --cites--> Job 26:7)",
+          note and job and bool(kb.db.execute(
+              "SELECT 1 FROM edges WHERE src_id=? AND dst_id=? AND family='citation' "
+              "AND status='active'", (note["id"], job["id"])).fetchone()))
+
     # ── idempotent ───────────────────────────────────────────────────────────
     again = cite_mod.build(store, kb, cfg)
-    check("re-running adds no new edges (deterministic ids)", again["edges"] == 0)
+    check("re-running adds no new edges/annotations (deterministic ids)",
+          again["edges"] == 0 and again["annotations"] == 0)
 
     kb.close()
     store.close()

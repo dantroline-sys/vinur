@@ -467,48 +467,70 @@ def _ingest_structured_doc(store, embedder, cfg, path, version, chash, st, profi
     items = ((r.key, t, max(1, len(t.split()))) for r, t in units)
     n = _store_records(store, embedder, cfg, source_type=source_type, title=title,
                        path_or_url=path, items=items, version=version)
+
+    # commentary layer (decided at the confirm step): store each interleaved note as a
+    # chunk keyed by the verse it annotates (source_type='commentary'), so the citation
+    # graph can link it — captured HERE, in one parse, not by re-reading the doc later.
+    n_notes = 0
+    if profile.get("layer_commentary") and kind == "scripture":
+        notes = structure.parse_annotations(text, profile, maps=maps)
+        if notes:
+            note_items = ((anchor.key, note, max(1, len(note.split()))) for anchor, note in notes)
+            n_notes = _store_records(store, embedder, cfg, source_type="commentary",
+                                     title=title, path_or_url=path, items=note_items,
+                                     version=version)
+
     store.set_doc_meta(path, {
         "structured": True, "kind": kind, "scheme": profile.get("scheme"),
         "work": profile.get("work"), "book_order": profile.get("book_order"),
         "reference_map": profile.get("reference_map") or {},
         "extra_books": profile.get("extra_books") or [],
+        "build_citations": profile.get("build_citations", True),
+        "layer_commentary": bool(profile.get("layer_commentary")),
     })
     store.manifest.set(path, chash, st.st_mtime, version, "ok")
-    log.info("structured %s ingest: %s (%d unit(s), keyed canonically)",
-             kind, os.path.basename(path), n)
+    log.info("structured %s ingest: %s (%d unit(s)%s, keyed canonically)",
+             kind, os.path.basename(path), n,
+             f", {n_notes} note(s)" if n_notes else "")
     return n
 
 
-def _ingest_or_defer(store, embedder, cfg, path, *, force, confirm_exts, pend) -> int:
+def _ingest_or_defer(store, embedder, cfg, path, *, force, confirm_exts, pend):
     """Bulk-crawl gate for a structured/ambiguous document.  Confirm-eligible files
     (plain text) are ANALYZED first: real scripture/legal structure is set aside into
     the 'Needs your input' inbox (once per profile) instead of being ingested on a
     guess; a standing answer for its profile ingests it unit-by-unit.  Everything else
-    takes the ordinary path.  Never blocks — deferral is immediate."""
+    takes the ordinary path.  Never blocks — deferral is immediate.  Returns
+    (chunks_added, wants_graph) — wants_graph is True when a confirmed STRUCTURED doc
+    asked for the cross-reference graph."""
+    def _structured(confirmed):
+        added = ingest_file(store, embedder, cfg, path, force=True, profile=confirmed)
+        return added, bool(confirmed.get("build_citations", True))
+
     if pend is None or os.path.splitext(path)[1].lower() not in confirm_exts:
-        return ingest_file(store, embedder, cfg, path, force=force)
+        return ingest_file(store, embedder, cfg, path, force=force), False
     from . import structure
     try:
         st = os.stat(path)
     except OSError:
-        return 0
+        return 0, False
     prev = store.manifest.get(path)
     unchanged = bool(prev) and not force and abs(prev["mtime"] - st.st_mtime) < 1e-6
     if unchanged and prev["status"] == "ok":
-        return 0                                   # already ingested, nothing changed
+        return 0, False                            # already ingested, nothing changed
     if unchanged and prev["status"] == "deferred":
         confirmed = pend.answer_for_path(path)     # answered since it was set aside?
         if confirmed is None:
-            return 0                               # still awaiting the user — no re-analysis
-        return ingest_file(store, embedder, cfg, path, force=True, profile=confirmed)
+            return 0, False                        # still awaiting the user — no re-analysis
+        return _structured(confirmed)
     # new or changed → analyze and decide
     prof = analyze_doc(cfg, path)
     if not structure.should_confirm(prof):
-        return ingest_file(store, embedder, cfg, path, force=force)
+        return ingest_file(store, embedder, cfg, path, force=force), False
     sig = structure.profile_signature(prof)
     confirmed = pend.confirmed_profile(sig)        # this profile already confirmed?
     if confirmed is not None:
-        return ingest_file(store, embedder, cfg, path, force=force, profile=confirmed)
+        return _structured(confirmed)
     # defer: file the questions once per profile, mark the doc awaiting input
     _rid, is_new = pend.defer(sig, prof.get("kind"), prof, structure.questions_for(prof), path)
     version = int(store.manifest.meta_get("version", "1"))
@@ -516,7 +538,7 @@ def _ingest_or_defer(store, embedder, cfg, path, *, force, confirm_exts, pend) -
     log.info("%s %s needs confirmation (%s) — set aside for your input%s",
              "structured document" if is_new else "another", os.path.basename(path),
              prof.get("kind"), " [new request]" if is_new else "")
-    return 0
+    return 0, False
 
 
 def crawl(store, embedder, cfg, *, force=False) -> dict:
@@ -544,6 +566,7 @@ def crawl(store, embedder, cfg, *, force=False) -> dict:
                         "confirm gate", e)
             pend = None
     deferred = 0
+    want_graph = False
     try:
         for root in roots:
             if not os.path.isdir(root):
@@ -554,8 +577,9 @@ def crawl(store, embedder, cfg, *, force=False) -> dict:
                     if os.path.splitext(name)[1].lower() not in exts:
                         continue
                     path = os.path.join(dirpath, name)
-                    added = _ingest_or_defer(store, embedder, cfg, path,
-                                             force=force, confirm_exts=confirm_exts, pend=pend)
+                    added, wants = _ingest_or_defer(store, embedder, cfg, path,
+                                                    force=force, confirm_exts=confirm_exts, pend=pend)
+                    want_graph = want_graph or wants
                     if added:
                         docs += 1
                         chunks += added
@@ -566,6 +590,19 @@ def crawl(store, embedder, cfg, *, force=False) -> dict:
         if pend:
             pend.close()
     out = {"docs": docs, "chunks": chunks}
+    # a structured doc was ingested and asked for the graph → build it now (idempotent)
+    if want_graph and cfg.get("auto_citations", True):
+        try:
+            from . import citations as citations_mod
+            from .kb import KB
+            kb = KB(cfg)
+            try:
+                out["citations"] = citations_mod.build(store, kb, cfg, log=log)
+                log.info("cross-reference graph built: %s", out["citations"])
+            finally:
+                kb.close()
+        except Exception as e:                     # the graph is a bonus, never fails the crawl
+            log.warning("citations pass skipped: %s", e)
     if deferred:
         out["needs_confirm"] = deferred
         log.info("%d document group(s) need your confirmation before ingest — "

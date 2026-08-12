@@ -183,6 +183,34 @@ Section 3. Information about Donations to the Foundation.
     check("deuterocanon presence surfaces the canon/versification warning",
           any("deuterocanonical" in w for w in pc["warnings"]))
 
+    # ── interleaved commentary: detection, confirm toggles, annotation parsing ─
+    COMMENTED = ("Genesis Chapter 1\n"
+                 "1:6. And God said: Let there be a firmament made amidst the waters.\n"
+                 "A firmament. By this name is understood the whole space; see Job 26:7.\n"
+                 "It divideth the waters that are upon the earth from those above.\n"
+                 "1:7. And God made a firmament, and divided the waters.\n"
+                 "1:8. And God called the firmament Heaven.\n"
+                 "And the evening and morning were the second day, note the Fathers.\n")
+    pcm = S.analyze(COMMENTED)
+    check("interleaved notes between verses are detected (has_commentary)",
+          pcm.get("has_commentary"))
+    cmids = [q["id"] for q in S.questions_for(pcm)]
+    check("confirm step surfaces the graph + commentary toggles (user is aware)",
+          "graph" in cmids and "commentary" in cmids)
+    conf_on = S.apply_answers(pcm, {"kind": "structured"})
+    check("defaults are ON: build_citations + layer_commentary",
+          conf_on["build_citations"] and conf_on["layer_commentary"])
+    conf_off = S.apply_answers(pcm, {"kind": "structured", "graph": "skip", "commentary": "skip"})
+    check("both after-ingest steps can be turned off at confirm",
+          not conf_off["build_citations"] and not conf_off["layer_commentary"])
+    notes = S.parse_annotations(COMMENTED, conf_on)
+    check("parse_annotations anchors each note to the verse it follows",
+          notes and notes[0][0].key == "bible:Gen.1.6"
+          and notes[0][1].startswith("A firmament") and "Job 26:7" in notes[0][1])
+    check("prose with no interleaved notes → has_commentary False, no commentary toggle",
+          not S.analyze(KJV).get("has_commentary")
+          and "commentary" not in [q["id"] for q in S.questions_for(S.analyze(KJV))])
+
     # ── unknown-book warning ─────────────────────────────────────────────────
     pu = S.analyze("Nephi 3:7 And it came to pass that I, Nephi, said unto my father.\n"
                    "Nephi 3:8 And it came to pass that I did go.\n")
