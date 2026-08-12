@@ -1141,6 +1141,39 @@ def _run_build_ann(cfg, log) -> int:
     return 0
 
 
+def _run_read(cfg, log, args) -> int:
+    """`read <reference>`: read a scripture reference across every ingested edition —
+    each translation's text, its cross-references, and the commentary attached to it.
+    e.g. `read John 3:16`  ·  `read 1 Cor 13:4-7`.  Read-only."""
+    from . import scripture as scripture_mod
+    ref = " ".join(args.args).strip() or (args.doc or "").strip()
+    if not ref:
+        log.error("read needs a reference: read John 3:16")
+        return 1
+    store = make_store(cfg)
+    kb = KB(cfg)
+    try:
+        res = scripture_mod.parallel_reading(store, kb, cfg, ref)
+    finally:
+        kb.close()
+        store.close()
+    verses = res["verses"]
+    if not verses or not any(v["editions"] for v in verses):
+        log.info("nothing ingested for %s yet — ingest an edition (and run `citations`), "
+                 "then try again.", ref)
+        return 0
+    for v in verses:
+        print(f"\n\033[1m{v['display']}\033[0m")
+        for e in v["editions"]:
+            print(f"  [{e['translation']}] {e['text']}")
+        if v["cross_references"]:
+            print("  ↪ cross-references: " + ", ".join(v["cross_references"]))
+        for note in v["commentary"]:
+            print(f"  ✎ {note}")
+    print()
+    return 0
+
+
 def _run_citations(cfg, log) -> int:
     """`citations`: build the deterministic cross-reference graph over structured
     (scripture/legal) documents — one node per canonical unit (verse/section), a
@@ -1214,7 +1247,7 @@ def main(argv=None):
                              "optimize", "edge-audit", "stats", "reset", "bump-version", "migrate-vocab",
                              "bundles", "split", "source", "scenario", "eval", "facetize",
                              "ingest-library", "rebuild-fts", "import-bundle", "eject-bundle",
-                             "collect", "analyze", "citations", "clear-queue"])
+                             "collect", "analyze", "citations", "read", "clear-queue"])
     # positional args for the modular-bundle verbs:
     #   source <doc_id> [--title ..] [--bundle ..]   scenario [name]   split [dir]
     #   import-bundle <file.kdb>     eject-bundle <bundle>
@@ -1432,6 +1465,8 @@ def main(argv=None):
         return _run_analyze(cfg, log, args)
     if args.command == "citations":           # deterministic cross-reference graph (no LM)
         return _run_citations(cfg, log)
+    if args.command == "read":                # parallel scripture reading across editions
+        return _run_read(cfg, log, args)
 
     if args.command == "import-bundle":       # absorb a shipped brain into the master
         import json as _json

@@ -546,6 +546,18 @@ class SqliteStore:
                         "vec": list(struct.unpack(f"<{len(b)//4}f", b)) if b else None})
         return out
 
+    def chunks_for_section(self, section: str) -> list:
+        """Every chunk stored under one canonical section key (a verse / a section) across
+        ALL documents — the alignment feed: multiple translations of the same verse (and
+        its commentary chunks).  Each carries `title` (the translation label), text and
+        source_type, in ingestion order."""
+        rows = self.db.execute(
+            "SELECT title, text, path_or_url, source_type FROM chunks WHERE section=? "
+            "ORDER BY rowid", (section,)).fetchall()
+        return [{"title": r["title"] or "", "text": r["text"] or "",
+                 "path_or_url": r["path_or_url"] or "", "source_type": r["source_type"] or ""}
+                for r in rows]
+
     def search_text(self, query: str, k: int, filters: dict | None = None):
         match = _fts_query(query, self._stopset())
         if not match:
@@ -893,6 +905,24 @@ class LanceStore:
         rows.sort(key=lambda r: r.get("ingested_at") or 0)
         return [{"section": r.get("section") or "", "text": r.get("text") or "",
                  "tokens": r.get("tokens") or 0, "vec": r.get("vector")} for r in rows]
+
+    def chunks_for_section(self, section: str) -> list:
+        """Lance parity for verse alignment: every chunk under one canonical section key,
+        with its translation label (title), text and source_type."""
+        if self.tbl is None:
+            return []
+        safe = section.replace("'", "''")
+        try:
+            ds = self.tbl.to_lance()
+            rows = ds.scanner(columns=["title", "text", "path_or_url", "source_type", "ingested_at"],
+                              filter=f"section = '{safe}'").to_table().to_pylist()
+        except Exception as e:
+            log.warning("lance chunks_for_section failed (%s)", e)
+            return []
+        rows.sort(key=lambda r: r.get("ingested_at") or 0)
+        return [{"title": r.get("title") or "", "text": r.get("text") or "",
+                 "path_or_url": r.get("path_or_url") or "", "source_type": r.get("source_type") or ""}
+                for r in rows]
 
     def close(self):
         try:

@@ -443,6 +443,20 @@ def confirm_profile(cfg, path: str, answers: dict) -> dict:
     return structure.apply_answers(analyze_doc(cfg, path), answers or {})
 
 
+_EDITION_SHORT = {"douay-rheims": "DRB"}
+
+
+def _translation_label(profile, path) -> str:
+    """A short label naming this edition/translation (KJV, DRB, …), so aligned verses are
+    attributable.  From the confirmed edition when known, else the file's stem."""
+    ed = profile.get("edition")
+    eid = ed.get("id") if isinstance(ed, dict) else ed
+    if eid:
+        return _EDITION_SHORT.get(eid, str(eid).upper())
+    stem = os.path.splitext(os.path.basename(path))[0]
+    return (stem.strip() or "text").upper()[:24]     # translation sigla are conventionally caps
+
+
 def _ingest_structured_doc(store, embedder, cfg, path, version, chash, st, profile):
     """Ingest a CONFIRMED scripture/legal document one canonical unit at a time: each
     verse / section becomes a single chunk whose `section` is its canonical key
@@ -463,7 +477,9 @@ def _ingest_structured_doc(store, embedder, cfg, path, version, chash, st, profi
                     "— falling back to normal ingest", os.path.basename(path))
         return None
     store.delete_by_path(path)
-    title = os.path.splitext(os.path.basename(path))[0]
+    # the translation label rides the chunk title, so multiple editions of the same verse
+    # (keyed identically) line up side by side, each named (KJV / DRB / …).
+    title = _translation_label(profile, path)
     items = ((r.key, t, max(1, len(t.split()))) for r, t in units)
     n = _store_records(store, embedder, cfg, source_type=source_type, title=title,
                        path_or_url=path, items=items, version=version)
@@ -482,6 +498,7 @@ def _ingest_structured_doc(store, embedder, cfg, path, version, chash, st, profi
 
     store.set_doc_meta(path, {
         "structured": True, "kind": kind, "scheme": profile.get("scheme"),
+        "translation": title, "edition": profile.get("edition"),
         "work": profile.get("work"), "book_order": profile.get("book_order"),
         "reference_map": profile.get("reference_map") or {},
         "extra_books": profile.get("extra_books") or [],
