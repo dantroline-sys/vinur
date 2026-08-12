@@ -253,6 +253,14 @@ DEFAULTS = {
     #   {"fiction": "fictional", "science": "empirical", "essays": "interpretive",
     #    "history": "historical"}
     "source_regimes": {},
+    # Reference-map files (.json/.toml) for canonical, cross-referential corpora
+    # (scripture, legal): they let DIFFERENT — even multilingual — documents marry up
+    # on the SAME graph node.  Each file may carry `book_aliases` ({canonical:
+    # [variant, …]}, e.g. John: ["Jean","Johannes","1 Mose"→Genesis]) so foreign book
+    # names resolve to canonical OSIS, and `key_aliases` ({from_key: to_key}) for
+    # versification / renumbering divergences (e.g. an LXX Psalm split).  Empty by
+    # default; a domain pack ships them.  Example: ["refmaps/scripture-multilingual.json"]
+    "reference_maps": [],
     "extensions": [".pdf", ".epub", ".html", ".htm", ".txt", ".md"],
     # Where `clear-queue` MOVES the source files of documents it drops from the
     # distillation queue — with their tree relative to each source root preserved,
@@ -586,7 +594,7 @@ _BOOL_KEYS = {"embed_task_prefix", "ocr", "verify", "strict",
               "conceptnet_include_lexical", "ann_search", "ann_mmap", "wiki_semantic",
               "ask_fit_gate", "use_spacy", "library_dense", "distill_dedupe"}
 _LIST_KEYS = {"sources", "extensions", "distill_urls", "extract_urls", "verify_urls",
-              "encrypted_bundles", "library_sources", "stopwords_extra",
+              "encrypted_bundles", "library_sources", "stopwords_extra", "reference_maps",
               "high_stakes_extra", "ops_regions", "ask_exclude_facets",
               "distill_skip_zones"}
 

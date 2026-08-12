@@ -391,6 +391,65 @@ def _run_pack(cfg, log, args) -> int:
     return 0
 
 
+def _run_analyze(cfg, log, args) -> int:
+    """`analyze <doc>`: read a plain-text scripture/legal document and PROPOSE a
+    structure profile (kind, addressing scheme, books/sections found, how
+    cross-references are written, samples, warnings) for the user to CONFIRM before
+    a structured ingest.  Read-only; nothing is written unless --save is given."""
+    import json as _json
+    from . import structure as S
+    doc = (args.args[0] if args.args else None) or args.doc
+    if not doc:
+        log.error("analyze needs a document: analyze <file> [--kind scripture|legal] [--save profile.json]")
+        return 1
+    try:
+        text = open(os.path.expanduser(doc), encoding="utf-8", errors="replace").read()
+    except OSError as e:
+        log.error("cannot read %s: %s", doc, e)
+        return 1
+    maps = S.load_reference_maps(cfg.get("reference_maps"))
+    prof = S.analyze(text, kind_hint=args.kind, maps=maps)
+    if maps.stats["book_aliases"] or maps.stats["key_aliases"]:
+        print(f"  refmaps  : {maps.stats['book_aliases']} book alias(es), "
+              f"{maps.stats['key_aliases']} key alias(es) loaded")
+    for bad in maps.stats["unmapped_targets"]:
+        log.warning("reference map targets an unknown canonical book: %r (ignored)", bad)
+
+    print(f"\n  document : {doc}")
+    print(f"  kind     : {prof['kind']}   (confidence {prof.get('confidence', 0):.2f})")
+    print(f"  scheme   : {prof.get('scheme')}   — one unit per {prof.get('unit')}")
+    if prof["kind"] == "scripture":
+        bl = prof.get("books") or []
+        shown = ", ".join(f"{b['canonical']} ({b['verses_seen']})" for b in bl[:12])
+        print(f"  books    : {len(bl)} detected — {shown}{' …' if len(bl) > 12 else ''}")
+    elif prof["kind"] == "legal":
+        cs = prof.get("citation_style", {})
+        print(f"  citation : marker {cs.get('section_marker')} · subsections {cs.get('subsection')} · "
+              f"full-form {cs.get('full_citation')}")
+    print(f"  stats    : {prof.get('stats')}")
+    if prof.get("work"):
+        print(f"  work     : {prof['work']}   (the namespace local refs resolve under)")
+    if prof.get("samples"):
+        print("  samples  :  canonical-key  [citation]  text")
+        for s in prof["samples"]:
+            print(f"     {s.get('key', '?')}   [{s['citation']}]  {s['text']}")
+    for w in prof.get("warnings", []):
+        print(f"  ⚠ {w}")
+    print("\n  → If this looks right, re-run with --save <profile.json>, then a structured "
+          "ingest will use it. If a book/scheme is wrong, tell me what it should be.\n")
+
+    if args.save:
+        try:
+            with open(os.path.expanduser(args.save), "w", encoding="utf-8") as f:
+                _json.dump(prof, f, indent=2, ensure_ascii=False)
+            log.info("profile written to %s (%d sample(s), %d warning(s))",
+                     args.save, len(prof.get("samples", [])), len(prof.get("warnings", [])))
+        except OSError as e:
+            log.error("could not write %s: %s", args.save, e)
+            return 1
+    return 0
+
+
 def _run_collect(cfg, log, args) -> int:
     """`collect <doc> --to <file.kdb> --bundle <name>`: clean-room ingest+distil of one
     document, ADDED to a shareable .kdb collection (created or merged into).  The master
@@ -1107,7 +1166,7 @@ def main(argv=None):
                              "optimize", "edge-audit", "stats", "reset", "bump-version", "migrate-vocab",
                              "bundles", "split", "source", "scenario", "eval", "facetize",
                              "ingest-library", "rebuild-fts", "import-bundle", "eject-bundle",
-                             "collect", "clear-queue"])
+                             "collect", "analyze", "clear-queue"])
     # positional args for the modular-bundle verbs:
     #   source <doc_id> [--title ..] [--bundle ..]   scenario [name]   split [dir]
     #   import-bundle <file.kdb>     eject-bundle <bundle>
@@ -1200,6 +1259,11 @@ def main(argv=None):
                                   "(or pass it positionally)")
     ap.add_argument("--to", dest="to",
                     help="collect: the .kdb collection file to create or add to")
+    ap.add_argument("--kind", choices=["scripture", "legal"],
+                    help="analyze: force the corpus kind instead of auto-detecting")
+    ap.add_argument("--save", dest="save",
+                    help="analyze: write the proposed profile to this JSON file "
+                         "(after you've eyeballed it) for a later structured ingest")
     ap.add_argument("--allow-unlicensed", action="store_true", dest="allow_unlicensed",
                     help="pack: build despite unlicensed sources — stamped "
                          "shareable:false (private use only; import warns)")
@@ -1312,6 +1376,8 @@ def main(argv=None):
         return _run_pack(cfg, log, args)      # clean-room: opens its own scratch store
     if args.command == "collect":             # add one doc to a shareable .kdb collection
         return _run_collect(cfg, log, args)   # clean-room: opens its own scratch store
+    if args.command == "analyze":             # propose a structure profile (no ingest)
+        return _run_analyze(cfg, log, args)
 
     if args.command == "import-bundle":       # absorb a shipped brain into the master
         import json as _json

@@ -1,0 +1,27 @@
+{
+  "_note": "Example reference map for scripture. Point config `reference_maps` at file(s) like this (JSON or TOML). `book_aliases` map foreign/variant book names to a CANONICAL English book (which must be one of the built-in 66) so multilingual commentaries marry up on the same OSIS key; `key_aliases` remap a canonical key onto another for versification/renumbering divergences. This is a STARTER — extend it with your languages and your tradition's full versification table. Delete this _note or leave it; the loader ignores unknown keys.",
+
+  "book_aliases": {
+    "Genesis":        ["Genèse", "Génesis", "Genesi", "1. Mose", "1 Mose", "Gén", "Gn"],
+    "Exodus":         ["Exode", "Éxodo", "Esodo", "2. Mose", "2 Mose"],
+    "Leviticus":      ["Lévitique", "Levítico", "3. Mose", "3 Mose"],
+    "Numbers":        ["Nombres", "Números", "4. Mose", "4 Mose"],
+    "Deuteronomy":    ["Deutéronome", "Deuteronomio", "5. Mose", "5 Mose"],
+    "Psalms":         ["Psaumes", "Salmos", "Salmi", "Psalmen", "Psalmi"],
+    "Isaiah":         ["Ésaïe", "Isaías", "Jesaja", "Isaia"],
+    "Matthew":        ["Matthieu", "Mateo", "Matthäus", "Matteo", "Matthaeus"],
+    "Mark":           ["Marc", "Marcos", "Markus", "Marco", "Marcus"],
+    "Luke":           ["Luc", "Lucas", "Lukas", "Luca"],
+    "John":           ["Jean", "Juan", "Johannes", "Giovanni", "Ioannes", "Ev. Johannes"],
+    "Acts":           ["Actes", "Hechos", "Apostelgeschichte", "Atti", "Actus"],
+    "Romans":         ["Romains", "Romanos", "Römer", "Romani", "Ad Romanos"],
+    "1 Corinthians":  ["1 Corinthiens", "1 Corintios", "1. Korinther", "1 Corinzi"],
+    "2 Corinthians":  ["2 Corinthiens", "2 Corintios", "2. Korinther", "2 Corinzi"],
+    "Revelation":     ["Apocalypse", "Apocalipsis", "Offenbarung", "Apocalisse", "Apocalypsis"]
+  },
+
+  "key_aliases": {
+    "_note": "ILLUSTRATIVE ONLY — replace with a real table. Format: a citation as it appears in THIS document's versification, mapped to the key in your canonical frame. Example (Hebrew/English Psalm numbering can diverge from LXX/Vulgate by one for parts of the Psalter):",
+    "bible:Ps.9.22": "bible:Ps.10.1"
+  }
+}
