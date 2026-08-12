@@ -106,6 +106,54 @@ def main():
     check("header-style units resolve the book → same canonical keys",
           hu == ["bible:John.1.1", "bible:John.1.2", "bible:John.1.3"])
 
+    # ── real-world: Douay-Rheims from Project Gutenberg ──────────────────────
+    # verses print as '1:1.' (trailing period, Vulgate style); the file's appended
+    # Gutenberg licence carries 'Section N.' markers that must NOT flip it to legal.
+    DOUAY = """THE BOOK OF GENESIS
+
+Genesis Chapter 1
+
+1:1. In the beginning God created heaven, and earth.
+1:2. And the earth was void and empty, and darkness was upon the deep.
+1:3. And God said: Be light made. And light was made.
+
+Book of Exodus
+
+Exodus Chapter 2
+
+2:1. After this there went a man of the house of Levi.
+2:2. And she conceived, and bore a son.
+
+*** END OF THE PROJECT GUTENBERG EBOOK ***
+
+Section 1. General Terms of Use of this eBook.
+Section 2. Information about the Project Gutenberg Literary Archive.
+Section 3. Information about Donations to the Foundation.
+"""
+    pd = S.analyze(DOUAY)
+    check("Douay '1:1.' verse format → scripture (NOT legal, despite a 'Section N.' licence tail)",
+          pd["kind"] == "scripture")
+    check("Douay chapter headers resolve the book (Book of X / X Chapter N)",
+          {"Genesis", "Exodus"} <= {b["canonical"] for b in pd["books"]})
+    dk = [r.key for r, _ in S.parse_units(DOUAY, pd)]
+    check("Douay verses parse to canonical keys under the right book context",
+          dk == ["bible:Gen.1.1", "bible:Gen.1.2", "bible:Gen.1.3",
+                 "bible:Exod.2.1", "bible:Exod.2.2"])
+
+    # a Vulgate book name we can't resolve → the header DROPS context (verses are not
+    # mislabeled to the previous book); the shipped Douay map makes it resolve.
+    ISAIAS = ("Isaias Chapter 1\n"
+              "1:1. The vision of Isaias the son of Amos.\n"
+              "1:2. Hear, O ye heavens, and give ear, O earth.\n")
+    check("unresolved Vulgate header drops the book context (verses dropped, never mislabeled)",
+          [r.key for r, _ in S.parse_units(ISAIAS, {"kind": "scripture"})] == [])
+    dr = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                      "refmaps", "douay-rheims.example.json")
+    drmaps = S.load_reference_maps([dr])
+    check("shipped Douay-Rheims map resolves 'Isaias' → canonical Isaiah keys",
+          [r.key for r, _ in S.parse_units(ISAIAS, {"kind": "scripture"}, maps=drmaps)]
+          == ["bible:Isa.1.1", "bible:Isa.1.2"])
+
     # ── unknown-book warning ─────────────────────────────────────────────────
     pu = S.analyze("Nephi 3:7 And it came to pass that I, Nephi, said unto my father.\n"
                    "Nephi 3:8 And it came to pass that I did go.\n")

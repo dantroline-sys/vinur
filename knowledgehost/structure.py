@@ -272,9 +272,42 @@ _BOOK_TOK = (r"(?:[1-3]\.?|I{1,3}|First|Second|Third)?\s*"
              + _LT + r"{2,}(?:\s+of\s+" + _LT + r"{2,})?")
 # "John 3:16", "1 Cor 13:4-18", "Genèse 22:2"  (optional verse-range end captured)
 _RE_REF_BOOK = re.compile(rf"\b({_BOOK_TOK})\.?\s+(\d+)[:.](\d+)(?:\s*[-–]\s*(\d+))?")
-_RE_LINE_BOOKCV = re.compile(rf"^\s*({_BOOK_TOK})\.?\s+(\d+)[:.](\d+)\s+(.*\S)\s*$")
-_RE_LINE_CV = re.compile(r"^\s*(\d+)[:.](\d+)\s+(.*\S)\s*$")
+# a verse line — inline "Book C:V text" or bare "C:V text".  The verse number may
+# carry a trailing period (Douay-Rheims / Vulgate editions print "1:1. In the …").
+_RE_LINE_BOOKCV = re.compile(rf"^\s*({_BOOK_TOK})\.?\s+(\d+)[:.](\d+)\.?\s+(.*\S)\s*$")
+_RE_LINE_CV = re.compile(r"^\s*(\d+)[:.](\d+)\.?\s+(.*\S)\s*$")
 _RE_BARE_CV = re.compile(r"\b(\d+)[:.](\d+)\b")
+# a chapter header that carries the book context for the bare 'C:V' lines beneath it:
+# "Genesis Chapter 1", "Psalms Chapter 3", "Psalm 23"; and a table-of-contents / section
+# title "The Book of Genesis", "Book of Exodus".
+_RE_CHAP_HEADER = re.compile(r"^\s*(.+?)\s+(?:chapter|chap\.?|psalm)\s+\d+\.?\s*$", re.I)
+_RE_BOOK_OF = re.compile(r"^\s*(?:the\s+)?book\s+of\s+(.+?)\s*$", re.I)
+
+
+def _header_book(ln: str, maps):
+    """Resolve a header line to a book: the bare name, a 'Book Chapter N' / 'Psalm N'
+    chapter header, or a 'Book of X' title.  None if it isn't a recognisable header."""
+    s = ln.strip()
+    if not s or len(s.split()) > 8:
+        return None
+    b = _match(maps, s)
+    if b:
+        return b
+    for rx in (_RE_CHAP_HEADER, _RE_BOOK_OF):
+        m = rx.match(s)
+        if m:
+            b = _match(maps, m.group(1))
+            if b:
+                return b
+    return None
+
+
+def _looks_like_header(ln: str) -> bool:
+    """True for a chapter/book header SHAPE regardless of whether its book resolves —
+    so an unrecognised header (a Vulgate name with no map) DROPS the book context
+    instead of silently attributing its verses to the previous book."""
+    s = ln.strip()
+    return bool(_RE_CHAP_HEADER.match(s) or _RE_BOOK_OF.match(s))
 
 # legal: "§ 106", "Sec. 501(a)(1)", "Section 230", "17 U.S.C. § 106", "Article III"
 _RE_SECTION = re.compile(r"(?:§+|\bSec(?:tion)?s?\.?)\s*(\d+[A-Za-z]?(?:[.\-]\d+)*)((?:\([0-9a-zA-Z]+\))*)")
@@ -313,16 +346,21 @@ def analyze(text: str, *, kind_hint: str | None = None, maps: ReferenceMaps | No
             continue
         if _RE_LINE_CV.match(ln):
             cv_lines += 1
-        elif len(ln.split()) <= 5:                       # a short line that IS a book name?
-            b = _match(maps, ln.strip())
-            if b:
-                found.setdefault(b[1], 0)
+            continue
+        hb = _header_book(ln, maps)                      # "Genesis Chapter 1" / "Book of Exodus"
+        if hb:
+            found.setdefault(hb[1], 0)
     # book-header + "C:V lines" layout: bare C:V lines dominate AND some book headers seen
     header_books = [b for b, c in found.items() if c == 0]
     # a 'Book C:V' shape with an UNRECOGNISED book still signals scripture structure
     # (odd abbreviations / a non-standard canon) — surface it, don't misclassify.
     unknown_cv = sum(unknown_books.values())
-    scripture_hits = inline + unknown_cv + (cv_lines if (found or unknown_books) else 0)
+    # A run of bare 'C:V text' lines is scripture even when no book resolves (foreign /
+    # Vulgate book names we don't know yet) — a lone "16:9" is noise, but a sequence of
+    # verse-numbered lines is unmistakable.  Require a real run so a stray ratio/time
+    # doesn't tip an ordinary document.
+    cv_signal = cv_lines if (found or unknown_books or cv_lines >= 3) else 0
+    scripture_hits = inline + unknown_cv + cv_signal
 
     # ── legal signals ────────────────────────────────────────────────────────
     section_hits = sum(1 for ln in nonblank if _RE_SECTION.search(ln))
@@ -436,9 +474,11 @@ def parse_units(text: str, profile: dict, *, maps: ReferenceMaps | None = None):
             if m and cur_book:
                 yield _fix(scripture_ref(cur_book, m.group(1), m.group(2))), m.group(3).strip()
                 continue
-            b = _match(maps, ln.strip()) if len(ln.split()) <= 5 else None
-            if b:
-                cur_book = b[1]                          # a book header line — switch context
+            hb = _header_book(ln, maps)                  # "Genesis Chapter 1" / "Book of Exodus"
+            if hb:
+                cur_book = hb[1]                         # switch the book context
+            elif _looks_like_header(ln):
+                cur_book = None                          # unresolved book header — drop, don't mislabel
     elif kind == "legal":
         title = (profile.get("work") or {}).get("title", "")
         cur, buf = None, []

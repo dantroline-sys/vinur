@@ -1,0 +1,40 @@
+{
+  "_note": "Reference map for the Douay-Rheims / Latin Vulgate Bible (e.g. the Project Gutenberg edition). Point config `reference_maps` at this file so its Latin/Catholic book names resolve to canonical OSIS books. Covers the UNAMBIGUOUS renamings only. Two things it deliberately does NOT do — confirm them per document instead: (1) the Vulgate Kings/Samuel shift (Douay '1-2 Kings' = Samuel, '3-4 Kings' = Kings) is a genuine canon divergence that would corrupt a Protestant text if applied blindly; (2) the deuterocanonical books (Tobias, Judith, Wisdom, Ecclesiasticus/Sirach, Baruch, 1-2 Machabees) are NOT in the 66-book canon this engine ships, so they have no canonical key yet — the confirm step lets you keep them as their own works until Catholic/Orthodox canon support lands.",
+
+  "book_aliases": {
+    "Joshua":       ["Josue"],
+    "Nehemiah":     ["Nehemias", "2 Esdras", "Second Book of Esdras"],
+    "Ezra":         ["Esdras", "1 Esdras", "First Book of Esdras"],
+    "Job":          ["Job"],
+    "Psalms":       ["Psalmes"],
+    "Song of Solomon": ["Canticle of Canticles", "Canticles", "Canticle"],
+    "Isaiah":       ["Isaias"],
+    "Jeremiah":     ["Jeremias"],
+    "Lamentations": ["Lamentations of Jeremias"],
+    "Ezekiel":      ["Ezechiel"],
+    "Daniel":       ["Daniel"],
+    "Hosea":        ["Osee"],
+    "Joel":         ["Joel"],
+    "Amos":         ["Amos"],
+    "Obadiah":      ["Abdias"],
+    "Jonah":        ["Jonas"],
+    "Micah":        ["Micheas"],
+    "Nahum":        ["Nahum"],
+    "Habakkuk":     ["Habacuc"],
+    "Zephaniah":    ["Sophonias"],
+    "Haggai":       ["Aggeus"],
+    "Zechariah":    ["Zacharias"],
+    "Malachi":      ["Malachias"],
+    "1 Chronicles": ["1 Paralipomenon", "First Book of Paralipomenon"],
+    "2 Chronicles": ["2 Paralipomenon", "Second Book of Paralipomenon"],
+    "Revelation":   ["Apocalypse", "Apocalypse of St. John the Apostle"],
+    "Matthew":      ["Gospel According to St. Matthew"],
+    "Mark":         ["Gospel According to St. Mark"],
+    "Luke":         ["Gospel According to St. Luke"],
+    "John":         ["Gospel According to St. John"]
+  },
+
+  "key_aliases": {
+    "_note": "Add versification remaps here if this edition's chapter:verse numbering diverges from your canonical frame (the Vulgate Psalms are numbered differently from the Hebrew for much of the Psalter). Format: {\"bible:Ps.<this-edition>.<v>\": \"bible:Ps.<canonical>.<v>\"}."
+  }
+}
