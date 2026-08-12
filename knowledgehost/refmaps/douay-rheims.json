@@ -1,0 +1,44 @@
+{
+  "_note": "Built-in reference map for the Douay-Rheims Bible (Challoner revision of the Latin Vulgate). Loaded automatically when the Douay-Rheims edition is detected, so every book name resolves to a canonical OSIS book WITHOUT asking the user to hand-map anything. The Vulgate book naming diverges from later English Bibles in a well-established, unambiguous way — most importantly the Kings/Samuel shift (Douay '1-2 Kings' = Samuel; '3-4 Kings' = Kings) and the Esdras naming (Douay '1 Esdras' = Ezra; '2 Esdras' = Nehemias = Nehemiah). This map is applied PER DOCUMENT (only to files confirmed as Douay-Rheims), so it can never affect a KJV or other edition in the same corpus. Verse numbering is ingested AS PRINTED (Vulgate); the Douay is internally consistent, so this is safe. `key_aliases` is where a Vulgate->Hebrew Psalm cross-reference table would go if you later want the affected Psalms to marry up with Hebrew-numbered editions; leaving it empty keeps the Vulgate numbers as the canonical frame for this edition.",
+
+  "book_aliases": {
+    "Joshua":          ["Josue"],
+    "1 Samuel":        ["1 Kings", "First Book of Kings", "First Book of Samuel"],
+    "2 Samuel":        ["2 Kings", "Second Book of Kings", "Second Book of Samuel"],
+    "1 Kings":         ["3 Kings", "Third Book of Kings"],
+    "2 Kings":         ["4 Kings", "Fourth Book of Kings"],
+    "1 Chronicles":    ["1 Paralipomenon", "First Book of Paralipomenon"],
+    "2 Chronicles":    ["2 Paralipomenon", "Second Book of Paralipomenon"],
+    "Ezra":            ["1 Esdras", "Esdras", "First Book of Esdras"],
+    "Nehemiah":        ["2 Esdras", "Nehemias", "Second Book of Esdras", "Book of Nehemias"],
+    "Song of Solomon": ["Canticle of Canticles", "Canticles", "Canticle"],
+    "Sirach":          ["Ecclesiasticus"],
+    "Isaiah":          ["Isaias"],
+    "Jeremiah":        ["Jeremias"],
+    "Lamentations":    ["Lamentations of Jeremias"],
+    "Ezekiel":         ["Ezechiel"],
+    "Hosea":           ["Osee"],
+    "Obadiah":         ["Abdias"],
+    "Jonah":           ["Jonas"],
+    "Micah":           ["Micheas"],
+    "Habakkuk":        ["Habacuc", "Abacuc"],
+    "Zephaniah":       ["Sophonias"],
+    "Haggai":          ["Aggeus"],
+    "Zechariah":       ["Zacharias"],
+    "Malachi":         ["Malachias"],
+    "Tobit":           ["Tobias"],
+    "1 Maccabees":     ["1 Machabees", "First Book of Machabees"],
+    "2 Maccabees":     ["2 Machabees", "Second Book of Machabees"],
+    "Matthew":         ["Gospel According to St. Matthew"],
+    "Mark":            ["Gospel According to St. Mark"],
+    "Luke":            ["Gospel According to St. Luke"],
+    "John":            ["Gospel According to St. John"],
+    "Acts":            ["Acts of the Apostles"],
+    "Romans":          ["Epistle of St. Paul to the Romans"],
+    "Revelation":      ["Apocalypse", "Apocalypse of St. John the Apostle"]
+  },
+
+  "key_aliases": {
+    "_note": "Empty by design — the Douay is ingested in its own (Vulgate) Psalm numbering. To cross-reference the affected Psalms (Vulgate Ps 9 = Hebrew Ps 9-10; Vulgate is one behind for most of Ps 10-146) with a Hebrew-numbered edition, add entries like {\"bible:Ps.<vulgate>.<v>\": \"bible:Ps.<hebrew>.<v>\"} here."
+  }
+}

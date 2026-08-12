@@ -304,6 +304,57 @@ def load_reference_maps(paths, extra: dict | None = None) -> ReferenceMaps:
     return ReferenceMaps(book_aliases, key_aliases)
 
 
+# ── editions: recognised whole-Bible traditions with a complete built-in map ──
+# A mainstream edition (the Douay-Rheims PREDATES the KJV — it is not exotic) should
+# ingest cleanly on a sensible default, not interrogate the user book by book.  We
+# detect the edition from a distinctive name mention or a cluster of its own Vulgate/
+# Latin book names, then apply its complete map PER DOCUMENT (never globally, so it can
+# never touch a KJV in the same corpus).  Extend _EDITIONS to add more traditions.
+_EDITIONS = {
+    "douay-rheims": {
+        "name": "Douay-Rheims (Latin Vulgate)",
+        "map": "douay-rheims.json",
+        # Douay-specific terms — the Gutenberg header carries these explicitly.
+        "name_signals": ("douay", "rheims", "rhemes", "douai", "challoner"),
+        # Vulgate/Latin book spellings essentially never seen in an English Protestant
+        # Bible; a cluster of them identifies the edition even with no title page.
+        "book_signals": ("paralipomenon", "aggeus", "sophonias", "abdias", "osee",
+                         "micheas", "machabees", "josue", "isaias", "jeremias",
+                         "ezechiel", "malachias", "zacharias", "habacuc", "nehemias",
+                         "tobias", "canticle of canticles", "3 kings", "4 kings"),
+        "note": ("Its deuterocanonical books and Vulgate numbering — including the "
+                 "Kings/Samuel and Esdras naming — are expected and handled here; it "
+                 "ingests as printed, so there is nothing to get wrong."),
+    },
+}
+
+
+def detect_edition(text: str) -> dict | None:
+    """Recognise a known whole-Bible edition from its own vocabulary, so it can be
+    ingested on a sensible default instead of a book-by-book interrogation.  Returns
+    {id, name, note} or None."""
+    low = text.lower()
+    for eid, spec in _EDITIONS.items():
+        strong = any(re.search(r"\b" + re.escape(s) + r"\b", low) for s in spec["name_signals"])
+        cluster = sum(1 for s in spec["book_signals"] if s in low) >= 3
+        if strong or cluster:
+            return {"id": eid, "name": spec["name"], "note": spec["note"]}
+    return None
+
+
+def edition_map(edition_id: str) -> dict:
+    """The bundled reference-map dict ({book_aliases, key_aliases}) for an edition id,
+    or {} if unknown / unreadable."""
+    spec = _EDITIONS.get(edition_id)
+    if not spec:
+        return {}
+    path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "refmaps", spec["map"])
+    try:
+        return _read_map_file(path)
+    except (OSError, ValueError):
+        return {}
+
+
 def _match(maps, token):
     return maps.match_book(token) if maps else match_book(token)
 
@@ -436,6 +487,11 @@ def analyze(text: str, *, kind_hint: str | None = None, maps: ReferenceMaps | No
         "legal_markers": legal_hits}}
 
     if kind == "scripture":
+        # a recognised edition (e.g. Douay-Rheims) carries a complete built-in map, so
+        # its Vulgate/Latin book names and deuterocanon are EXPECTED, not 'unrecognised'
+        # — detect it up front and reframe the warnings accordingly.
+        edition = detect_edition(text)
+        prof["edition"] = edition
         scheme = "book-chapter-verse-inline" if inline >= cv_lines else "chapter-verse-lines"
         prof["scheme"] = scheme
         prof["unit"] = "verse"
@@ -446,16 +502,16 @@ def analyze(text: str, *, kind_hint: str | None = None, maps: ReferenceMaps | No
         prof["citation_style"] = {"form": "Book C:V", "chapter_verse_sep": ":",
                                   "cross_ref": "Book C:V / bare C:V within a book"}
         prof["confidence"] = round(min(1.0, scr_score * 1.6), 2)
-        if unknown_books:
+        if unknown_books and not edition:
             top = sorted(unknown_books.items(), key=lambda kv: -kv[1])[:8]
             prof["warnings"].append("unrecognised book name(s) — map or confirm: "
                                     + ", ".join(f"{k}×{v}" for k, v in top))
-        if scheme == "chapter-verse-lines" and not header_books:
+        if scheme == "chapter-verse-lines" and not header_books and not edition:
             prof["warnings"].append("bare 'C:V' lines with no detected book headers — "
                                     "the book per unit is ambiguous; confirm the book or its header pattern")
         low = [b["canonical"] for b in prof["books"] if b["verses_seen"] and b["verses_seen"] < 3]
         deutero = [b for b in found if b in _DEUTERO]
-        if deutero:
+        if deutero and not edition:               # a known edition already accounts for these
             prof["warnings"].append("deuterocanonical book(s) present (" + ", ".join(sorted(deutero)[:6])
                                     + ") — Catholic/Orthodox canon; confirm the versification "
                                     "(e.g. Vulgate Psalm numbering can differ by one for much of the Psalter)")
@@ -700,6 +756,7 @@ def questions_for(profile: dict) -> list[dict]:
     kind = profile.get("kind")
     qs: list[dict] = []
     if kind == "scripture":
+        edition = profile.get("edition")
         books = ", ".join(b["canonical"] for b in profile.get("books", [])[:8]) or "—"
         qs.append({
             "id": "kind", "type": "choice", "default": "structured",
@@ -709,29 +766,43 @@ def questions_for(profile: dict) -> list[dict]:
             "options": [
                 {"value": "structured", "label": "Structured scripture — one node per verse, with cross-reference links"},
                 {"value": "plain", "label": "Ordinary prose — just chunk it normally"}]})
+        if edition:
+            # a recognised edition: one friendly, default-yes question replaces the
+            # book-by-book interrogation (and the scary versification prompt).
+            qs.append({
+                "id": "edition", "type": "choice", "default": "apply",
+                "prompt": f"This looks like the {edition['name']} edition. Apply its "
+                          "built-in reference map so every book and its numbering resolve "
+                          "automatically?",
+                "detail": edition["note"] + " Recommended — decline only if you'd rather "
+                          "map the book names yourself.",
+                "options": [
+                    {"value": "apply", "label": f"Yes — use the built-in {edition['name']} map (recommended)"},
+                    {"value": "manual", "label": "No — I'll handle the book names myself"}]})
         if profile.get("scheme") == "chapter-verse-lines" and not profile.get("book_order"):
             qs.append({
                 "id": "book", "type": "text", "default": "",
                 "prompt": "The file uses bare 'chapter:verse' lines with no book header — "
                           "which book is this file? (e.g. 'John')",
                 "detail": "Leave blank if the text already heads several books itself."})
-        apoc = any("deuterocanonical" in w for w in profile.get("warnings", []))
-        qs.append({
-            "id": "canon", "type": "choice", "default": "as_printed",
-            "prompt": ("Deuterocanonical/apocryphal books are present, so canon and verse "
-                       "numbering vary by tradition — " if apoc else "")
-                      + "which verse numbering should I treat as canonical?",
-            "options": [
-                {"value": "as_printed", "label": "As printed — use the chapter:verse numbers in this file"},
-                {"value": "diverges", "label": "This edition's numbering diverges — I'll supply a mapping file"}]})
-        for name in _unknown_book_tokens(profile):
+        if not edition:
+            apoc = any("deuterocanonical" in w for w in profile.get("warnings", []))
             qs.append({
-                "id": "book:" + name, "type": "text", "default": "",
-                "prompt": f"I found references to '{name}', which isn't one of the standard "
-                          "66 books. What is it?",
-                "detail": "Leave blank to ignore it; type a standard book name (e.g. "
-                          "'Revelation') to treat it AS that book; type 'keep' to keep it "
-                          "as its own extra-canonical work."})
+                "id": "canon", "type": "choice", "default": "as_printed",
+                "prompt": ("Deuterocanonical/apocryphal books are present, so canon and verse "
+                           "numbering vary by tradition — " if apoc else "")
+                          + "which verse numbering should I treat as canonical?",
+                "options": [
+                    {"value": "as_printed", "label": "As printed — use the chapter:verse numbers in this file"},
+                    {"value": "diverges", "label": "This edition's numbering diverges — I'll supply a mapping file"}]})
+            for name in _unknown_book_tokens(profile):
+                qs.append({
+                    "id": "book:" + name, "type": "text", "default": "",
+                    "prompt": f"I found references to '{name}', which isn't one of the standard "
+                              "66 books. What is it?",
+                    "detail": "Leave blank to ignore it; type a standard book name (e.g. "
+                              "'Revelation') to treat it AS that book; type 'keep' to keep it "
+                              "as its own extra-canonical work."})
     elif kind == "legal":
         qs.append({
             "id": "kind", "type": "choice", "default": "structured",
@@ -820,6 +891,7 @@ def apply_answers(profile: dict, answers: dict) -> dict:
                              and ans.get("commentary", "layer") != "skip")
 
     book_aliases: dict[str, list] = {}
+    key_aliases: dict[str, str] = {}
     extra_books: list[str] = []
     for k, v in ans.items():
         if not k.startswith("book:"):
@@ -835,7 +907,23 @@ def apply_answers(profile: dict, answers: dict) -> dict:
             book_aliases.setdefault(b[1], []).append(token)
     if extra_books:
         p["extra_books"] = extra_books
-    p["reference_map"] = {"book_aliases": book_aliases, "key_aliases": {}}
+
+    # a recognised edition (default: apply): fold its complete built-in map in, so every
+    # Vulgate/Latin book name resolves without a per-book interrogation.  Per-document
+    # only — it lives in THIS profile's reference_map, never in the global config.
+    ed = profile.get("edition")
+    applied = None
+    if ed and ans.get("edition", "apply") != "manual":
+        em = edition_map(ed["id"])
+        for canon, forms in (em.get("book_aliases") or {}).items():
+            if str(canon).startswith("_"):
+                continue
+            book_aliases.setdefault(canon, []).extend(forms if isinstance(forms, list) else [forms])
+        key_aliases.update({str(k): str(v) for k, v in (em.get("key_aliases") or {}).items()
+                            if not str(k).startswith("_")})
+        applied = ed["id"]
+    p["edition"] = applied                       # the APPLIED edition id, or None
+    p["reference_map"] = {"book_aliases": book_aliases, "key_aliases": key_aliases}
     return p
 
 
@@ -848,5 +936,8 @@ def profile_signature(profile: dict) -> str:
         w = profile.get("work") or {}
         return f"legal:{w.get('scheme', 'usc')}:{w.get('title', '')}"
     if kind == "scripture":
-        return f"scripture:{(profile.get('work') or {}).get('scheme', 'bible')}"
+        ed = profile.get("edition")
+        eid = ed["id"] if isinstance(ed, dict) else (ed or "")
+        base = f"scripture:{(profile.get('work') or {}).get('scheme', 'bible')}"
+        return base + (":" + eid if eid else "")     # a Douay + a KJV batch separately
     return "plain"

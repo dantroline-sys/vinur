@@ -183,6 +183,41 @@ Section 3. Information about Donations to the Foundation.
     check("deuterocanon presence surfaces the canon/versification warning",
           any("deuterocanonical" in w for w in pc["warnings"]))
 
+    # ── EDITIONS: a mainstream edition ingests on a sensible default ──────────
+    DRB = ("The Project Gutenberg eBook of The Bible, Douay-Rheims, Complete\n"
+           "Revised and Diligently Compared with the Latin Vulgate by Bishop Richard Challoner\n"
+           "3 Kings Chapter 1\n"
+           "1:1. Now king David was old, and advanced in years.\n"
+           "1:2. His servants said to him: Let us seek a young virgin.\n"
+           "1 Kings Chapter 2\n"
+           "2:1. And Anna prayed, and said: My heart hath rejoiced in the Lord.\n"
+           "Ecclesiasticus Chapter 1\n"
+           "1:1. All wisdom is from the Lord God.\n")
+    ed = S.detect_edition(DRB)
+    check("edition detected: Douay-Rheims", ed and ed["id"] == "douay-rheims")
+    check("an ordinary KJV is NOT mistaken for a special edition", S.detect_edition(KJV) is None)
+    pdrb = S.analyze(DRB)
+    dq = [q["id"] for q in S.questions_for(pdrb)]
+    check("Douay confirm = one friendly edition question (no book-by-book barrage, no scary canon prompt)",
+          "edition" in dq and "canon" not in dq and not any(q.startswith("book:") for q in dq))
+    check("no worrying deuterocanon/versification warnings for a recognised edition",
+          not pdrb.get("warnings"))
+    confd = S.apply_answers(pdrb, {"kind": "structured"})       # default: apply the edition map
+    check("the edition map is applied by default", confd.get("edition") == "douay-rheims")
+    dmaps = S.load_reference_maps([], extra=confd["reference_map"])
+    check("Douay Kings/Samuel shift resolved correctly (1 Kings=1 Samuel, 3 Kings=1 Kings)",
+          dmaps.match_book("1 Kings") == (9, "1 Samuel")
+          and dmaps.match_book("3 Kings") == (11, "1 Kings"))
+    dk = [r.key for r, _ in S.parse_units(DRB, confd, maps=dmaps)]
+    check("Douay verses land on the CORRECT keys (3 Kings→1Kgs, Douay '1 Kings'→1Sam, not dropped)",
+          "bible:1Kgs.1.1" in dk and "bible:1Sam.2.1" in dk and "bible:Sir.1.1" in dk)
+    conf_manual = S.apply_answers(pdrb, {"kind": "structured", "edition": "manual"})
+    check("declining the edition leaves its map unapplied (user takes over)",
+          conf_manual.get("edition") is None and not conf_manual["reference_map"]["book_aliases"])
+    check("a Douay and a KJV batch under DIFFERENT signatures (edition map never crosses editions)",
+          S.profile_signature(pdrb) == "scripture:bible:douay-rheims"
+          and S.profile_signature(S.analyze(KJV)) == "scripture:bible")
+
     # ── interleaved commentary: detection, confirm toggles, annotation parsing ─
     COMMENTED = ("Genesis Chapter 1\n"
                  "1:6. And God said: Let there be a firmament made amidst the waters.\n"
