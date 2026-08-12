@@ -29,6 +29,11 @@ class Embedder:
         self.qpfx = cfg["embed_query_prefix"]
         self.dpfx = cfg["embed_document_prefix"]
         self.timeout = cfg["embed_timeout_s"]
+        # Query-path timeout — deliberately SHORT.  kb_ask/kb_search must stay live even
+        # while a distill hammers the embed server (or its recycler is mid-restart): a
+        # query embedding that can't answer promptly falls back to the BM25 arm instead
+        # of stalling the read path behind ingestion for embed_timeout_s.
+        self.query_timeout = float(cfg.get("ask_embed_timeout_s", 4) or 4)
         self.max_tokens = cfg.get("embed_max_tokens", 512)
         # Tokens are estimated as chars/4 (no tokenizer here); clip on chars.
         self._max_chars = self.max_tokens * 4 if self.max_tokens else 0
@@ -62,13 +67,13 @@ class Embedder:
             return text[:self._max_chars]
         return text
 
-    def _post(self, payload: dict):
+    def _post(self, payload: dict, timeout: float | None = None):
         req = urllib.request.Request(
             f"{self.url}/v1/embeddings",
             data=json.dumps(payload).encode("utf-8"),
             headers={"Content-Type": "application/json"},
             method="POST")
-        with urllib.request.urlopen(req, timeout=self.timeout) as r:
+        with urllib.request.urlopen(req, timeout=timeout or self.timeout) as r:
             out = json.loads(r.read())
         self.ever_ok = True
         return out
@@ -121,11 +126,14 @@ class Embedder:
         if not texts:
             return []
         inputs = [self._truncate(self._prefix(t, task)) for t in texts]
-        return self._embed_inputs(inputs)
+        # query embeddings answer fast or step aside (BM25 fallback) — see query_timeout
+        return self._embed_inputs(inputs,
+                                  timeout=self.query_timeout if task == "query" else None)
 
-    def _embed_inputs(self, inputs: list[str]):
+    def _embed_inputs(self, inputs: list[str], timeout: float | None = None):
         try:
-            data = self._post({"model": self.model, "input": inputs}).get("data") or []
+            data = self._post({"model": self.model, "input": inputs},
+                              timeout=timeout).get("data") or []
         except urllib.error.HTTPError as e:
             # The endpoint is up but rejected this request — almost always one
             # input over n_ubatch (or the whole batch over n_batch).  With more
@@ -134,8 +142,8 @@ class Embedder:
             if len(inputs) == 1:
                 return [self._embed_shrinking(inputs[0], e)]
             mid = len(inputs) // 2
-            left = self._embed_inputs(inputs[:mid])
-            right = self._embed_inputs(inputs[mid:])
+            left = self._embed_inputs(inputs[:mid], timeout=timeout)
+            right = self._embed_inputs(inputs[mid:], timeout=timeout)
             if left is None or right is None:
                 return None                  # a half hit a transport failure
             return left + right

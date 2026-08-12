@@ -107,6 +107,11 @@ DEFAULTS = {
     "embed_document_prefix": "search_document: ",
     "embed_batch": 64,        # ingestion embed batch size
     "embed_timeout_s": 30,
+    # Query-path embed timeout (kb_ask/kb_search): SHORT by design, so the read path
+    # answers promptly even while ingestion saturates the embed server — on expiry the
+    # dense arm steps aside and the BM25 arm answers.  Reads must never queue behind
+    # background work.
+    "ask_embed_timeout_s": 4,
     # Long ingestion jobs (embed-nodes, document ingest) wait up to this many
     # seconds for the embed endpoint to come back after a transport failure —
     # llama.cpp's embedding server leaks under heavy use and gets restarted
