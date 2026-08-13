@@ -44,6 +44,27 @@ INDEX_HTML = """<!doctype html>
   #live .rate.up { color: #22aa66; }
   #live .rate.zero { opacity: .35; }
   #live .upd { opacity: .5; font-size: 11px; margin-left: auto; }
+  /* the running-job strip: what this host is DOING, on every tab */
+  #jobbar { display: none; align-items: center; gap: 10px; font-size: 13px;
+            margin-bottom: 8px; padding: 5px 10px; border-radius: 6px;
+            background: #4a90d914; border: 1px solid #4a90d955; cursor: pointer; }
+  #jobbar.on { display: flex; }
+  #jobbar.done { background: #22aa6614; border-color: #22aa6655; }
+  #jobbar .jb-what { font-weight: 600; }
+  #jobbar .jb-num { font-variant-numeric: tabular-nums; }
+  #jobbar .jb-sub { opacity: .65; font-size: 12px; }
+  #jobbar .jb-go { margin-left: auto; opacity: .55; font-size: 12px; }
+  /* Operations: the progress card above the (collapsible) log */
+  #opprog { margin: 8px 0 10px; }
+  .opcard { border: 1px solid #8884; border-radius: 8px; padding: 10px 12px; }
+  .opgrid { display: flex; gap: 22px; flex-wrap: wrap; margin-top: 8px; font-size: 13px; }
+  .opgrid .k { opacity: .6; font-size: 11px; text-transform: uppercase;
+               letter-spacing: .3px; display: block; }
+  .opgrid .v { font-weight: 600; font-variant-numeric: tabular-nums; }
+  .opnext { margin-top: 9px; padding-top: 8px; border-top: 1px dashed #8884;
+            font-size: 12.5px; opacity: .85; }
+  details.collapsible > summary { cursor: pointer; font-size: 12px; opacity: .7;
+            padding: 3px 0; user-select: none; }
   .badge { display: inline-block; padding: 1px 7px; margin: 0 6px 2px 0;
            border: 1px solid #8886; border-radius: 10px; font-size: 12px; }
   .tabs { display: flex; gap: 2px; flex-wrap: wrap; }
@@ -180,6 +201,7 @@ INDEX_HTML = """<!doctype html>
     <h1>Knowledge Host — viewer</h1>
     <div id="stats">loading…</div>
     <div id="live"></div>
+    <div id="jobbar" onclick="go('ops')" title="open Operations"></div>
     <div class="tabs" id="tabs"></div>
   </div>
 </header>
@@ -430,6 +452,65 @@ function statEl(lbl, val, r) {
     + `<span class="val">${fmt(val)}</span>${rateSpan(r)}</span>`;
 }
 
+// ── running-job progress: one vocabulary, two renderings ────────────────────
+// The header strip (every tab) and the Operations card read the SAME record —
+// the last OPS_PROGRESS line the running verb emitted, parsed server-side.
+function fmtDur(s) {
+  if (s == null || !isFinite(s)) return '';
+  s = Math.max(0, Math.round(s));
+  if (s < 60) return s + 's';
+  if (s < 3600) return Math.floor(s / 60) + 'm ' + String(s % 60).padStart(2, '0') + 's';
+  return Math.floor(s / 3600) + 'h ' + String(Math.floor(s % 3600 / 60)).padStart(2, '0') + 'm';
+}
+function progPct(p) {
+  if (!p || !p.steps) return null;
+  return Math.max(0, Math.min(100, Math.round((p.step || 0) / p.steps * 100)));
+}
+function pbar(pct, w) {
+  return `<span class="pbar" style="width:${w || 120}px"><i style="width:${pct == null ? 0 : pct}%"></i></span>`;
+}
+// A distil's bar IS the chunk counter (step/steps are chunks); inside a clean-room
+// BUILD the bar counts phases and the chunk total rides along as chunk_steps.  One
+// reader, both shapes — and no total at all when the backend couldn't survey one.
+function chunkTotal(p) {
+  if (p.chunk_steps != null) return p.chunk_steps;
+  return (p.chunks == null || p.chunks === p.step) ? (p.steps || null) : null;
+}
+// "1,240 / 8,430" — or just "1,240" when the total is unknown.
+function progCount(p) {
+  const done = fmt(p.chunks != null ? p.chunks : p.step);
+  const total = chunkTotal(p);
+  return total ? `${done} / ${fmt(total)}` : done;
+}
+function renderJobBar(job) {
+  const el = $('#jobbar');
+  if (!el) return;
+  if (!job) { el.className = ''; el.innerHTML = ''; return; }
+  if (!job.running) {
+    const bad = job.exit_code !== 0 && job.exit_code != null;
+    el.className = 'on done';
+    el.innerHTML = `<span class="jb-what">${bad ? '✗' : '✓'} ${esc(job.command)}</span>`
+      + `<span class="jb-sub">finished${bad ? ' — exit ' + job.exit_code : ''}`
+      + `${job.elapsed_s != null ? ' in ' + fmtDur(job.elapsed_s) : ''}</span>`
+      + `<span class="jb-go">Operations →</span>`;
+    return;
+  }
+  const p = job.progress || {};
+  const pct = progPct(p);
+  const bits = [];
+  if (p.phase) bits.push(`<span class="jb-num">${esc(p.phase)}</span>`);
+  if (p.step != null || p.chunks != null) bits.push(`<span class="jb-num">${progCount(p)} chunks</span>`);
+  if (pct != null) bits.push(`<span class="jb-num">${pct}%</span>`);
+  if (p.doc) bits.push(`<span class="jb-sub">in ${esc(p.doc)}</span>`);
+  if (p.eta_s != null) bits.push(`<span class="jb-sub">~${fmtDur(p.eta_s)} left</span>`);
+  el.className = 'on';
+  el.innerHTML = `<span class="jb-what">▶ ${esc(job.command)}</span>`
+    + (pct != null ? pbar(pct, 120) : '')
+    + bits.join(' <span style="opacity:.3">·</span> ')
+    + `<span class="jb-sub">${fmtDur(job.elapsed_s)} elapsed</span>`
+    + `<span class="jb-go">Operations →</span>`;
+}
+
 async function refreshStats() {
   let s = {}, kb = {};
   try { s = await (await fetch('stats')).json(); } catch (e) {}
@@ -447,6 +528,7 @@ async function refreshStats() {
     ['distilled', 'distilled'], ['adjudicate', 'adjudicate'], ['gaps', 'gaps']];
   $('#live').innerHTML = order.map(([k, lbl]) => statEl(lbl, counts[k], rates[k])).join('')
     + `<span class="stat upd">⟳ ${dt >= 1 ? '/min over ' + Math.min(60, Math.round(dt)) + 's' : 'measuring…'}</span>`;
+  renderJobBar(s.job);
 }
 
 async function fillSources() {
@@ -1219,14 +1301,82 @@ function opsProgressBar(prog, s) {
   const step = Math.max(1, Math.min(steps, prog.step || 1));
   const pct = Math.round(step / steps * 100);
   let detail = '';
-  if (prog.chunks != null) detail = ` — ${fmtCompact(prog.chunks)} chunk(s)`;
-  else if (prog.added && typeof prog.added === 'object') {
+  if (prog.chunks != null) {
+    detail = ` — ${fmt(prog.chunks)}`
+      + (prog.chunk_steps ? ` / ${fmt(prog.chunk_steps)}` : '') + ' chunk(s)'
+      + (prog.doc ? `, in ${esc(prog.doc)}` : '');
+  } else if (prog.added && typeof prog.added === 'object') {
     const a = Object.entries(prog.added).map(([k, v]) => `${fmtCompact(v)} ${PHASE_TABLE[k] || k}`).join(', ');
     detail = a ? ` — added ${esc(a)}` : ' — nothing new';
   } else if (prog.created != null) detail = prog.created ? ' — new file' : ' — merged';
   return `<span style="display:inline-flex;gap:8px;align-items:center;margin-left:10px">`
     + `<span class="pbar" style="width:150px"><i style="width:${pct}%"></i></span>`
     + `<span style="font-size:12px">${step}/${steps} <b>${esc(prog.phase)}</b>${detail}</span></span>`;
+}
+// ── the Operations progress card: what is running, how far in, what's next ──
+// The status line above it is one line by design; this is the panel that answers
+// "how long will this take, which document is it in, and what happens after?".
+function statCell(k, v, tip) {
+  return `<span title="${esc(tip || '')}"><span class="k">${esc(k)}</span>`
+    + `<span class="v">${v}</span></span>`;
+}
+function addedCells(added) {
+  return Object.entries(added || {})
+    .map(([k, v]) => statCell(PHASE_TABLE[k] || k, fmt(v))).join('');
+}
+function nextUpLine(auto) {
+  if (!auto) return '';
+  if (!auto.enabled) {
+    return `<div class="opnext">Automation is <b>off</b> — jobs run only when you start them `
+      + `(turn it on under Settings › Prioritizer).</div>`;
+  }
+  const n = auto.next;
+  const when = !n ? '' : (n.due_in_s > 0 ? ` in ${fmtDur(n.due_in_s)}` : ' — due now');
+  return `<div class="opnext">Automation is <b>on</b>`
+    + (n ? ` — next up: <b>${esc(n.label || n.command)}</b>${when}`
+         + (n.reason ? ` <span style="opacity:.6">(${esc(n.reason)})</span>` : '')
+       : ' — no enabled steps in the plan')
+    + (auto.last_reason ? `<div style="opacity:.6;margin-top:2px">last: ${esc(auto.last_reason)}</div>` : '')
+    + `</div>`;
+}
+function opsProgressCard(prog, s, auto) {
+  const idle = !s.running;
+  if (idle && !auto) return '';
+  const p = prog || {};
+  const pct = progPct(p);
+  let head;
+  if (idle) {
+    head = `<div style="font-size:13px;opacity:.7">Nothing running`
+      + (s.command ? ` — last job: <b>${esc(s.command)}</b> exited ${s.exit_code}` : '') + `</div>`;
+  } else {
+    head = `<div style="display:flex;gap:10px;align-items:center;flex-wrap:wrap">`
+      + `<b>${esc(s.command)}</b>`
+      + (p.phase ? `<span class="badge">${esc(p.phase)}</span>` : '')
+      + (pct != null ? pbar(pct, 220) + `<span class="v">${pct}%</span>` : '')
+      + `</div>`;
+  }
+  const cells = [];
+  if (!idle) {
+    if (p.step != null || p.chunks != null) {
+      const tot = chunkTotal(p);
+      cells.push(statCell(tot ? 'chunks (of the queue)' : 'chunks done', progCount(p),
+        tot ? 'surveyed before the pass started: chunks with no distilled or zone-skip mark'
+            : 'this backend could not survey the queue — counting up, total unknown'));
+    }
+    if (p.left != null) cells.push(statCell('left', fmt(p.left)));
+    if (p.doc) {
+      const d = (p.doc_steps ? ` ${p.doc_step}/${p.doc_steps}` : '');
+      cells.push(statCell('current document', esc(p.doc) + d, p.doc));
+    }
+    if (p.docs_left != null) cells.push(statCell('documents left', fmt(p.docs_left)));
+    if (p.rate_min) cells.push(statCell('rate', p.rate_min + '/min', 'over the last 2 minutes'));
+    cells.push(statCell('elapsed', fmtDur(s.elapsed_s)));
+    if (p.eta_s != null) cells.push(statCell('eta', '~' + fmtDur(p.eta_s), 'at the current rate'));
+    if (p.added) cells.push(addedCells(p.added));
+  }
+  return `<div class="opcard">${head}`
+    + (cells.length ? `<div class="opgrid">${cells.join('')}</div>` : '')
+    + nextUpLine(auto) + `</div>`;
 }
 async function pollOps_() {
   let r; try { r = await (await authFetch('/ops/log?tail=400')).json(); } catch (e) { return; }
@@ -1243,15 +1393,32 @@ async function pollOps_() {
     if (k >= 0) { try { prog = JSON.parse(line.slice(k + 13)); } catch (e) {} return; }
     shown.push(line);
   });
+  // the server parses the same channel from the whole log, not just this tail —
+  // prefer its record and fall back to the tail-scraped one on an older server
+  prog = r.progress || prog;
   $('#opstatus').innerHTML = run + ' &nbsp; ' + healthStrip(r.health) + opsProgressBar(prog, s);
+  const card = $('#opprog'); if (card) card.innerHTML = opsProgressCard(prog, s, r.auto);
+  renderJobBar(s.command ? { running: !!s.running, command: s.command,
+    elapsed_s: s.elapsed_s, exit_code: s.exit_code, progress: prog } : null);
   const log = $('#opslog'); if (log) { const atBottom = log.scrollTop + log.clientHeight >= log.scrollHeight - 20;
     log.textContent = shown.join(NL) || '(no output yet)'; if (atBottom) log.scrollTop = log.scrollHeight; }
 }
+// Panels that eat the screen remember whether you left them open (per browser).
+function toggleRemember(el, key) { store_set(key, el.open ? '1' : '0'); }
+function store_get(key, dflt) {
+  try { const v = localStorage.getItem(key); return v == null ? dflt : v; } catch (e) { return dflt; }
+}
+function store_set(key, val) { try { localStorage.setItem(key, val); } catch (e) {} }
 async function loadOps() {
   $('#results').className = '';
+  const logOpen = store_get('vinur.opslog.open', '1') === '1';
   $('#results').innerHTML = `<div id="opstatus" style="margin:4px 0;font-size:13px">…</div>
-    <pre id="opslog" style="background:#0c0c0c;color:#d8d8d8;padding:10px;border-radius:6px;
-      height:46vh;overflow:auto;font-size:12px;white-space:pre-wrap;margin:0"></pre>`;
+    <div id="opprog"></div>
+    <details class="collapsible" id="opslogbox"${logOpen ? ' open' : ''}
+      ontoggle="toggleRemember(this,'vinur.opslog.open')">
+      <summary>▸ Job output (the raw log)</summary>
+      <pre id="opslog" style="background:#0c0c0c;color:#d8d8d8;padding:10px;border-radius:6px;
+        height:46vh;overflow:auto;font-size:12px;white-space:pre-wrap;margin:6px 0 0"></pre></details>`;
   let r; try { r = await (await authFetch('/ops/status')).json(); } catch (e) { $('#opstatus').textContent = 'request failed: ' + e; return; }
   if (!r.ok) { $('#opstatus').textContent = 'enter the auth token above to use Operations'; return; }
   OPSPEC = r.commands || {}; OPHELP = r.help || {};
@@ -2042,9 +2209,15 @@ async function loadPending() {
   try { r = await (await authFetch('/pending')).json(); } catch (e) { r = { ok: false }; }
   if (!r.ok || !r.count) { PENDINGQ = []; el.innerHTML = ''; return; }
   PENDINGQ = r.pending || [];
+  // Collapsible: it sits above every tab, so once you've read it (or decided to
+  // deal with it later) it must be possible to fold it away — the choice sticks.
+  const open = store_get('vinur.needsinput.open', '1') === '1';
   let h = `<div class="note" style="text-align:left;border-left:3px solid #e2a33a;max-width:760px">`
+    + `<details class="collapsible"${open ? ' open' : ''}`
+    + ` ontoggle="toggleRemember(this,'vinur.needsinput.open')">`
+    + `<summary style="opacity:1;font-size:inherit">`
     + `<b>Needs your input</b> — ${r.count} document group(s) look like structured text and were `
-    + `set aside during ingest until you confirm how to read them:`;
+    + `set aside during ingest until you confirm how to read them</summary>`;
   PENDINGQ.forEach((req, ri) => {
     const files = (req.docs || []).map(baseName);
     h += `<div style="margin-top:12px;border-top:1px solid #8883;padding-top:8px">`
@@ -2069,7 +2242,7 @@ async function loadPending() {
       + `<button class="toolbtn" onclick="dismissPending(${ri})" title="do not ask again unless the file changes">Dismiss</button>`
       + `</div></div>`;
   });
-  h += `</div>`;
+  h += `</details></div>`;
   el.innerHTML = h;
 }
 function pendingAnswers(ri) {

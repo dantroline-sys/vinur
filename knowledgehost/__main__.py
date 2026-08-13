@@ -183,6 +183,9 @@ def _run_distill(cfg, embedder, log, *, limit=None, watch=False, interval=30, bu
                 break
             log.info("watch: waiting %ds for ingest to add more chunks (Ctrl-C to stop)…",
                      interval)
+            # keep the panel honest between passes: "waiting", not a frozen bar
+            ops_mod.emit_progress("watching", chunks=stats.get("chunks", 0),
+                                  wait_s=int(interval))
             time.sleep(interval)
             store.close()
             store = make_store(cfg)            # fresh snapshot (lance sees new versions)

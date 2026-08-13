@@ -35,6 +35,10 @@ from .viewer import INDEX_HTML
 
 log = logging.getLogger("knowledgehost.server")
 
+# How long a FINISHED job keeps its place in the viewer's header strip.  The
+# Operations tab still names it as the last job; the header is for "right now".
+_JOB_BRIEF_LINGER_S = 900
+
 
 def _import_formats() -> list:
     """What can THIS install ingest right now?  Live probes (find_spec/which),
@@ -256,6 +260,25 @@ class Handler(BaseHTTPRequestHandler):
             pass
         return h
 
+    def _job_brief(self) -> dict | None:
+        """What the maintenance slot is doing, for the viewer's header — on every
+        tab, not just Operations.  Rides /stats (which the header already polls),
+        so it carries NO argv: the command name, its age and its progress record
+        say what is happening without publishing paths on an unauthed route."""
+        ops = getattr(self.server, "ops", None)
+        if ops is None:
+            return None
+        st = ops.status()
+        if not st.get("command"):
+            return None
+        if not st.get("running") and time.time() - (st.get("ended") or 0) > _JOB_BRIEF_LINGER_S:
+            return None          # yesterday's job is not "what this host is doing"
+        out = {"running": bool(st.get("running")), "command": st.get("command"),
+               "elapsed_s": st.get("elapsed_s"), "exit_code": st.get("exit_code")}
+        if out["running"]:
+            out["progress"] = ops.progress()
+        return out
+
     # A handler exception must NEVER drop the socket without a response —
     # the browser then reports only "NetworkError when attempting to fetch
     # resource", which names nothing.  Answer 500 with the real error and
@@ -313,7 +336,7 @@ class Handler(BaseHTTPRequestHandler):
                 "ok": True, "backend": store.backend, "chunks": store.count(),
                 "dense": store.has_vectors(),
                 "version": store.manifest.meta_get("version", "1"),
-                "by_source": by_source})
+                "by_source": by_source, "job": self._job_brief()})
         if path == "/sample":                      # viewer: eyeball stored chunks
             n = min(int((q.get("n") or ["20"])[0] or 20), 100)
             src = (q.get("source_type") or [None])[0] or None
@@ -650,12 +673,16 @@ class Handler(BaseHTTPRequestHandler):
                 return self._send_json({"ok": False, "error": "unauthorized"}, 401)
             if path == "/ops/status":
                 return self._send_json({"ok": True, "status": self.server.ops.status(),
+                                        "progress": self.server.ops.progress(),
                                         "health": self._health(),
                                         "commands": OPS_COMMANDS, "help": OPS_HELP})
             if path == "/ops/log":
                 n = int((q.get("tail") or ["300"])[0] or 300)
+                ap = getattr(self.server, "autopilot", None)
                 return self._send_json({"ok": True, "log": self.server.ops.tail(n),
                                         "status": self.server.ops.status(),
+                                        "progress": self.server.ops.progress(),
+                                        "auto": ap.status() if ap else None,
                                         "health": self._health()})
             if path == "/config":
                 from .config import settings_schema

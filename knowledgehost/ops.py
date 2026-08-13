@@ -293,6 +293,7 @@ def emit_result(did_work: bool, **stats) -> None:
 # into the ops log and the panel renders the LAST one as a progress bar.  Free-text
 # log lines remain the human-readable detail underneath.
 PROGRESS_PREFIX = "OPS_PROGRESS "
+_PROGRESS_TAIL_BYTES = 65536      # how far back progress() looks for the last record
 
 
 def emit_progress(phase: str, *, step: int | None = None, steps: int | None = None,
@@ -426,8 +427,14 @@ class OpsRunner:
         if not j:
             return {"running": False, "command": None}
         rc = j["proc"].poll()
+        if rc is not None and not j.get("ended"):
+            # Stop the clock the first time we see it exited — otherwise "finished
+            # in 15m" keeps climbing all afternoon.  (First SIGHTING, not the exact
+            # exit instant: close enough at a 2.5s poll, and never wrong by more.)
+            j["ended"] = time.time()
         return {"running": rc is None, "command": j["command"], "argv": j["argv"],
-                "started": j["started"], "elapsed_s": round(time.time() - j["started"]),
+                "started": j["started"], "ended": j.get("ended"),
+                "elapsed_s": round((j.get("ended") or time.time()) - j["started"]),
                 "exit_code": rc, "logfile": j["logfile"]}
 
     def result(self) -> dict | None:
@@ -455,6 +462,34 @@ class OpsRunner:
         if payload is None:
             return None
         return {"command": j["command"], "exit_code": rc, **payload}
+
+    def progress(self) -> dict | None:
+        """The live job's LAST OPS_PROGRESS record, parsed — the panel's bar and the
+        header status both read this.  Only the tail bytes are read: a long distil's
+        log runs to megabytes and this is polled every couple of seconds."""
+        import json as _json
+        j = self._job
+        if not j:
+            return None
+        try:
+            with open(j["logfile"], "rb") as f:
+                f.seek(0, os.SEEK_END)
+                size = f.tell()
+                f.seek(max(0, size - _PROGRESS_TAIL_BYTES))
+                blob = f.read().decode("utf-8", "replace")
+        except OSError:
+            return None
+        for line in reversed(blob.splitlines()):
+            k = line.find(PROGRESS_PREFIX)
+            if k < 0:
+                continue
+            try:
+                rec = _json.loads(line[k + len(PROGRESS_PREFIX):])
+            except ValueError:      # a torn last line (the job is mid-write) — look older
+                continue
+            if isinstance(rec, dict):
+                return rec
+        return None
 
     def tail(self, n: int = 300) -> str:
         j = self._job

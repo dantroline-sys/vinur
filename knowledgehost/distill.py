@@ -1286,6 +1286,147 @@ def _stage_line() -> str:
             f"kept {st['proc_kept']} / {st['crit_kept']} / {st['extra_kept']}]")
 
 
+# ── live progress: how much of the job is left ───────────────────────────────
+# A distil is the longest thing this host does, and until now it said nothing
+# about its own size: the log counted chunks UP, with no total and no notion of
+# which document it was in.  The queue is surveyed once at the start (one grouped
+# anti-join) and progress counts DOWN from it, per document and overall, onto the
+# ops progress channel that the panel's bar and the header status read.
+_PROGRESS_EVERY_S = 2.0     # floor between emitted lines (they ride the ops log)
+_RATE_WINDOW_S = 120.0      # rate/ETA measured over this trailing window
+
+
+def _basename(path: str) -> str:
+    s = str(path or "")
+    return s.rsplit("/", 1)[-1] or s
+
+
+class DistillProgress:
+    """The pass's own progress, emitted on the ops channel.  Thread-safe: the
+    parallel and two-tier paths tick from their worker/writer threads.
+
+    Emission is throttled (`every_s`) because these lines share the ops log with
+    the human-readable detail — one line per chunk would push everything else out
+    of the tail the panel reads."""
+
+    def __init__(self, *, phase: str = "distil", emit=None,
+                 every_s: float = _PROGRESS_EVERY_S):
+        from . import ops as _ops
+        self.phase = phase
+        self.emit = emit if emit is not None else _ops.emit_progress
+        self.every_s = float(every_s)
+        self.total: int | None = None       # chunks pending when the pass started
+        self.docs: dict = {}                # doc -> chunks still pending in it
+        self.doc_total: dict = {}           # doc -> chunks pending at the start
+        self.docs_ahead = 0                 # documents holding pending chunks
+        self.step = 0
+        self.cur: str | None = None
+        self.counters: dict = {}
+        self.started = time.time()
+        self._marks = [(self.started, 0)]   # (t, step) for the trailing rate
+        self._last = 0.0
+        self._lock = threading.Lock()
+
+    # ── the survey: what the job is walking into ─────────────────────────────
+    def survey(self, store, cfg, *, bundle=None, limit=None, log_fn=None) -> dict:
+        """Ask the store what is pending BEFORE the pass runs, and say it out loud.
+        Silent (total stays None) on a backend that can't answer — an unknown total
+        degrades the bar to a counter, it never stops the run."""
+        q = {}
+        if hasattr(store, "distill_queue"):
+            try:
+                q = store.distill_queue(cfg["kb_path"], bundle=bundle) or {}
+            except Exception as e:               # a survey is never worth a failed run
+                log.debug("distill queue survey unavailable: %s", e)
+        pending = q.get("pending")
+        if pending is not None:
+            self.total = min(int(pending), int(limit)) if limit else int(pending)
+        self.docs = {d["doc"]: d["pending"] for d in q.get("docs") or []}
+        self.doc_total = dict(self.docs)
+        self.docs_ahead = int(q.get("docs_pending") or len(self.docs))
+        say = log_fn or log.info
+        if pending is None:
+            say("queue ahead: unknown (this backend can't survey it) — "
+                "progress will count chunks without a total")
+        elif pending:
+            big = sorted((q.get("docs") or []), key=lambda d: -d["pending"])[:3]
+            say("queue ahead: %s chunk(s) to distil across %s document(s)%s%s",
+                f"{pending:,}", f"{self.docs_ahead:,}",
+                f" (this pass stops at {limit:,})" if limit and limit < pending else "",
+                (" — biggest: "
+                 + ", ".join(f"{_basename(d['doc'])} ({d['pending']:,})" for d in big))
+                if big else "")
+        else:
+            say("queue ahead: nothing pending%s", f" in bundle '{bundle}'" if bundle else "")
+        self._fire(force=True)
+        return q
+
+    # ── ticks ────────────────────────────────────────────────────────────────
+    def tick(self, doc=None, **counters) -> None:
+        """One chunk finished (written to the KB)."""
+        with self._lock:
+            self.step += 1
+            if doc:
+                self.cur = doc
+                if doc in self.docs:
+                    self.docs[doc] = max(0, self.docs[doc] - 1)
+            for k, v in counters.items():
+                self.counters[k] = self.counters.get(k, 0) + int(v or 0)
+            self._fire()
+
+    def finish(self, **counters) -> None:
+        """Final line, unthrottled — the panel's bar should end where the job did."""
+        with self._lock:
+            for k, v in counters.items():
+                self.counters[k] = self.counters.get(k, 0) + int(v or 0)
+            self._fire(force=True, done=True)
+
+    # ── emission ─────────────────────────────────────────────────────────────
+    def _rate(self, now: float) -> float:
+        """Chunks/min over the trailing window (0.0 until there's a span to measure)."""
+        self._marks.append((now, self.step))
+        while len(self._marks) > 2 and now - self._marks[0][0] > _RATE_WINDOW_S:
+            self._marks.pop(0)
+        t0, s0 = self._marks[0]
+        dt = now - t0
+        return ((self.step - s0) / dt * 60.0) if dt >= 1.0 else 0.0
+
+    def _fire(self, *, force: bool = False, done: bool = False) -> None:
+        now = time.time()
+        if not force and now - self._last < self.every_s:
+            return
+        self._last = now
+        rate = self._rate(now)
+        rec: dict = {"step": self.step, "chunks": self.step,
+                     "elapsed_s": round(now - self.started, 1)}
+        if self.total is not None:
+            rec["steps"] = self.total
+            rec["left"] = max(0, self.total - self.step)
+            if rate > 0 and not done:
+                rec["eta_s"] = int(round(rec["left"] / rate * 60.0))
+        if rate:
+            rec["rate_min"] = round(rate, 1)
+        if self.cur:
+            rec["doc"] = _basename(self.cur)
+            tot = self.doc_total.get(self.cur)
+            if tot:
+                rec["doc_step"] = tot - self.docs.get(self.cur, 0)
+                rec["doc_steps"] = tot
+        ahead = sum(1 for n in self.docs.values() if n > 0)
+        if self.docs:
+            # documents surveyed but not started + the one in hand; a corpus with
+            # more docs than the survey returned keeps the survey's larger count
+            rec["docs_left"] = max(ahead, self.docs_ahead - (len(self.docs) - ahead))
+        if self.counters:
+            rec["added"] = dict(self.counters)
+        if done:
+            rec["done"] = True
+        try:
+            self.emit(self.phase, **rec)
+        except Exception:            # progress is cosmetic — never fail a run for it
+            pass
+
+
 def distill_chunk(kb, lm, embedder, chunk: dict, extraction=None,
                   source_regime=None, narrative=None) -> tuple:
     """Distil one raw chunk into the KB.  Returns (concepts, relations, cards).
@@ -2319,7 +2460,7 @@ def _fan_out(cfg, lms) -> list:
 
 
 def distill_corpus(store, kb, extractors, embedder, cfg, *, limit=None, verifiers=None,
-                   bundle=None) -> dict:
+                   bundle=None, progress=None) -> dict:
     """Distil the not-yet-done chunks.  Resumable (the distilled set is the checkpoint).
     With a verifier tier and the fast `extractors`, runs the decoupled two-tier pipeline
     (fast extract → big verify → write); otherwise the single-tier path (parallel when
@@ -2329,7 +2470,10 @@ def distill_corpus(store, kb, extractors, embedder, cfg, *, limit=None, verifier
     at a time.
 
     `bundle` (e.g. "vinkona") restricts the pass to chunks from that provenance bundle,
-    so Vinkona's own research drops can be distilled ahead of a big uncurated corpus."""
+    so Vinkona's own research drops can be distilled ahead of a big uncurated corpus.
+
+    `progress` is a DistillProgress (one is made if absent): it surveys the queue
+    before the first chunk and reports "N of M, in <document>" as the pass runs."""
     if not extractors:
         raise BackendUnavailable("no distill endpoints available")
     _stage_reset()
@@ -2358,15 +2502,18 @@ def distill_corpus(store, kb, extractors, embedder, cfg, *, limit=None, verifier
                 _lm.timeout = cfg.get("distill_timeout_s", getattr(_lm, "timeout", None))
             verifiers = None
     extractors = _fan_out(cfg, extractors)
+    prog = progress if progress is not None else DistillProgress()
+    prog.survey(store, cfg, bundle=bundle, limit=limit)
     if verifiers and cfg.get("verify", True):
         res = _distill_pipeline(store, kb, extractors, _fan_out(cfg, verifiers),
-                                embedder, cfg, limit=limit, bundle=bundle)
+                                embedder, cfg, limit=limit, bundle=bundle, progress=prog)
     elif len(extractors) == 1:
         res = _distill_sequential(store, kb, extractors[0], embedder, cfg,
-                                  limit=limit, bundle=bundle)
+                                  limit=limit, bundle=bundle, progress=prog)
     else:
         res = _distill_parallel(store, kb, extractors, embedder, cfg,
-                                limit=limit, bundle=bundle)
+                                limit=limit, bundle=bundle, progress=prog)
+    prog.finish()
     st = stage_stats()
     res.update(st)
     # Card-drought diagnosis: say WHY zero, not just that it was zero.
@@ -2439,7 +2586,8 @@ def _pending_chunks(store, kb, counter, bundle=None, cfg=None):
         yield ch
 
 
-def _distill_sequential(store, kb, lm, embedder, cfg, *, limit=None, bundle=None) -> dict:
+def _distill_sequential(store, kb, lm, embedder, cfg, *, limit=None, bundle=None,
+                        progress=None) -> dict:
     done = concepts = relations = cards = failed = 0
     skipped = [0, 0, 0, 0]
     every = cfg["ingest_log_every"]
@@ -2474,6 +2622,8 @@ def _distill_sequential(store, kb, lm, embedder, cfg, *, limit=None, bundle=None
         concepts += nc
         relations += nr
         cards += ncard
+        if progress:
+            progress.tick(chunk.get("path_or_url"), concepts=nc, relations=nr, cards=ncard)
         if every and done % every == 0:
             log.info("… distilled %d chunks / %d concepts / %d relations / %d cards (%d done) %s",
                      done, concepts, relations, cards, skipped[0], _stage_line())
@@ -2484,7 +2634,8 @@ def _distill_sequential(store, kb, lm, embedder, cfg, *, limit=None, bundle=None
             "skipped_dupe": skipped[2], "outside_bundle": skipped[3], "failed": failed}
 
 
-def _distill_parallel(store, kb, lms, embedder, cfg, *, limit=None, bundle=None) -> dict:
+def _distill_parallel(store, kb, lms, embedder, cfg, *, limit=None, bundle=None,
+                      progress=None) -> dict:
     import queue
     import threading
     from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
@@ -2600,6 +2751,9 @@ def _distill_parallel(store, kb, lms, embedder, cfg, *, limit=None, bundle=None)
                     concepts += nc
                     relations += nr
                     cards += ncard
+                    if progress:
+                        progress.tick(chunk.get("path_or_url"),
+                                      concepts=nc, relations=nr, cards=ncard)
                     if every and done % every == 0:
                         log.info("… distilled %d chunks / %d concepts / %d relations / "
                                  "%d cards (%d done) %s", done, concepts, relations, cards,
@@ -2883,7 +3037,7 @@ def _get(q, upstream_done, timeout=0.3):
 
 
 def _distill_pipeline(store, kb, extractors, verifiers, embedder, cfg, *, limit=None,
-                      bundle=None) -> dict:
+                      bundle=None, progress=None) -> dict:
     """Two-tier, decoupled pipeline (the user's design): fast EXTRACTORS (4090) and big
     VERIFIERS (3090) each pull from their own bounded queue and run at their own max
     rate; a single writer serialises KB writes.  A chunk is marked distilled only after
@@ -3146,6 +3300,8 @@ def _distill_pipeline(store, kb, extractors, verifiers, embedder, cfg, *, limit=
                 kb.mark_distilled(ch["id"])
                 if not ch.get("_cards_truncated"):            # truncated → recard recovers
                     kb.mark_recarded(ch["id"], RECARD_VERSION)   # families extracted inline
+            if progress:
+                progress.tick(ch.get("path_or_url"), concepts=nc, relations=nr, cards=ncard)
             with lock:
                 st["done"] += 1
                 st["concepts"] += nc

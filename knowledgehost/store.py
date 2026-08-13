@@ -505,6 +505,49 @@ class SqliteStore:
         finally:
             con.close()
 
+    def distill_queue(self, kb_path: str, bundle: str | None = None,
+                      limit: int = 400) -> dict:
+        """The work AHEAD of a distil pass, per document.  A chunk is pending when
+        kb.db holds neither a distilled_chunks row nor a zone_skips row for it —
+        the same test `_pending_chunks` applies one chunk at a time, asked once as
+        a grouped anti-join so a job can say "1,240 of 8,430" instead of counting
+        up from zero with no visible end.
+
+        `bundle` restricts to one provenance bundle; a document with no doc_meta
+        reads as 'base', matching distill._chunk_bundle.  Returns
+        {pending, docs_pending, docs: [{doc, title, pending}], truncated} with
+        `docs` capped at `limit` (largest first) — or {} when kb.db can't be read,
+        which the caller treats as "total unknown", never as a failure."""
+        meta_map = _doc_meta_all(self.db) if bundle is not None else {}
+        con = sqlite3.connect(self.cfg["db_path"], timeout=10)
+        try:
+            con.execute("PRAGMA busy_timeout=10000")
+            con.execute("ATTACH ? AS kbdb", (str(kb_path),))
+            zone = ("AND NOT EXISTS(SELECT 1 FROM kbdb.zone_skips z "
+                    "WHERE z.chunk_id = chunks.id) ")
+            sql = ("SELECT path_or_url, MAX(title), COUNT(*) FROM chunks "
+                   "WHERE NOT EXISTS(SELECT 1 FROM kbdb.distilled_chunks d "
+                   "                 WHERE d.chunk_id = chunks.id) {zone}"
+                   "GROUP BY path_or_url")
+            try:
+                rows = con.execute(sql.format(zone=zone)).fetchall()
+            except sqlite3.Error:                  # an older kb.db without zone_skips
+                rows = con.execute(sql.format(zone="")).fetchall()
+            docs = []
+            for doc, title, n in rows:
+                if bundle is not None and \
+                        ((meta_map.get(doc) or {}).get("bundle") or "base") != bundle:
+                    continue
+                docs.append({"doc": doc, "title": title or doc, "pending": n})
+            docs.sort(key=lambda d: -d["pending"])
+            return {"pending": sum(d["pending"] for d in docs),
+                    "docs_pending": len(docs), "docs": docs[:int(limit)],
+                    "truncated": len(docs) > int(limit)}
+        except sqlite3.Error:          # kb.db missing/locked → queue unknown
+            return {}
+        finally:
+            con.close()
+
     def sample(self, n: int, source_type: str | None = None) -> list:
         """A random spread of stored chunks — for eyeballing ingestion quality."""
         sql, params = "SELECT * FROM chunks", []

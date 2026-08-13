@@ -239,7 +239,41 @@ class Autopilot:
         return {"enabled": plan["enabled"], "running_step": self._state["running_step"],
                 "last_reason": self._state["last_reason"],
                 "respect_leases": plan["respect_leases"],
-                "auto_models": plan.get("auto_models", True)}
+                "auto_models": plan.get("auto_models", True),
+                "next": self.next_up(plan)}
+
+    def next_up(self, plan: dict | None = None) -> dict | None:
+        """What runs after the current job — 'and then?', answered from the same
+        plan/last-run/hold state the loop selects on, without touching it.  Returns
+        {label, command, args, due_in_s, reason} for the step that would be picked
+        now, or the soonest one if none is due; None when automation is off."""
+        plan = plan or load_plan(self.cfg)
+        if not plan.get("enabled"):
+            return None
+        now = time.time()
+        _i, step = due_step(plan["steps"], self._last_run, now, self._hold_until)
+        if step is not None:
+            return {"label": step.get("label", step["command"]), "command": step["command"],
+                    "args": step.get("args") or {}, "due_in_s": 0, "reason": "due now"}
+        soonest = None
+        for s in plan["steps"]:
+            if not s.get("enabled", True):
+                continue
+            key = step_key(s)
+            due_at = max(self._last_run.get(key, 0.0)
+                         + float(s.get("min_interval_s", 0) or 0),
+                         self._hold_until.get(key, 0.0))
+            wait = max(0.0, due_at - now)
+            if soonest is None or wait < soonest[0]:
+                soonest = (wait, s, key)
+        if soonest is None:
+            return None
+        wait, s, key = soonest
+        held = self._hold_until.get(key, 0.0) > now
+        return {"label": s.get("label", s["command"]), "command": s["command"],
+                "args": s.get("args") or {}, "due_in_s": int(round(wait)),
+                "reason": "found no work last run — standing aside" if held
+                          else "waiting for its interval"}
 
     # ── the loop ─────────────────────────────────────────────────────────────
     def _leases_held(self, plan) -> bool:

@@ -244,6 +244,25 @@ def _emit(report, phase: str, **extra) -> None:
         pass
 
 
+def _distil_progress(report):
+    """Route the distiller's live chunk counts into the BUILD's phase bar.  A build
+    is a 6-phase job that happens to contain a chunk-counting one; the bar stays in
+    phase space (2 of 6) and gains "1,240 / 8,430 chunks, in <doc>" underneath,
+    instead of the two progress channels overwriting each other.  No reporter
+    (build_pack) → the distiller stays silent on the channel, as it did before."""
+    from . import distill as distill_mod
+
+    def emit(_phase, **kw):
+        kw.pop("step", None)                      # the build owns step/steps
+        total = kw.pop("steps", None)
+        if total is not None:
+            kw["chunk_steps"] = total
+        _emit(report, "distill", **kw)
+
+    return distill_mod.DistillProgress(
+        emit=emit if report else (lambda *_a, **_k: None))
+
+
 def _pipeline(scfg: dict, src: Path, say, *, label: str = "pack", report=None,
               profile=None) -> dict:
     """ingest → distill → link inside the scratch.  Module-level so tests can
@@ -301,7 +320,8 @@ def _pipeline(scfg: dict, src: Path, say, *, label: str = "pack", report=None,
         t0 = time.time()
         stats["distill"] = distill_mod.distill_corpus(
             store, kb, extractors or verifiers, embedder, scfg,
-            verifiers=verifiers if extractors else None)
+            verifiers=verifiers if extractors else None,
+            progress=_distil_progress(report))
         say(f"{label}: distilled {stats['distill']} ({time.time() - t0:.1f}s)")
 
         # RECARD RECOVERY — the crux for a thrown-away scratch.  A chunk truncated at
