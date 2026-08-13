@@ -302,11 +302,190 @@ def collect_e2e():
     shutil.rmtree(tmp, ignore_errors=True)
 
 
+def furniture_completeness():
+    """A document whose furniture (a copyright page) is zone-skipped must still reach
+    complete=True — zone-skips are PROCESSED work, not missing work.  Before the fix
+    such a doc was 'incomplete' forever: doc_hashes never recorded, scratch never
+    cleaned, and the unchanged-re-collect fast path could never engage."""
+    state = _StubState()
+    srv, url = _start(state)
+    tmp = tempfile.mkdtemp(prefix="kb-collect-furn-")
+    doc = os.path.join(tmp, "essay.md")
+    boiler = ("Copyright © 2020 Example House. All rights reserved.\n"
+              "No part of this publication may be reproduced. ISBN 978-1-2345-6789-0.\n")
+    body = ("Alpine glaciers store winter snowfall and release it as summer meltwater. "
+            "Their retreat shifts the timing of river flow across the basin. ") * 12
+    with open(doc, "w", encoding="utf-8") as f:
+        f.write("# Copyright\n\n" + boiler + "\n# Glaciers\n\n" + body + "\n")
+
+    from knowledgehost import zones
+    cfg = load_config(None)
+    cfg.update({
+        "backend": "sqlite",
+        "db_path": os.path.join(tmp, "master-index.db"),
+        "kb_path": os.path.join(tmp, "master-kb.db"),
+        "pack_build_dir": os.path.join(tmp, "build"),
+        "sources": [tmp], "embed_url": url, "embed_dim": 8,
+        "distill_url": url, "distill_urls": [url], "extract_urls": [],
+        "distill_model": "stub-model", "distill_timeout_s": 15,
+        "distill_parallel": 2, "ann_search": False,
+        "auto_reconcile": False,
+    })
+
+    # fixture sanity: the ingested doc really contains a furniture chunk
+    from knowledgehost import ingest as ingest_mod
+    from knowledgehost.store import make_store
+    pre = dict(cfg, db_path=os.path.join(tmp, "pre-index.db"))
+    pstore = make_store(pre)
+    ingest_mod.ingest_file(pstore, None, pre, doc)
+    zs = [zones.classify(c.get("section") or "", c.get("text") or "")
+          for c in pstore.iter_chunks()]
+    pstore.close()
+    check(f"fixture sanity: the copyright page chunks as furniture ({zs})",
+          "boilerplate" in zs and "body" in zs)
+
+    target = os.path.join(tmp, "out", "essay.kdb")
+    res = P.add_to_collection(cfg, doc, target, "essay", license_override="CC-BY-4.0",
+                              log_fn=lambda *a: None)
+    dz = ((res.get("stats") or {}).get("distill") or {}).get("skipped_zone", 0)
+    check(f"the run zone-skipped the furniture ({dz})", dz >= 1)
+    check("…and still reports COMPLETE (skips are processed, not missing)",
+          res["ok"] and res.get("complete"))
+    build = Path(cfg["pack_build_dir"]) / "collect-essay"
+    check("a complete build cleans its scratch away", not build.exists())
+
+    mark = len(state.calls)
+    res2 = P.add_to_collection(cfg, doc, target, "essay", license_override="CC-BY-4.0",
+                               log_fn=lambda *a: None)
+    check("re-collecting it is answered from the manifest hash — zero LM calls",
+          res2.get("skipped") and len(state.calls) == mark)
+
+    srv.shutdown()
+    shutil.rmtree(tmp, ignore_errors=True)
+
+
+def pipeline_unit_tests():
+    """The two-tier pipeline's own mechanics (fake LMs, no HTTP): a clean run lands
+    everything; an empty queue returns zeros (it used to raise a misleading 'all fast
+    extractor endpoints failed'); a feeder death ABORTS the run loudly (it used to be
+    swallowed — the pipeline drained what was queued and reported success with most of
+    the corpus unfed); domain lenses run on the VERIFY tier, never in the writer."""
+    from knowledgehost.kb import KB
+
+    tmp = tempfile.mkdtemp(prefix="kb-pipeline-")
+    cfg = load_config(None)
+    cfg.update({"kb_path": os.path.join(tmp, "kb.db"), "control_dir": tmp,
+                "distill_unit_window_tokens": 100, "verify_batch": 3,
+                "ingest_log_every": 0, "ann_search": False})
+
+    GEN = ([{"label": "divine mercy", "kind": "concept",
+             "summary": "The passage describes mercy shown to the people.",
+             "questions": ["What does the passage say about mercy?"]}], [], [], [])
+    TYPED = {
+        "theme": {"title": "God's mercy", "concept": "divine mercy", "theme": "mercy",
+                  "statement": "Mercy endures through the psalm",
+                  "support": "his mercy endureth"},
+        "parallel": {"title": "Mercy echo", "concept": "Ps 1:1", "relationship": "echoes",
+                     "parallels": ["Ps 100:5"], "evidence": "his mercy endureth"},
+    }
+
+    class FakeLM:
+        def __init__(self, url):
+            self.url = url
+            self.typed_calls = 0
+
+        def extract(self, ch, reg=None):
+            return GEN
+
+        def extract_narrative(self, ch):
+            return None
+
+        def extract_typed(self, ch, card_type):
+            self.typed_calls += 1
+            return TYPED.get(card_type, {})
+
+    class FakeEmbedder:
+        def embed_many(self, texts, kind="document"):
+            return [[0.1] * 8 for _ in texts]
+
+        def embed_one(self, text, kind="document"):
+            return [0.1] * 8
+
+    class FakeStore:
+        def __init__(self, chunks):
+            self._chunks = chunks
+
+        def iter_chunks(self):
+            yield from self._chunks
+
+        def count(self):
+            return len(self._chunks)
+
+    def unit(i):
+        return {"id": f"v{i}", "source_type": "scripture", "path_or_url": "/x/ps.txt",
+                "title": "PS", "section": f"bible:Ps.1.{i + 1}", "tokens": 20,
+                "text": f"verse {i + 1} for his mercy endureth and his truth is everlasting"}
+
+    real_vb = D.verify_mod.verify_batch
+    D.verify_mod.verify_batch = lambda vlm, drafts, cfg_: [
+        (d["concepts"], d["relations"], d["procedures"],
+         {"rejected": 0, "adjusted": 0, "failed": 0}) for d in drafts]
+    try:
+        # ── clean run: everything lands; lenses on the verify tier only ──────
+        ex, vf = FakeLM("stub://fast"), FakeLM("stub://big")
+        kb = KB({"kb_path": cfg["kb_path"]})
+        chunks = [unit(i) for i in range(8)]
+        n_windows = len(list(D._windowed(iter([dict(c) for c in chunks]), cfg)))
+        res = D._distill_pipeline(FakeStore(chunks), kb, [ex], [vf],
+                                  FakeEmbedder(), cfg)
+        check(f"pipeline lands every window ({res['chunks']} of {n_windows})",
+              res["chunks"] == n_windows and res["failed"] == 0)
+        ncards = kb.db.execute("SELECT COUNT(*) FROM procedure_cards "
+                               "WHERE card_type IN ('theme','parallel')").fetchone()[0]
+        check(f"domain cards land through the pipeline ({ncards})", ncards >= 2)
+        check(f"lenses ran on the VERIFY tier exactly once per window "
+              f"(big {vf.typed_calls}, fast {ex.typed_calls})",
+              vf.typed_calls == n_windows * 2 and ex.typed_calls == 0)
+
+        # ── empty queue: zeros, not a fake endpoint failure ──────────────────
+        res2 = D._distill_pipeline(FakeStore(chunks), kb, [FakeLM("stub://fast")],
+                                   [FakeLM("stub://big")], FakeEmbedder(), cfg)
+        check("an already-done corpus returns zeros instead of raising",
+              res2["chunks"] == 0 and res2["skipped"] == n_windows * 0 + len(chunks))
+        kb.close()
+
+        # ── feeder death: loud, resumable — never a hollow success ───────────
+        class DyingStore(FakeStore):
+            def iter_chunks(self):
+                yield from self._chunks[:2]
+                raise RuntimeError("index backend fell over")
+
+        cfg2 = dict(cfg, kb_path=os.path.join(tmp, "kb2.db"))
+        kb2 = KB({"kb_path": cfg2["kb_path"]})
+        raised = None
+        try:
+            D._distill_pipeline(DyingStore([unit(i) for i in range(8)]), kb2, [FakeLM("f")],
+                                [FakeLM("b")], FakeEmbedder(), cfg2)
+        except D.BackendUnavailable as e:
+            raised = str(e)
+        check("a feeder death raises (resumable), never a silent partial 'success'",
+              raised is not None and "feeder died" in raised
+              and "index backend fell over" in raised)
+        kb2.close()
+    finally:
+        D.verify_mod.verify_batch = real_vb
+    shutil.rmtree(tmp, ignore_errors=True)
+
+
 def main():
     print("windows (distill._windowed):")
     windows_unit_tests()
     print("\ncollect end-to-end (live stubs — poison, resume, parallel):")
     collect_e2e()
+    print("\ncompleteness with furniture zones:")
+    furniture_completeness()
+    print("\ntwo-tier pipeline mechanics (fake LMs):")
+    pipeline_unit_tests()
     print()
     if FAIL:
         print(f"{FAIL} FAILURE(S)")

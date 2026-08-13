@@ -345,8 +345,16 @@ def _pipeline(scfg: dict, src: Path, say, *, label: str = "pack", report=None,
 
         # completeness safety net (≈0 on the success path — an interruption RAISES and
         # is handled by the caller; this catches any residual undistilled chunk).
+        # Zone-skipped furniture (References/TOC/Index/boilerplate — a Gutenberg licence
+        # block) counts as PROCESSED: it lives only in zone_skips, and subtracting just
+        # distilled_chunks left any such document "incomplete" forever — doc_hashes never
+        # recorded, scratch never cleaned, the unchanged-re-collect fast path never able
+        # to engage.  fresh=True because counts() is TTL-cached and a stale read here
+        # could also fake an undistilled remainder.
         try:
-            stats["undistilled"] = max(0, store.count() - kb.counts().get("distilled_chunks", 0))
+            k = kb.counts(fresh=True)
+            done_n = int(k.get("distilled_chunks", 0)) + int(k.get("zone_skipped_chunks", 0))
+            stats["undistilled"] = max(0, store.count() - done_n)
         except Exception:
             stats["undistilled"] = 0
 

@@ -3325,7 +3325,9 @@ def _distill_pipeline(store, kb, extractors, verifiers, embedder, cfg, *, limit=
              len(verifiers), ", ".join(v.url for v in verifiers))
     chunk_q: queue.Queue = queue.Queue(maxsize=max(4, len(extractors) * 3))
     draft_q: queue.Queue = queue.Queue(maxsize=max(4, (len(extractors) + len(verifiers)) * 2))
-    write_q: queue.Queue = queue.Queue()
+    # Bounded like the others: unbounded, a slow writer accumulated every extraction
+    # AND its embedding cache in RAM toward the whole corpus on a multi-hour collect.
+    write_q: queue.Queue = queue.Queue(maxsize=max(8, (len(extractors) + len(verifiers)) * 2))
     feed_done = threading.Event()
     extract_done = threading.Event()
     verify_done = threading.Event()
@@ -3340,7 +3342,11 @@ def _distill_pipeline(store, kb, extractors, verifiers, embedder, cfg, *, limit=
     reconcile_lm = verifiers[0]                       # the big LM does reconciliation's 5-way
 
     def feeder():
-        fcon = sqlite3.connect(cfg["kb_path"])        # own read connection (WAL: safe)
+        # Own connection — the shared kb handle belongs to the writer thread.  NOT
+        # read-only: it records zone-skips and dupe claims, so it contends with the
+        # writer's long per-chunk batch windows.  timeout=60 rides out those windows;
+        # Python's 5s default made "database is locked" a routine, silent death here.
+        fcon = sqlite3.connect(cfg["kb_path"], timeout=60.0)
 
         def pending():
             for ch in store.iter_chunks():
@@ -3407,6 +3413,17 @@ def _distill_pipeline(store, kb, extractors, verifiers, embedder, cfg, *, limit=
                     return
                 with lock:
                     st["fed"] += 1
+        except Exception as e:
+            # A feeder death used to be SILENT: the exception vanished into the
+            # thread, feed_done was set anyway, and the pipeline drained what was
+            # queued and exited CLAIMING SUCCESS with most of the corpus unfed
+            # ("database is locked" against the writer's batch windows was the live
+            # trigger).  Now the run stops and the end-of-run check raises, so the
+            # operator sees an aborted (resumable) build, not a hollow "finished".
+            with lock:
+                st["feed_error"] = f"{type(e).__name__}: {e}"
+                st["stop"] = True
+            log.exception("chunk feeder died mid-run — stopping the run (resumable)")
         finally:
             fcon.close()
             # The scan summary answers "is the feeder starving the pool?" in one
@@ -3521,8 +3538,11 @@ def _distill_pipeline(store, kb, extractors, verifiers, embedder, cfg, *, limit=
                             ch, reg, gen, narr = b
                             with lock:
                                 st["vfail"] += 1
-                            write_q.put((ch, reg, gen, narr,
-                                         _precompute_node_embeds(embedder, gen)))
+                            if not _put(write_q, (ch, reg, gen, narr,
+                                                  _precompute_node_embeds(embedder, gen),
+                                                  None),
+                                        lambda: not st["stop"]):
+                                return
                     log.warning("verifier on %s failed a batch (%s) — requeued %d, "
                                 "passed %d through unverified%s", vlm.url, e, requeued,
                                 len(batch) - requeued,
@@ -3553,9 +3573,23 @@ def _distill_pipeline(store, kb, extractors, verifiers, embedder, cfg, *, limit=
                             st["rejected"] += vs["rejected"]
                             st["adjusted"] += vs["adjusted"]
                             st["vfail"] += vs["failed"]
+                    # Domain lenses HERE, on the verify tier — the big model, which is
+                    # contractually the lens model in this path.  The writer used to run
+                    # them serially per structured window under the write lock: the same
+                    # serial-lane gate 562efd5 removed from the single-tier path, and the
+                    # lock-stretch that starved the feeder's connection.  None (a failed
+                    # prefetch) → the writer falls back to its own lens legs as before.
+                    try:
+                        typed = _prefetch_domain(vlm, ch)
+                    except BackendUnavailable:
+                        typed = None
                     # embed the bulk off the writer (this parallel stage), per chunk.
                     ecache = _precompute_node_embeds(embedder, gen)
-                    write_q.put((ch, reg, gen, narr, ecache))
+                    if typed:
+                        ecache = {**ecache, **_precompute_domain_embeds(embedder, typed)}
+                    if not _put(write_q, (ch, reg, gen, narr, ecache, typed),
+                                lambda: not st["stop"]):
+                        return
         finally:
             with lock:
                 st["verify_alive"] -= 1
@@ -3566,19 +3600,20 @@ def _distill_pipeline(store, kb, extractors, verifiers, embedder, cfg, *, limit=
             got = _get(write_q, lambda: verify_done.is_set())
             if got is None:
                 return
-            ch, reg, gen, narr, ecache = got
+            ch, reg, gen, narr, ecache, typed = got
             emb = _CacheEmbedder(embedder, ecache) if ecache else embedder
             # reconciliation's 5-way is big-LM work; when the 3090 is leased, write with
             # lm=None so the writer keeps moving (edges insert unadjudicated, mergeable later).
             rlm = None if lm_lease.is_held(lm_lease.BIG, cfg) else reconcile_lm
             # The writer must NEVER die silently: it is the only thread that marks
             # work done, so an uncaught exception here (a write-side LM leg — the
-            # 5-way, a domain-card lens — or the embedder) let extract/verify churn
+            # 5-way, or a lens fallback — or the embedder) let extract/verify churn
             # for hours with NOTHING landing, which read as "not resumable".
             try:
                 with kb.batch():                      # one transaction / fsync per chunk
                     nc, nr, ncard = distill_chunk(kb, rlm, emb, ch, gen,
-                                                  source_regime=reg, narrative=narr)
+                                                  source_regime=reg, narrative=narr,
+                                                  domain_typed=typed)
                     _mark_done(kb, ch)                # truncated → recard recovers cards
                 wfail = 0
             except Exception as e:
@@ -3587,12 +3622,14 @@ def _distill_pipeline(store, kb, extractors, verifiers, embedder, cfg, *, limit=
                         with kb.batch():
                             nc, nr, ncard = distill_chunk(kb, None, emb, ch, gen,
                                                           source_regime=reg,
-                                                          narrative=narr)
+                                                          narrative=narr,
+                                                          domain_typed=typed)
                             _mark_done(kb, ch)
                         wfail = 0
                         log.warning("writer: LM leg failed for chunk %s (%s) — landed "
-                                    "WITHOUT it (edges unadjudicated, domain cards "
-                                    "skipped)", ch.get("id"), e)
+                                    "WITHOUT it (edges unadjudicated%s)", ch.get("id"), e,
+                                    "; prefetched domain cards kept" if typed
+                                    else ", domain cards skipped")
                     except Exception as e2:
                         wfail += 1
                         log.warning("writer: chunk %s failed to land (%s) — left for "
@@ -3648,7 +3685,15 @@ def _distill_pipeline(store, kb, extractors, verifiers, embedder, cfg, *, limit=
                     "on the survivors.  Raise the timeout knobs or lower distill_parallel "
                     "if this recurs.", st["ex_dropped"], len(ex_threads),
                     st["vf_dropped"], len(vf_threads))
-    if st["done"] == 0 and st["extract_alive"] <= 0 and st["skipped"] == 0:
+    if st.get("feed_error"):
+        raise BackendUnavailable(
+            f"the chunk feeder died mid-run ({st['feed_error']}) — the corpus was NOT "
+            "fully fed; the scratch is intact, re-run to resume")
+    # "All endpoints failed" must mean the workers actually DIED on failures — after the
+    # joins extract_alive is ALWAYS 0, so the old guard reduced to done==0 and skipped==0
+    # and a legitimately empty queue (a bundle pass with nothing pending, an all-furniture
+    # set) aborted with a misleading endpoint error instead of returning zeros.
+    if st["done"] == 0 and ex_threads and st["ex_dropped"] >= len(ex_threads):
         raise BackendUnavailable("all fast extractor endpoints failed")
     return {"chunks": st["done"], "units": st["units"],
             "concepts": st["concepts"], "relations": st["relations"],

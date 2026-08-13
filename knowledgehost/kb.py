@@ -1975,6 +1975,7 @@ class KB:
             "gaps": c("SELECT COUNT(*) FROM knowledge_gaps WHERE status='open'").fetchone()[0],
             "distilled_chunks": c("SELECT COUNT(*) FROM distilled_chunks").fetchone()[0],
             "recarded_chunks": c("SELECT COUNT(*) FROM recarded_chunks").fetchone()[0],
+            "zone_skipped_chunks": c("SELECT COUNT(*) FROM zone_skips").fetchone()[0],
         }
         self._counts_cache = (res, now)
         return res
