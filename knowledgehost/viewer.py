@@ -216,7 +216,13 @@ INDEX_HTML = """<!doctype html>
 <div id="cktip"></div>
 <script>
 const $ = s => document.querySelector(s);
-const esc = t => { const d = document.createElement('div'); d.textContent = t == null ? '' : t; return d.innerHTML; };
+// Quote-safe by hand: textContent→innerHTML escapes only &<> — fine for text nodes,
+// but esc() output is also interpolated into "quoted" attributes and 'single-quoted'
+// onclick strings, where an unescaped quote in a document title/bundle name breaks
+// out of the attribute (stored XSS via ingested third-party content).
+const esc = t => String(t == null ? '' : t)
+  .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
+  .replace(/"/g, '&quot;').replace(/'/g, '&#39;');
 const badge = t => `<span class="badge">${esc(t)}</span>`;
 
 // ── two-level nav: 6 groups over the (unchanged) leaf panels ─────────────────
@@ -264,7 +270,7 @@ function renderSubtabs(leaf) {
 // ── Help: tab intros from help.json + live import-format probes (/help) ─────
 let HELP = { help: {}, formats: [] };
 async function loadHelp() {
-  try { HELP = await (await fetch('/help')).json(); } catch (e) { /* keep empty */ }
+  try { HELP = await (await authFetch('/help')).json(); } catch (e) { /* keep empty */ }
   renderHelp(active);
 }
 function renderHelp(k) {

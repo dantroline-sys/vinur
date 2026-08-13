@@ -337,8 +337,10 @@ def _argv(command: str, args: dict) -> list:
             sv = str(val).strip()
             # Constrained charset: it becomes a CLI value (list form, no shell), but keep
             # it to identifier-like tokens so it can never look like a flag or path.
-            if sv and not all(ch.isalnum() or ch in "._-" for ch in sv):
-                raise ValueError(f"{command}: {key} must be alphanumeric (._- allowed)")
+            # ':' is allowed for the YYYY-MM-DDTHH:MM timestamps recard's before/since
+            # advertise (HELP documented them, then this check rejected them).
+            if sv and not all(ch.isalnum() or ch in "._-:" for ch in sv):
+                raise ValueError(f"{command}: {key} must be alphanumeric (._-: allowed)")
             if sv:
                 out += [flag, sv]
         elif typ == "float":
@@ -389,6 +391,15 @@ class OpsRunner:
             if self.running():
                 return {"ok": False, "error": "a job is already running", "status": self.status()}
             argv = _argv(command, args or {})          # raises on anything invalid
+            # Close the previous job's log handle — it was held (never closed) in the
+            # replaced dict, one leaked fd per job until the server hit EMFILE under
+            # autopilot.  The child owns its own duplicated fd, so this is always safe.
+            old = self._job
+            if old and old.get("logfh"):
+                try:
+                    old["logfh"].close()
+                except OSError:
+                    pass
             ts = time.strftime("%Y%m%d-%H%M%S")
             logfile = self.logdir / f"{command}-{ts}.log"
             lf = open(logfile, "wb", buffering=0)

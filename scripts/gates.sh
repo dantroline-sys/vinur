@@ -72,6 +72,10 @@ run "psalm reconcile"    ""     "$PY" tests/psalms_test.py
 run "graph reasoning"    ""     "$PY" tests/reason_test.py
 run "investigate battery" ""    "$PY" tests/investigate_test.py
 run "job progress"       ""     "$PY" tests/ops_progress_test.py
+run "ops annotate"       ""     "$PY" tests/ops_annotate_test.py
+run "conflict §11"       ""     "$PY" tests/conflict_acceptance.py
+run "lex §11"            ""     "$PY" tests/lex_acceptance.py
+run "stat §11"           ""     "$PY" tests/stat_acceptance.py
 run "ship battery"      ""     "$PY" tests/ship_test.py
 run "minimal battery"   ""     "$PY" tests/minimal_test.py
 run "G-8 broker size"   ""     "$PY" - <<'EOF'

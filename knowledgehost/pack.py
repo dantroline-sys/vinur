@@ -621,6 +621,19 @@ def collection_preview(cfg: dict, target: str, bundle: str, doc: str = "") -> di
     return out
 
 
+def _answers_sig(answers) -> str:
+    """Stable signature of the confirm answers a document was collected WITH ('' for a
+    plain collect).  Rides the manifest next to doc_hashes so the unchanged-doc fast
+    path re-engages only for the same bytes AND the same confirmation."""
+    if not answers:
+        return ""
+    try:
+        return hashlib.sha1(json.dumps(answers, sort_keys=True, default=str)
+                            .encode()).hexdigest()[:16]
+    except Exception:
+        return "?"
+
+
 def add_to_collection(cfg: dict, doc: str, target: str, bundle: str, *,
                       license_override: str = "", allow_unlicensed: bool = False,
                       force: bool = False, dry_run: bool = False, log_fn=None,
@@ -665,7 +678,13 @@ def add_to_collection(cfg: dict, doc: str, target: str, bundle: str, *,
                       for t in bundles.KNOWLEDGE_TABLES if bundles._has_table(con, t)}
         finally:
             con.close()
-        if (man.get("doc_hashes") or {}).get(str(src)) == _content_hash(str(src)):
+        # Unchanged means the BYTES and the CONFIRMATION both match: same file
+        # re-collected with a newly confirmed structured profile must rebuild
+        # (it used to no-op silently unless the user knew to pass --force).
+        # Manifests from before doc_answers existed treat the prior sig as ''.
+        if ((man.get("doc_hashes") or {}).get(str(src)) == _content_hash(str(src))
+                and (man.get("doc_answers") or {}).get(str(src), "")
+                == _answers_sig(answers)):
             say(f"collect: {src.name} is already in {tgt.name} and unchanged — "
                 "nothing to do (pass --force to rebuild it anyway)")
             _emit(report, "done", created=False, added={}, target=str(tgt),
@@ -691,6 +710,23 @@ def add_to_collection(cfg: dict, doc: str, target: str, bundle: str, *,
 
     build = Path(cfg.get("pack_build_dir") or "var/packs/build") / f"collect-{bundle_slug}"
     build.mkdir(parents=True, exist_ok=True)
+    # The scratch is keyed by bundle, so an INCOMPLETE collect's leftovers (kept by
+    # design for resume) would otherwise ride into the next collect that shares the
+    # bundle name but aims at a DIFFERENT file — merging document A's content (and
+    # licences) into B's exported .kdb.  A target marker scopes resume to one file:
+    # same target resumes; a different target starts clean.
+    marker = build / ".target"
+    try:
+        prev_tgt = marker.read_text().strip() if marker.is_file() else ""
+        if prev_tgt and prev_tgt != str(tgt):
+            say(f"collect: scratch at {build.name} belongs to an unfinished collect into "
+                f"{Path(prev_tgt).name} — starting clean for {tgt.name} (that resume is "
+                "forfeited; re-run its collect to finish it)")
+            for p in build.iterdir():
+                (shutil.rmtree if p.is_dir() else os.remove)(p)
+        marker.write_text(str(tgt))
+    except OSError as e:
+        log.warning("collect: could not scope the scratch to its target (%s) — continuing", e)
     scfg = scratch_cfg(cfg, build, src)
     say(f"collect: clean-room build at {build} (your master KB is untouched)")
     stats = _pipeline(scfg, src, say, label="collect", report=report, profile=profile)
@@ -748,16 +784,20 @@ def add_to_collection(cfg: dict, doc: str, target: str, bundle: str, *,
         # build that couldn't FINISH records nothing new, or the fast path would
         # skip its own resume.
         from .ingest import _content_hash
-        hashes = dict((bundles.read_manifest(dst) or {}).get("doc_hashes") or {})
+        man0 = bundles.read_manifest(dst) or {}
+        hashes = dict(man0.get("doc_hashes") or {})
+        sigs = dict(man0.get("doc_answers") or {})
         if complete:
             for r in rows:
                 d = r.get("doc_id") or ""
                 if d and os.path.isfile(d):
                     try:
                         hashes[d] = _content_hash(d)
+                        sigs[d] = _answers_sig(answers)
                     except OSError:
                         pass
-        return {"doc_hashes": hashes, "shareable": bool(g["shareable"])}
+        return {"doc_hashes": hashes, "doc_answers": sigs,
+                "shareable": bool(g["shareable"])}
 
     if created:
         shutil.copyfile(kdb, tmp)                       # fresh file = the export itself

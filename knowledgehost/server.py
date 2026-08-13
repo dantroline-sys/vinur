@@ -445,6 +445,11 @@ class Handler(BaseHTTPRequestHandler):
                 return self._send_json({"ok": True, **json.loads(res["result"])})
             return self._send_json(res)
         if path == "/help":                        # viewer: tab help + import/dataset probes
+            # Auth-gated: the payload's dataset probes carry raw config filesystem
+            # paths + exists-flags.  Serving it pre-auth contradicted the README's
+            # "Bearer on every control route" and leaked paths to any LAN client.
+            if not self._authed():
+                return self._send_json({"ok": False, "error": "unauthorized"}, 401)
             return self._send(json.dumps(
                 _help_payload(self.cfg, getattr(self.server, "kb", None))).encode())
         if path == "/tools":
