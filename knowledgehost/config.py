@@ -239,6 +239,13 @@ DEFAULTS = {
     # The `dedupe` op does the same sweep over what's already stored, and can
     # also hunt near-duplicates.
     "distill_dedupe": True,
+    # Structured units (per-verse / per-section chunks) are grouped into windows of
+    # about this many tokens for DISTILLATION — one LM extraction per chapter-sized
+    # window instead of three calls per 25-word verse (a whole bible ≈ 100k calls
+    # without this; ~3k with).  Chunks/citations/reading are untouched; every unit
+    # in a landed window is marked distilled, so resume regroups only what's left.
+    # 0 disables (back to one extraction per unit).
+    "distill_unit_window_tokens": 700,
     # link_to_node identity policy (§9.4): bias toward NOT merging (under-merge is
     # recoverable, over-merge is destructive).
     "node_sim_high": 0.86,    # ≥ this + alias agreement => same node
@@ -678,7 +685,7 @@ EDITABLE_SETTINGS = frozenset({
     # distillation budgets & the verify pipeline (not URLs/models)
     "verify", "verify_timeout_s", "verify_max_tokens", "verify_batch", "verify_source_chars",
     "extract_timeout_s", "extract_max_tokens", "distill_timeout_s", "distill_max_tokens",
-    "distill_parallel", "distill_skip_zones",
+    "distill_parallel", "distill_skip_zones", "distill_unit_window_tokens",
     # telemetry cadence/retention (restart to apply; not the db path)
     "stats_interval_s", "stats_keep_days",
 

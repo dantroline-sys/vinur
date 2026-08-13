@@ -222,16 +222,17 @@ def merge_db(src: sqlite3.Connection, dst: sqlite3.Connection,
 
 # ── manifest: a .kdb file's self-description ─────────────────────────────────
 def write_manifest(dst: sqlite3.Connection, bundle: str, counts: dict,
-                   cfg: dict) -> None:
+                   cfg: dict, extra: dict | None = None) -> None:
     """Single-row JSON manifest inside a bundle file: what it is, when it was
     exported, and which embed model produced its node vectors (an importer on a
-    different model strips the vectors and re-embeds)."""
+    different model strips the vectors and re-embeds).  `extra` merges additional
+    keys in (e.g. collect's doc_hashes — readers ignore keys they don't know)."""
     dst.execute("CREATE TABLE IF NOT EXISTS bundle_manifest(json TEXT)")
     dst.execute("DELETE FROM bundle_manifest")
     dst.execute("INSERT INTO bundle_manifest(json) VALUES(?)", (json.dumps({
         "format": 1, "name": bundle, "created": time.time(),
         "embed_model": cfg.get("embed_model") or "",
-        "counts": counts}),))
+        "counts": counts, **(extra or {})}),))
 
 
 def read_manifest(conn: sqlite3.Connection) -> dict | None:

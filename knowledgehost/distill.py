@@ -1362,14 +1362,16 @@ class DistillProgress:
         return q
 
     # ── ticks ────────────────────────────────────────────────────────────────
-    def tick(self, doc=None, **counters) -> None:
-        """One chunk finished (written to the KB)."""
+    def tick(self, doc=None, n=1, **counters) -> None:
+        """One chunk finished (written to the KB).  `n` > 1 when the chunk was a
+        WINDOW over n structured units — the survey counted units, so the bar
+        advances by units either way."""
         with self._lock:
-            self.step += 1
+            self.step += int(n or 1)
             if doc:
                 self.cur = doc
                 if doc in self.docs:
-                    self.docs[doc] = max(0, self.docs[doc] - 1)
+                    self.docs[doc] = max(0, self.docs[doc] - int(n or 1))
             for k, v in counters.items():
                 self.counters[k] = self.counters.get(k, 0) + int(v or 0)
             self._fire()
@@ -1485,7 +1487,7 @@ def distill_chunk(kb, lm, embedder, chunk: dict, extraction=None,
         # card, not one per raw source.  Runs even when the generic pass found no
         # concepts (a behavioural answer can be all playbook, no encyclopedia).
         hint = (str(chunk.get("card_type") or "")).strip().lower()
-        if (vinkona and hint in TYPED_CARD_TYPES
+        if (vinkona and lm is not None and hint in TYPED_CARD_TYPES
                 and (chunk.get("section") or "").strip().lower() == "answer"):
             ncard += _distil_typed(kb, lm, embedder, chunk, hint,
                                    chunk.get("context_features") or {},
@@ -2281,7 +2283,11 @@ def _distil_domain(kb, lm, embedder, chunk, card_types, nodemap, doc_id,
                    claim_regime, claim_scope) -> int:
     """Extract the domain cards a structured unit supports (theme/parallel for scripture;
     definition/obligation/exception for legal).  Returns the number of cards stored; a
-    type the text doesn't support yields nothing.  BackendUnavailable propagates."""
+    type the text doesn't support yields nothing.  BackendUnavailable propagates.
+    lm=None (a leased/downed write-side LM) skips the lenses instead of crashing the
+    writer — the concepts still land; the cards for this chunk are foregone."""
+    if lm is None:
+        return 0
     locator = (chunk.get("section") or "").strip()       # the canonical key (bible:… / usc:…)
     made = 0
     for card_type in card_types:
@@ -2586,12 +2592,112 @@ def _pending_chunks(store, kb, counter, bundle=None, cfg=None):
         yield ch
 
 
+# ── structured-unit windows ──────────────────────────────────────────────────
+# A structured ingest stores ONE CHUNK PER CANONICAL UNIT (a verse, a section) —
+# right for retrieval, citations and parallel reading, ruinous for distillation:
+# the DRB is ~35,600 verse chunks, and at (1 generic + 2 domain-card) LM calls
+# per chunk a collect paid ~107,000 LM calls for a 4 MB text — six hours on a
+# 96 GB card.  A 25-word verse also gives the extractor almost no context.
+#
+# So the DISTILLER groups consecutive units from the same document+chapter into
+# one window near `distill_unit_window_tokens`, each unit's text prefixed with
+# its citation key so evidence stays attributable; the window's `section` is the
+# canonical RANGE (bible:Gen.1.1-31) so domain cards still locate precisely.
+# ~30x fewer LM calls, and a theme card grounded in a whole chapter instead of
+# one verse.  The chunks themselves are untouched — every member is marked
+# distilled when its window lands, so resume regroups only what is left.
+_STRUCTURED_TYPES = frozenset({"scripture", "legal"})
+
+
+def _window_key(ch) -> tuple | None:
+    """(doc, chapter) when this chunk is a groupable structured unit, else None.
+    The chapter is the section key with its final unit ordinal peeled off:
+    bible:Gen.1.5 → bible:Gen.1 ; usc:17/106 → usc:17."""
+    st = (ch.get("source_type") or "").strip().lower()
+    if st not in _STRUCTURED_TYPES:
+        return None
+    sec = (ch.get("section") or "").strip()
+    if not sec:
+        return None
+    m = re.match(r"^(.+?)[./:]\d+\w?$", sec)
+    return (ch.get("path_or_url") or ch.get("id"), m.group(1) if m else sec)
+
+
+def _unit_citation(section: str) -> str:
+    """The inline tag a unit wears inside its window: the key minus the work
+    prefix (bible:Gen.1.5 → Gen.1.5) — short, and exactly what citations use."""
+    return section.split(":", 1)[-1] if ":" in section else section
+
+
+def _make_window(buf: list) -> dict:
+    """One synthetic distillation chunk from consecutive units.  Its id is the
+    FIRST member's id (a real chunk id, so provenance rows stay valid) and
+    `_members` carries every unit to be marked done when the window lands."""
+    if len(buf) == 1:
+        return buf[0]
+    first = buf[0]
+    secs = [(c.get("section") or "").strip() for c in buf]
+    w = dict(first)
+    w["text"] = "\n".join(f"[{_unit_citation(s)}] {(c.get('text') or '').strip()}"
+                          for s, c in zip(secs, buf))
+    w["tokens"] = sum(int(c.get("tokens") or 0) for c in buf)
+    tail = re.search(r"(\d+\w?)$", secs[-1])
+    w["section"] = f"{secs[0]}-{tail.group(1)}" if tail else secs[0]
+    w["_members"] = [c["id"] for c in buf]
+    froms = [c["_recard_from"] for c in buf if "_recard_from" in c]
+    if froms:
+        w["_recard_from"] = min(froms)
+    return w
+
+
+def _windowed(chunks, cfg):
+    """Group consecutive structured units into distillation windows; everything
+    else passes straight through.  `distill_unit_window_tokens` ≤ 0 disables."""
+    win = int((cfg or {}).get("distill_unit_window_tokens", 700) or 0)
+    if win <= 0:
+        yield from chunks
+        return
+    buf: list = []
+    key = None
+    buf_tok = 0
+    for ch in chunks:
+        k = _window_key(ch)
+        if k is None:
+            if buf:
+                yield _make_window(buf)
+                buf, key, buf_tok = [], None, 0
+            yield ch
+            continue
+        tok = int(ch.get("tokens") or 0) or max(1, len(ch.get("text") or "") // 4)
+        if buf and (k != key or buf_tok + tok > win):
+            yield _make_window(buf)
+            buf, buf_tok = [], 0
+        buf.append(ch)
+        key = k
+        buf_tok += tok
+    if buf:
+        yield _make_window(buf)
+
+
+def _mark_done(kb, chunk) -> None:
+    """Mark a finished chunk — or every unit of a finished window — distilled
+    (+ recarded unless its cards were truncated away)."""
+    for cid in chunk.get("_members") or [chunk["id"]]:
+        kb.mark_distilled(cid)
+        if not chunk.get("_cards_truncated"):
+            kb.mark_recarded(cid, RECARD_VERSION)
+
+
+def _units(chunk) -> int:
+    return len(chunk.get("_members") or (chunk["id"],))
+
+
 def _distill_sequential(store, kb, lm, embedder, cfg, *, limit=None, bundle=None,
                         progress=None) -> dict:
-    done = concepts = relations = cards = failed = 0
+    done = units = concepts = relations = cards = failed = 0
     skipped = [0, 0, 0, 0]
     every = cfg["ingest_log_every"]
-    for chunk in _pending_chunks(store, kb, skipped, bundle=bundle, cfg=cfg):
+    for chunk in _windowed(_pending_chunks(store, kb, skipped, bundle=bundle, cfg=cfg), cfg):
         reg = regime_for_path(cfg, chunk.get("path_or_url") or chunk.get("id"))
         tries = 0
         nc = None
@@ -2600,11 +2706,10 @@ def _distill_sequential(store, kb, lm, embedder, cfg, *, limit=None, bundle=None
                 with kb.batch():                      # one transaction / fsync per chunk
                     nc, nr, ncard = distill_chunk(kb, lm, embedder, chunk,
                                                   source_regime=reg)
-                    kb.mark_distilled(chunk["id"])    # parse-fail counts as done (0) → progress
-                    if not chunk.get("_cards_truncated"):
-                        kb.mark_recarded(chunk["id"], RECARD_VERSION)  # families extracted inline
-                    # else: cards were truncated away — leave recard-eligible so the
-                    # cards-only pass recovers them (concepts already landed).
+                    # parse-fail counts as done (0) → progress; a truncated chunk keeps
+                    # its distil stamp but stays recard-eligible so the cards-only pass
+                    # recovers it (concepts already landed).
+                    _mark_done(kb, chunk)
                 break
             except BackendUnavailable as e:
                 if e.permanent:                       # this chunk is unservable — skip IT,
@@ -2619,18 +2724,20 @@ def _distill_sequential(store, kb, lm, embedder, cfg, *, limit=None, bundle=None
         if nc is None:
             continue
         done += 1
+        units += _units(chunk)
         concepts += nc
         relations += nr
         cards += ncard
         if progress:
-            progress.tick(chunk.get("path_or_url"), concepts=nc, relations=nr, cards=ncard)
+            progress.tick(chunk.get("path_or_url"), n=_units(chunk),
+                          concepts=nc, relations=nr, cards=ncard)
         if every and done % every == 0:
             log.info("… distilled %d chunks / %d concepts / %d relations / %d cards (%d done) %s",
                      done, concepts, relations, cards, skipped[0], _stage_line())
         if limit and done >= limit:
             break
-    return {"chunks": done, "concepts": concepts, "relations": relations, "cards": cards,
-            "skipped": skipped[0], "skipped_zone": skipped[1],
+    return {"chunks": done, "units": units, "concepts": concepts, "relations": relations,
+            "cards": cards, "skipped": skipped[0], "skipped_zone": skipped[1],
             "skipped_dupe": skipped[2], "outside_bundle": skipped[3], "failed": failed}
 
 
@@ -2663,7 +2770,12 @@ def _distill_parallel(store, kb, lms, embedder, cfg, *, limit=None, bundle=None,
         try:
             gen = lm.extract(chunk, regime)          # SLOW, off the lock, in parallel
             narr = lm.extract_narrative(chunk) if regime == "fictional" else None
-            return chunk, (gen, narr), lm, regime, None
+            # Embed the bulk HERE, still off the lock — the write below holds the one
+            # kb_lock, and embedding inside it serialised the whole pool (the pipeline
+            # path had this precompute; this path paid the network per node per chunk
+            # under the global lock).
+            ecache = _precompute_node_embeds(embedder, gen)
+            return chunk, (gen, narr, ecache), lm, regime, None
         except BackendUnavailable as e:
             return chunk, None, lm, regime, e        # caller decides: retry vs drop
 
@@ -2678,11 +2790,17 @@ def _distill_parallel(store, kb, lms, embedder, cfg, *, limit=None, bundle=None,
         src = kb.get_source(doc_id)
         return src.get("regime") if src else None
 
-    chunks = _pending_chunks(store, kb, skipped, bundle=bundle, cfg=cfg)
+    chunks = _windowed(_pending_chunks(store, kb, skipped, bundle=bundle, cfg=cfg), cfg)
     stop = False
-    failed = 0
+    units = failed = wfail = 0
     consec = {}                                      # id(lm) → consecutive failures
-    with ThreadPoolExecutor(max_workers=len(lms)) as ex:
+    # Manual executor lifecycle — the `finally` is the deadlock guard: whatever
+    # leaves this block (the all-endpoints-dead raise, or any unexpected exception),
+    # `alive` is cleared BEFORE the join, so extract jobs parked on pool.get() see
+    # it and exit.  A `with` block joins first and hangs forever on them — that was
+    # the six-hour "timed out" collect: an exception pending, workers unjoinable.
+    ex = ThreadPoolExecutor(max_workers=len(lms))
+    try:
         futures = set()
 
         def submit_next():
@@ -2739,20 +2857,54 @@ def _distill_parallel(store, kb, lms, embedder, cfg, *, limit=None, bundle=None,
                             pool.put(lm)             # transient — back into rotation
                 else:
                     consec[id(lm)] = 0
-                    gen, narr = payload              # generic + (fiction) narrative pass
+                    gen, narr, ecache = payload      # generic + narrative + off-lock embeds
                     pool.put(lm)                     # healthy — back into rotation
-                    with kb_lock, kb.batch():
-                        nc, nr, ncard = distill_chunk(kb, writer_lm, embedder, chunk,
-                                                      gen, source_regime=regime, narrative=narr)
-                        kb.mark_distilled(chunk["id"])
-                        if not chunk.get("_cards_truncated"):   # truncated → recard recovers
-                            kb.mark_recarded(chunk["id"], RECARD_VERSION)
+                    emb = _CacheEmbedder(embedder, ecache) if ecache else embedder
+                    # The write itself can call the LM (reconciliation's 5-way; the
+                    # domain-card lenses on a scripture/legal chunk) — and it runs in
+                    # THIS thread.  A BackendUnavailable here used to propagate out of
+                    # the loop and DEADLOCK the executor exit (workers waiting on pool
+                    # slots are joined forever): Dan's six-hour "timed out" collect.
+                    # Now: retry once WITHOUT the write-side LM (concepts still land,
+                    # cards/adjudication deferred), and only then fail the chunk.
+                    try:
+                        with kb_lock, kb.batch():
+                            nc, nr, ncard = distill_chunk(kb, writer_lm, emb, chunk, gen,
+                                                          source_regime=regime,
+                                                          narrative=narr)
+                            _mark_done(kb, chunk)    # truncated → recard recovers cards
+                        wfail = 0
+                    except BackendUnavailable as e:
+                        try:
+                            with kb_lock, kb.batch():
+                                nc, nr, ncard = distill_chunk(kb, None, emb, chunk, gen,
+                                                              source_regime=regime,
+                                                              narrative=narr)
+                                _mark_done(kb, chunk)
+                            wfail = 0
+                            log.warning("write-side LM failed for chunk %s (%s) — "
+                                        "landed WITHOUT it (edges unadjudicated, "
+                                        "domain cards skipped)", chunk.get("id"), e)
+                        except Exception:
+                            failed += 1
+                            wfail += 1
+                            log.warning("chunk %s failed to land (%s) — left "
+                                        "un-distilled for the next run",
+                                        chunk.get("id"), e)
+                            if wfail >= _WORKER_MAX_CONSEC:
+                                log.error("%d consecutive write failures — the write "
+                                          "side is down; stopping (resumable)", wfail)
+                                stop = True
+                            if not stop:
+                                submit_next()
+                            continue
                     done += 1
+                    units += _units(chunk)
                     concepts += nc
                     relations += nr
                     cards += ncard
                     if progress:
-                        progress.tick(chunk.get("path_or_url"),
+                        progress.tick(chunk.get("path_or_url"), n=_units(chunk),
                                       concepts=nc, relations=nr, cards=ncard)
                     if every and done % every == 0:
                         log.info("… distilled %d chunks / %d concepts / %d relations / "
@@ -2762,8 +2914,12 @@ def _distill_parallel(store, kb, lms, embedder, cfg, *, limit=None, bundle=None,
                         stop = True
                 if not stop and not resubmitted:
                     submit_next()
-    return {"chunks": done, "concepts": concepts, "relations": relations, "cards": cards,
-            "skipped": skipped[0], "skipped_zone": skipped[1],
+    finally:
+        stop = True
+        alive.clear()             # wake extract jobs parked on pool.get → joinable
+        ex.shutdown(wait=True)
+    return {"chunks": done, "units": units, "concepts": concepts, "relations": relations,
+            "cards": cards, "skipped": skipped[0], "skipped_zone": skipped[1],
             "skipped_dupe": skipped[2], "outside_bundle": skipped[3], "failed": failed}
 
 
@@ -2923,10 +3079,13 @@ def recard_corpus(store, kb, lms, embedder, cfg, *, limit=None, bundle=None,
         except BackendUnavailable as e:
             return chunk, None, lm, regime, families, e   # caller decides: retry vs drop
 
-    chunks = _pending_recard_chunks(store, kb, skipped, bundle=bundle, cfg=cfg,
-                                    before=before, since=since)
+    chunks = _windowed(_pending_recard_chunks(store, kb, skipped, bundle=bundle, cfg=cfg,
+                                              before=before, since=since), cfg)
     stop = False
-    with ThreadPoolExecutor(max_workers=len(lms)) as ex:
+    # Manual lifecycle, same deadlock guard as _distill_parallel: clear `alive`
+    # BEFORE the join, or jobs parked on pool.get() hang the shutdown forever.
+    ex = ThreadPoolExecutor(max_workers=len(lms))
+    try:
         futures = set()
 
         def submit_next():
@@ -2937,7 +3096,8 @@ def recard_corpus(store, kb, lms, embedder, cfg, *, limit=None, bundle=None,
                 fams = families_for(ch)
                 if _recard_system(ch, reg, fams) is None:
                     with kb_lock:                     # fiction, or nothing NEW for
-                        kb.mark_recarded(ch["id"], RECARD_VERSION)  # this regime:
+                        for cid in ch.get("_members") or [ch["id"]]:   # this regime:
+                            kb.mark_recarded(cid, RECARD_VERSION)
                     no_menu[0] += 1                   # stamp without an LM call
                     continue
                 futures.add(ex.submit(job, ch, reg, fams))
@@ -2987,7 +3147,8 @@ def recard_corpus(store, kb, lms, embedder, cfg, *, limit=None, bundle=None,
                     pool.put(lm)                      # healthy — back into rotation
                     with kb_lock, kb.batch():
                         cards += _recard_store(kb, embedder, chunk, extras)
-                        kb.mark_recarded(chunk["id"], RECARD_VERSION)  # parse-fail marks too
+                        for cid in chunk.get("_members") or [chunk["id"]]:
+                            kb.mark_recarded(cid, RECARD_VERSION)  # parse-fail marks too
                     done += 1
                     if every and done % every == 0:
                         log.info("… recarded %d chunks / %d cards (%d ineligible) %s",
@@ -2996,6 +3157,10 @@ def recard_corpus(store, kb, lms, embedder, cfg, *, limit=None, bundle=None,
                         stop = True
                 if not stop and not resubmitted:
                     submit_next()
+    finally:
+        stop = True
+        alive.clear()             # wake jobs parked on pool.get → joinable
+        ex.shutdown(wait=True)
     res = {"chunks": done, "cards": cards, "no_menu": no_menu[0],
            "skipped": skipped[0], "skipped_zone": skipped[1],
            "skipped_recent": skipped[2], "failed": failed}
@@ -3061,7 +3226,7 @@ def _distill_pipeline(store, kb, extractors, verifiers, embedder, cfg, *, limit=
     extract_done = threading.Event()
     verify_done = threading.Event()
     lock = threading.Lock()
-    st = {"done": 0, "concepts": 0, "relations": 0, "cards": 0, "skipped": 0,
+    st = {"done": 0, "units": 0, "concepts": 0, "relations": 0, "cards": 0, "skipped": 0,
           "skipped_zone": 0, "skipped_dupe": 0, "outside_bundle": 0,
           "rejected": 0, "adjusted": 0, "vfail": 0, "failed": 0, "fed": 0,
           "ex_dropped": 0, "vf_dropped": 0,
@@ -3072,10 +3237,11 @@ def _distill_pipeline(store, kb, extractors, verifiers, embedder, cfg, *, limit=
 
     def feeder():
         fcon = sqlite3.connect(cfg["kb_path"])        # own read connection (WAL: safe)
-        try:
+
+        def pending():
             for ch in store.iter_chunks():
                 if st["stop"]:
-                    break
+                    return
                 if bundle is not None and _chunk_bundle(ch) != bundle:
                     with lock:
                         st["outside_bundle"] += 1
@@ -3120,6 +3286,12 @@ def _distill_pipeline(store, kb, extractors, verifiers, embedder, cfg, *, limit=
                         with lock:
                             st["skipped_dupe"] += 1
                         continue
+                yield ch
+
+        try:
+            # structured units are grouped into distillation windows HERE, after the
+            # per-chunk skip/dedupe accounting, so a window never hides a duplicate
+            for ch in _windowed(pending(), cfg):
                 doc = ch.get("path_or_url") or ch.get("id")
                 reg = regime_for_path(cfg, doc)
                 if not reg:
@@ -3285,6 +3457,7 @@ def _distill_pipeline(store, kb, extractors, verifiers, embedder, cfg, *, limit=
                 st["verify_alive"] -= 1
 
     def writer():
+        wfail = 0                                     # CONSECUTIVE failed landings
         while True:
             got = _get(write_q, lambda: verify_done.is_set())
             if got is None:
@@ -3294,16 +3467,51 @@ def _distill_pipeline(store, kb, extractors, verifiers, embedder, cfg, *, limit=
             # reconciliation's 5-way is big-LM work; when the 3090 is leased, write with
             # lm=None so the writer keeps moving (edges insert unadjudicated, mergeable later).
             rlm = None if lm_lease.is_held(lm_lease.BIG, cfg) else reconcile_lm
-            with kb.batch():                          # one transaction / fsync per chunk
-                nc, nr, ncard = distill_chunk(kb, rlm, emb, ch, gen,
-                                              source_regime=reg, narrative=narr)
-                kb.mark_distilled(ch["id"])
-                if not ch.get("_cards_truncated"):            # truncated → recard recovers
-                    kb.mark_recarded(ch["id"], RECARD_VERSION)   # families extracted inline
+            # The writer must NEVER die silently: it is the only thread that marks
+            # work done, so an uncaught exception here (a write-side LM leg — the
+            # 5-way, a domain-card lens — or the embedder) let extract/verify churn
+            # for hours with NOTHING landing, which read as "not resumable".
+            try:
+                with kb.batch():                      # one transaction / fsync per chunk
+                    nc, nr, ncard = distill_chunk(kb, rlm, emb, ch, gen,
+                                                  source_regime=reg, narrative=narr)
+                    _mark_done(kb, ch)                # truncated → recard recovers cards
+                wfail = 0
+            except Exception as e:
+                if isinstance(e, BackendUnavailable) and rlm is not None:
+                    try:                              # retry once WITHOUT the LM legs
+                        with kb.batch():
+                            nc, nr, ncard = distill_chunk(kb, None, emb, ch, gen,
+                                                          source_regime=reg,
+                                                          narrative=narr)
+                            _mark_done(kb, ch)
+                        wfail = 0
+                        log.warning("writer: LM leg failed for chunk %s (%s) — landed "
+                                    "WITHOUT it (edges unadjudicated, domain cards "
+                                    "skipped)", ch.get("id"), e)
+                    except Exception as e2:
+                        wfail += 1
+                        log.warning("writer: chunk %s failed to land (%s) — left for "
+                                    "the next run", ch.get("id"), e2)
+                else:
+                    wfail += 1
+                    log.exception("writer: chunk %s failed to land — left for the "
+                                  "next run", ch.get("id"))
+                if wfail:
+                    with lock:
+                        st["failed"] += 1
+                        if wfail >= _WORKER_MAX_CONSEC:
+                            log.error("writer: %d consecutive failed landings — the "
+                                      "write side is down; stopping the run "
+                                      "(resumable)", wfail)
+                            st["stop"] = True
+                    continue
             if progress:
-                progress.tick(ch.get("path_or_url"), concepts=nc, relations=nr, cards=ncard)
+                progress.tick(ch.get("path_or_url"), n=_units(ch),
+                              concepts=nc, relations=nr, cards=ncard)
             with lock:
                 st["done"] += 1
+                st["units"] += _units(ch)
                 st["concepts"] += nc
                 st["relations"] += nr
                 st["cards"] += ncard
@@ -3338,7 +3546,8 @@ def _distill_pipeline(store, kb, extractors, verifiers, embedder, cfg, *, limit=
                     st["vf_dropped"], len(vf_threads))
     if st["done"] == 0 and st["extract_alive"] <= 0 and st["skipped"] == 0:
         raise BackendUnavailable("all fast extractor endpoints failed")
-    return {"chunks": st["done"], "concepts": st["concepts"], "relations": st["relations"],
+    return {"chunks": st["done"], "units": st["units"],
+            "concepts": st["concepts"], "relations": st["relations"],
             "cards": st["cards"], "skipped": st["skipped"], "skipped_zone": st["skipped_zone"],
             "skipped_dupe": st["skipped_dupe"], "outside_bundle": st["outside_bundle"],
             "rejected": st["rejected"], "adjusted": st["adjusted"], "verify_failed": st["vfail"],

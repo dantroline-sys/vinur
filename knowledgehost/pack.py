@@ -643,6 +643,30 @@ def add_to_collection(cfg: dict, doc: str, target: str, bundle: str, *,
                 "created": not tgt.exists(), "current": prev.get("counts") or {},
                 "file_bundle": prev.get("file_bundle") or ""}
 
+    # Already collected, unchanged?  A finished collect records each document's
+    # content hash in the target's manifest — re-running the same collect against
+    # the same bytes must cost nothing, not a full clean-room rebuild (the merge
+    # was always idempotent; the WORK wasn't).  A changed file, a folder source,
+    # or --force goes the full route.
+    if tgt.exists() and not force and src.is_file():
+        from .ingest import _content_hash
+        con = bundles._connect(str(tgt))
+        try:
+            man = bundles.read_manifest(con) or {}
+            counts = {t: con.execute(f"SELECT COUNT(*) FROM {t}").fetchone()[0]
+                      for t in bundles.KNOWLEDGE_TABLES if bundles._has_table(con, t)}
+        finally:
+            con.close()
+        if (man.get("doc_hashes") or {}).get(str(src)) == _content_hash(str(src)):
+            say(f"collect: {src.name} is already in {tgt.name} and unchanged — "
+                "nothing to do (pass --force to rebuild it anyway)")
+            _emit(report, "done", created=False, added={}, target=str(tgt),
+                  bundle=bundle, complete=True, skipped=True)
+            return {"ok": True, "skipped": True, "unchanged": True, "target": str(tgt),
+                    "bundle": bundle, "created": False, "added": {}, "totals": counts,
+                    "shareable": bool(man.get("shareable", True)),
+                    "complete": True, "stats": {}}
+
     # a structured document (scripture/legal) that the user CONFIRMED is ingested one
     # canonical unit at a time; anything else takes the ordinary heading-chunk path.
     profile = None
@@ -703,13 +727,38 @@ def add_to_collection(cfg: dict, doc: str, target: str, bundle: str, *,
     if tmp.exists():
         tmp.unlink()
     created = not tgt.exists()
+    undistilled = stats.get("undistilled", 0)
+    recard_incomplete = bool(stats.get("recard_incomplete"))
+    single_tier = bool(stats.get("single_tier"))
+    recovered = (stats.get("recard") or {}).get("chunks", 0)
+    complete = undistilled == 0 and not recard_incomplete
+
+    def _man_extra(dst) -> dict:
+        # Record each collected document's content hash (plus the gate's verdict)
+        # so an unchanged re-collect can be answered from the FILE, without a
+        # clean-room rebuild.  Prior hashes are preserved across merges — but a
+        # build that couldn't FINISH records nothing new, or the fast path would
+        # skip its own resume.
+        from .ingest import _content_hash
+        hashes = dict((bundles.read_manifest(dst) or {}).get("doc_hashes") or {})
+        if complete:
+            for r in rows:
+                d = r.get("doc_id") or ""
+                if d and os.path.isfile(d):
+                    try:
+                        hashes[d] = _content_hash(d)
+                    except OSError:
+                        pass
+        return {"doc_hashes": hashes, "shareable": bool(g["shareable"])}
+
     if created:
         shutil.copyfile(kdb, tmp)                       # fresh file = the export itself
         dst = bundles._connect(str(tmp))
         try:
             totals = {t: dst.execute(f"SELECT COUNT(*) FROM {t}").fetchone()[0]
                       for t in bundles.KNOWLEDGE_TABLES if bundles._has_table(dst, t)}
-            bundles.write_manifest(dst, bundle, totals, cfg)   # re-stamp name=bundle
+            bundles.write_manifest(dst, bundle, totals, cfg,   # re-stamp name=bundle
+                                   extra=_man_extra(dst))
             dst.commit()
         finally:
             dst.close()
@@ -725,18 +774,13 @@ def add_to_collection(cfg: dict, doc: str, target: str, bundle: str, *,
             totals = {t: dst.execute(f"SELECT COUNT(*) FROM {t}").fetchone()[0] for t in tabs}
             # honest "added" = rows that were actually NEW (re-adding a doc → {} )
             added = {t: totals[t] - before[t] for t in tabs if totals[t] - before[t] > 0}
-            bundles.write_manifest(dst, bundle, totals, cfg)
+            bundles.write_manifest(dst, bundle, totals, cfg, extra=_man_extra(dst))
             dst.commit()
         finally:
             srcc.close()
             dst.close()
     os.replace(tmp, tgt)
 
-    undistilled = stats.get("undistilled", 0)
-    recard_incomplete = bool(stats.get("recard_incomplete"))
-    single_tier = bool(stats.get("single_tier"))
-    recovered = (stats.get("recard") or {}).get("chunks", 0)
-    complete = undistilled == 0 and not recard_incomplete
     # Keep the scratch when the build couldn't finish, so re-running the SAME collect
     # resumes distil/recard from the checkpoint and the rest merges in idempotently.
     if complete:
