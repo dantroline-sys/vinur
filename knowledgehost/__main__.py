@@ -1254,6 +1254,29 @@ def _run_reason(cfg, log, args) -> int:
     return 0 if res.get("ok") else 1
 
 
+def _run_investigate(cfg, log, args) -> int:
+    """`investigate "question…"`: iterative agentic graph reasoning from the CLI —
+    the serving LM tiers navigate and synthesise when up; with none up it degrades
+    to the engine's greedy walk and returns the evidence subgraph."""
+    import json
+    from . import investigate as inv_mod
+    q = " ".join(args.args or []).strip()
+    if not q:
+        log.error('investigate needs a question: investigate "how could X affect Y?"')
+        return 1
+    kb = KB(cfg)
+    try:
+        nav, syn = inv_mod.live_lms(cfg, log)
+        if nav is None:
+            log.warning("no LM endpoint up — greedy walk, evidence only (no synthesis)")
+        res = inv_mod.investigate(kb, cfg, q, navigator=nav, synthesizer=syn,
+                                  mode=getattr(args, "reasoning_mode", None))
+    finally:
+        kb.close()
+    print(json.dumps(res, indent=2, ensure_ascii=False))
+    return 0 if res.get("ok") else 1
+
+
 def _run_derive(cfg, log) -> int:
     """`derive`: rebuild the quarantined derived-reasoning layer + mine contradictions
     and sibling-completion gaps.  No LM; deterministic; safe to re-run."""
@@ -1321,7 +1344,7 @@ def main(argv=None):
                              "bundles", "split", "source", "scenario", "eval", "facetize",
                              "ingest-library", "rebuild-fts", "import-bundle", "eject-bundle",
                              "collect", "analyze", "citations", "psalms", "read",
-                             "reason", "derive", "clear-queue"])
+                             "reason", "derive", "investigate", "clear-queue"])
     # positional args for the modular-bundle verbs:
     #   source <doc_id> [--title ..] [--bundle ..]   scenario [name]   split [dir]
     #   import-bundle <file.kdb>     eject-bundle <bundle>
@@ -1558,6 +1581,8 @@ def main(argv=None):
         return _run_reason(cfg, log, args)
     if args.command == "derive":              # rebuild the quarantined derived layer
         return _run_derive(cfg, log)
+    if args.command == "investigate":         # iterative agentic graph reasoning
+        return _run_investigate(cfg, log, args)
 
     if args.command == "import-bundle":       # absorb a shipped brain into the master
         import json as _json

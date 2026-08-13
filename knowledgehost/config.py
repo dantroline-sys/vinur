@@ -286,6 +286,15 @@ DEFAULTS = {
     # override supported, so A/B needs no global flip.
     "reasoning_mode": "conservative",
     "reasoning_max_depth": 3,          # traversal bound for paths/effects
+    # Iterative agentic reasoning (kb_investigate / investigate.py): the LM WALKS the
+    # graph — a cheap navigator picks edges hop by hop, the big LM synthesises once,
+    # and the answer's claims are verified against the graph.  These bound the walk.
+    "investigate_max_hops": 4,
+    "investigate_beam": 6,             # frontier nodes carried between hops
+    "investigate_candidates": 14,      # edges offered to the navigator per hop
+    "investigate_evidence_cap": 24,    # evidence lines before synthesis is forced
+    "investigate_greedy_picks": 2,     # per-hop picks when no navigator LM is up
+    "investigate_navigator": "fast",   # fast | big — which tier picks edges
     "derive_max_edges": 20000,         # cap per derive run (wipe-and-rebuild)
     "derive_max_children": 40,         # is_a hubs above this don't inherit (over-general)
     "derive_sibling_frac": 0.8,        # siblings needing a relation before its absence is a gap

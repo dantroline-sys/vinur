@@ -125,6 +125,28 @@ REASON_TOOL = {
         "required": ["op", "a"]},
 }
 
+INVESTIGATE_TOOL = {
+    "name": "kb_investigate",
+    "description": (
+        "INVESTIGATE a question by walking the knowledge graph step by step: anchor on "
+        "the question's concepts, iteratively follow the most promising typed edges (a "
+        "navigator LM picks each hop — every fact in the result is an auditable edge), "
+        "then synthesise an answer grounded ONLY in the collected evidence, with its "
+        "claims fact-checked against the graph (contradicted → 'contested'). Slower "
+        "than kb_ask (several LM hops). Use it for MULTI-STEP questions whose answer "
+        "needs a chain of relations — mechanisms, indirect effects, 'would X affect "
+        "Y?' — not for simple lookups (kb_ask) or single relation checks (kb_reason). "
+        "Returns the answer plus the full evidence trail; abstains honestly when the "
+        "graph cannot carry the question."),
+    "parameters": {"type": "object", "properties": {
+        "question": {"type": "string", "description": "the question, in plain words"},
+        "mode": {"type": "string", "description":
+                 "conservative (observed edges only, default) | permissive (bounded "
+                 "derivations included, marked 'inferred')"},
+        "max_hops": {"type": "integer", "description": "walk depth (default 4)"}},
+        "required": ["question"]},
+}
+
 # Advertised only when the serving host wires itself in (Tools.catalogue) —
 # load/unload needs the live server's hot-swap, so the bare CLI can't offer it.
 BRAIN_TOOL = {
@@ -197,7 +219,7 @@ class Tools:
     def catalogue(self):
         tools = list(CATALOGUE)
         if self.kb is not None:                   # deterministic graph reasoning needs the KB
-            tools = tools + [REASON_TOOL]
+            tools = tools + [REASON_TOOL, INVESTIGATE_TOOL]
         if self.library_store is not None:        # only advertise it when a library is loaded
             tools = tools + [LIBRARY_TOOL]
         if self.brain_host is not None:           # only under a live server (needs hot-swap)
@@ -419,6 +441,21 @@ class Tools:
             return {"ok": False, "error": "structured KB not available"}
         from . import reason as reason_mod
         return reason_mod.query(self.kb, self.cfg, args)
+
+    def _t_kb_investigate(self, args):
+        """Iterative agentic graph reasoning (investigate.py): a navigator LM walks the
+        graph hop by hop, the big LM synthesises from the collected evidence, the graph
+        verifies the claims.  Degrades to a greedy evidence-only walk when no LM is up."""
+        if self.kb is None:
+            return {"ok": False, "error": "structured KB not available"}
+        question = (args.get("question") or "").strip()
+        if not question:
+            return {"ok": False, "error": "kb_investigate needs a question"}
+        from . import investigate as inv_mod
+        nav, syn = inv_mod.live_lms(self.cfg)
+        return inv_mod.investigate(self.kb, self.cfg, question,
+                                   navigator=nav, synthesizer=syn,
+                                   mode=args.get("mode"), max_hops=args.get("max_hops"))
 
     def _t_ops_annotate(self, args):
         """VINUR-OPS-01 §3 — batch id-join annotation for an external oracle's
