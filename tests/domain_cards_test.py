@@ -128,6 +128,96 @@ def main():
     sq = kb.db.execute("SELECT COUNT(*) FROM surface_questions WHERE target_kind='card'").fetchone()[0]
     check("domain cards get a retrieval surface question", sq >= 5)
 
+    # ── worker-side prefetch: the lenses leave the writer thread ─────────────
+    # (_prefetch_domain runs in the parallel path's workers so the single writer
+    # no longer pays 2 serial LM calls per scripture window — that lane, not
+    # extraction, gated the whole pass.)
+    pre = D._prefetch_domain(StubLM(), verse)
+    check("prefetch runs every scripture lens in the worker",
+          set(pre) == {"theme", "parallel"} and pre["theme"]["title"] == "God's love")
+    check("an unstructured chunk prefetches nothing (no wasted LM calls)",
+          D._prefetch_domain(StubLM(), {"source_type": "pdf", "text": "x"}) == {})
+    check("no LM → no prefetch (writer skips, exactly as before)",
+          D._prefetch_domain(None, verse) == {})
+
+    class FlakyLM(StubLM):
+        def extract_typed(self, chunk, card_type):
+            if card_type == "parallel":
+                raise ValueError("shape drift")
+            return _PAYLOADS[card_type]
+    pre_flaky = D._prefetch_domain(FlakyLM(), verse)
+    check("a lens that fails in the worker is marked None (skipped, not fatal)",
+          pre_flaky["theme"] and pre_flaky["parallel"] is None)
+
+    class DeadLM(StubLM):
+        def extract_typed(self, chunk, card_type):
+            raise D.BackendUnavailable("down")
+    try:
+        D._prefetch_domain(DeadLM(), verse)
+        ba_raised = False
+    except D.BackendUnavailable:
+        ba_raised = True
+    check("BackendUnavailable propagates (the whole job retries on another slot)",
+          ba_raised)
+
+    def _fresh(tag):
+        """Distinct payloads per landing — identical cards would dedupe, hiding the count."""
+        return {"theme": {**_PAYLOADS["theme"], "title": f"Theme {tag}",
+                          "concept": f"theme {tag}", "theme": f"motif {tag}",
+                          "statement": f"A statement about {tag}"},
+                "parallel": {**_PAYLOADS["parallel"], "title": f"Parallel {tag}",
+                             "concept": f"passage {tag}", "parallels": [f"Ref {tag}"]}}
+
+    _EMPTY_GEN = ([], [], [], [])                     # the writer always passes `extraction`
+
+    class MustNotCall(StubLM):
+        def extract_typed(self, chunk, card_type):
+            raise AssertionError("writer re-ran a lens the worker already paid for")
+    verse2 = dict(verse, id="v2", section="bible:John.3.17",
+                  text="For God sent not his Son into the world to condemn the world.")
+    before = kb.db.execute("SELECT COUNT(*) FROM procedure_cards").fetchone()[0]
+    D.distill_chunk(kb, MustNotCall(), StubEmbedder(), verse2,
+                    extraction=_EMPTY_GEN, domain_typed=_fresh("v2"))
+    after = kb.db.execute("SELECT COUNT(*) FROM procedure_cards").fetchone()[0]
+    check("prefetched lenses land through distill_chunk with NO writer LM call",
+          after == before + 2)
+
+    verse3 = dict(verse, id="v3", section="bible:John.3.18",
+                  text="He that believeth on him is not condemned.")
+    before = after
+    D.distill_chunk(kb, None, StubEmbedder(), verse3,
+                    extraction=_EMPTY_GEN, domain_typed=_fresh("v3"))
+    after = kb.db.execute("SELECT COUNT(*) FROM procedure_cards").fetchone()[0]
+    check("a downed write-side LM no longer costs the prefetched domain cards",
+          after == before + 2)
+
+    flaky_v4 = {**_fresh("v4"), "parallel": None}     # that lens failed in the worker
+    verse4 = dict(verse, id="v4", section="bible:John.3.19",
+                  text="And this is the condemnation, that light is come into the world.")
+    before = after
+    D.distill_chunk(kb, None, StubEmbedder(), verse4,
+                    extraction=_EMPTY_GEN, domain_typed=flaky_v4)
+    after = kb.db.execute("SELECT COUNT(*) FROM procedure_cards").fetchone()[0]
+    check("a worker-failed lens is skipped at landing (theme lands, parallel doesn't)",
+          after == before + 1)
+
+    # prefetched embeds mirror the writer's text formats EXACTLY — the writer
+    # serves every vector from the cache and never embeds live
+    class NoLiveEmbeds:
+        def embed_many(self, texts, kind="document"):
+            raise AssertionError(f"writer embedded live — prefetch text drifted: {texts!r}")
+        def embed_one(self, text, kind="document"):
+            raise AssertionError(f"writer embedded live — prefetch text drifted: {text!r}")
+    cache = D._precompute_domain_embeds(StubEmbedder(), pre)
+    cached_emb = D._CacheEmbedder(NoLiveEmbeds(), cache)
+    verse5 = dict(verse, id="v5", section="bible:John.3.20",
+                  text="For every one that doeth evil hateth the light.")
+    made = D._distil_domain(kb, None, cached_emb, verse5,
+                            D.DOMAIN_CARD_TYPES["scripture"], {}, "/x/john.txt",
+                            lambda item: "canonical", lambda reg: None,
+                            prefetched=pre)
+    check("prefetched embeds hit the cache — the writer never embeds live", made == 2)
+
     kb.close()
     print()
     if FAIL:

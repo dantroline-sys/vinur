@@ -1372,6 +1372,17 @@ function opsProgressCard(prog, s, auto) {
     if (p.rate_min) cells.push(statCell('rate', p.rate_min + '/min', 'over the last 2 minutes'));
     cells.push(statCell('elapsed', fmtDur(s.elapsed_s)));
     if (p.eta_s != null) cells.push(statCell('eta', '~' + fmtDur(p.eta_s), 'at the current rate'));
+    if (p.slots != null) {
+      const wp = p.writer_pct;
+      const verdict = wp == null ? ''
+        : (wp >= 60 ? ' — writer-bound: more slots will not help'
+                    : ' — LM-bound: distill_parallel is the lever');
+      cells.push(statCell('saturation',
+        fmt(p.slots) + ' slot' + (p.slots === 1 ? '' : 's')
+          + (wp != null ? ` · writer ${wp}%` : ''),
+        'LM requests kept in flight, and the share of wall time the single writer '
+          + 'thread spent landing chunks' + verdict));
+    }
     if (p.added) cells.push(addedCells(p.added));
   }
   return `<div class="opcard">${head}`

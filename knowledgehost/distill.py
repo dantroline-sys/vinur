@@ -1322,6 +1322,7 @@ class DistillProgress:
         self.step = 0
         self.cur: str | None = None
         self.counters: dict = {}
+        self.info: dict = {}                # gauges (slots, writer_pct) — overwritten, not summed
         self.started = time.time()
         self._marks = [(self.started, 0)]   # (t, step) for the trailing rate
         self._last = 0.0
@@ -1376,6 +1377,19 @@ class DistillProgress:
                 self.counters[k] = self.counters.get(k, 0) + int(v or 0)
             self._fire()
 
+    def set_info(self, **kv) -> None:
+        """Gauge fields for the next record — overwritten each call, never summed.
+        `slots` (LM fan-out width) and `writer_pct` (share of wall time the single
+        writer spent landing chunks) ride here: together they answer the tuning
+        question the counters can't — is the pass LM-bound (raise distill_parallel /
+        max_num_seqs) or writer-bound (more slots won't help)?"""
+        with self._lock:
+            for k, v in kv.items():
+                if v is None:
+                    self.info.pop(k, None)
+                else:
+                    self.info[k] = v
+
     def finish(self, **counters) -> None:
         """Final line, unthrottled — the panel's bar should end where the job did."""
         with self._lock:
@@ -1421,6 +1435,7 @@ class DistillProgress:
             rec["docs_left"] = max(ahead, self.docs_ahead - (len(self.docs) - ahead))
         if self.counters:
             rec["added"] = dict(self.counters)
+        rec.update(self.info)
         if done:
             rec["done"] = True
         try:
@@ -1430,11 +1445,13 @@ class DistillProgress:
 
 
 def distill_chunk(kb, lm, embedder, chunk: dict, extraction=None,
-                  source_regime=None, narrative=None) -> tuple:
+                  source_regime=None, narrative=None, domain_typed=None) -> tuple:
     """Distil one raw chunk into the KB.  Returns (concepts, relations, cards).
     `source_regime` (from a folder mapping) classifies the source at registration;
     None preserves an existing re-tag / the format default.  `narrative` is a
-    precomputed §8 fiction pass (parallel path); sequential fetches it inline."""
+    precomputed §8 fiction pass (parallel path); sequential fetches it inline.
+    `domain_typed` = prefetched domain-lens extractions (_prefetch_domain, parallel
+    path) so the writer lands them without its own LM calls."""
     doc_id = chunk.get("path_or_url") or chunk.get("id")
     # Best-effort licence detection (§16.4): scan this chunk for an SPDX tag / CC URL /
     # copyright line.  register_source FILLS an empty licence but never overwrites, so
@@ -1500,7 +1517,8 @@ def distill_chunk(kb, lm, embedder, chunk: dict, extraction=None,
         if stype in DOMAIN_CARD_TYPES:
             ncard += _distil_domain(kb, lm, embedder, chunk, DOMAIN_CARD_TYPES[stype],
                                     nodemap if nodemap is not None else {},
-                                    doc_id, claim_regime, claim_scope)
+                                    doc_id, claim_regime, claim_scope,
+                                    prefetched=domain_typed)
         # Loop-closer (research §6.2): a card grounded the question this drop answered →
         # close the knowledge_gap the original kb miss opened.
         if ncard and vinkona and chunk.get("kb_query"):
@@ -2280,23 +2298,33 @@ _TYPED_QUESTION = {
 
 
 def _distil_domain(kb, lm, embedder, chunk, card_types, nodemap, doc_id,
-                   claim_regime, claim_scope) -> int:
+                   claim_regime, claim_scope, prefetched=None) -> int:
     """Extract the domain cards a structured unit supports (theme/parallel for scripture;
     definition/obligation/exception for legal).  Returns the number of cards stored; a
     type the text doesn't support yields nothing.  BackendUnavailable propagates.
     lm=None (a leased/downed write-side LM) skips the lenses instead of crashing the
-    writer — the concepts still land; the cards for this chunk are foregone."""
-    if lm is None:
+    writer — the concepts still land; the cards for this chunk are foregone.
+    `prefetched` = {card_type: raw_obj|None} from a worker that already ran the lenses
+    off-thread (_prefetch_domain): the writer then only cleans and lands them — no LM
+    call in here, which is what keeps the single writer from serialising the pass."""
+    if lm is None and not prefetched:
         return 0
     locator = (chunk.get("section") or "").strip()       # the canonical key (bible:… / usc:…)
     made = 0
     for card_type in card_types:
-        try:
-            obj = lm.extract_typed(chunk, card_type)      # may raise BackendUnavailable
-        except BackendUnavailable:
-            raise
-        except Exception:
+        if prefetched is not None and card_type in prefetched:
+            obj = prefetched[card_type]
+            if obj is None:                               # that lens failed in the worker —
+                continue                                  # same outcome as an inline failure
+        elif lm is None:
             continue
+        else:
+            try:
+                obj = lm.extract_typed(chunk, card_type)  # may raise BackendUnavailable
+            except BackendUnavailable:
+                raise
+            except Exception:
+                continue
         title, pay, disc, concept, evidence = _clean_typed_payload(card_type, obj)
         if not title:
             continue
@@ -2317,6 +2345,59 @@ def _distil_domain(kb, lm, embedder, chunk, card_types, nodemap, doc_id,
         kb.add_surface_question("card", cid, q, _embed_all(embedder, [q])[0])
         made += 1
     return made
+
+
+def _prefetch_domain(lm, chunk) -> dict:
+    """Run the domain-card lenses for a structured chunk in the WORKER, so the
+    single writer doesn't pay them serially (2 LM calls per scripture window, 3 per
+    legal section — at fan-out 8 that serial lane, not extraction, gated the pass).
+    Returns {card_type: raw_obj|None} — None marks a lens that failed (the writer
+    skips it, exactly as an inline failure would); {} when the chunk isn't
+    structured or there is no LM.  BackendUnavailable propagates so the whole job
+    retries on another slot, like the generic extraction."""
+    stype = (chunk.get("source_type") or "").strip().lower()
+    card_types = DOMAIN_CARD_TYPES.get(stype)
+    if not card_types or lm is None:
+        return {}
+    out = {}
+    for card_type in card_types:
+        try:
+            out[card_type] = lm.extract_typed(chunk, card_type)
+        except BackendUnavailable:
+            raise
+        except Exception:
+            out[card_type] = None
+    return out
+
+
+def _precompute_domain_embeds(base, typed) -> dict:
+    """Bulk-embed the texts _distil_domain will need for prefetched lenses (concept
+    label + card text + surface question per card), off the writer.  Mirrors the
+    writer's text formats exactly so they hit the _CacheEmbedder; best-effort — any
+    failure returns {} and the writer embeds live as before."""
+    texts = []
+    for card_type, obj in (typed or {}).items():
+        if not obj:
+            continue
+        title, pay, disc, concept, evidence = _clean_typed_payload(card_type, obj)
+        if not title:
+            continue
+        lab = (concept or title).strip()
+        texts.append(lab)
+        texts.append(_typed_card_text(card_type, title, lab, pay, disc))
+        qfn = _TYPED_QUESTION.get(card_type)
+        texts.append(sanitize.clean(qfn(title, lab, pay) if qfn
+                                    else f"What about {lab}?", 200))
+    uniq = list(dict.fromkeys(t for t in texts if t))
+    if not uniq:
+        return {}
+    try:
+        vecs = base.embed_many(uniq, "document")
+    except Exception:
+        return {}
+    if not vecs or any(v is None for v in vecs):
+        return {}
+    return dict(zip(uniq, vecs))
 
 
 def healthy_endpoints(cfg, urls=None, overrides=None, log=None) -> list:
@@ -2770,12 +2851,20 @@ def _distill_parallel(store, kb, lms, embedder, cfg, *, limit=None, bundle=None,
         try:
             gen = lm.extract(chunk, regime)          # SLOW, off the lock, in parallel
             narr = lm.extract_narrative(chunk) if regime == "fictional" else None
+            # Domain lenses (theme/parallel; definition/obligation/exception) HERE
+            # too — they used to run serially in the writer via writer_lm, which made
+            # the single writer 2 LM calls per scripture window and the actual gate
+            # on the whole pass (extraction was 8-wide, landings weren't).  Same
+            # model either way: this path's slots are fan-out clones of one tier.
+            typed = _prefetch_domain(lm, chunk)
             # Embed the bulk HERE, still off the lock — the write below holds the one
             # kb_lock, and embedding inside it serialised the whole pool (the pipeline
             # path had this precompute; this path paid the network per node per chunk
             # under the global lock).
             ecache = _precompute_node_embeds(embedder, gen)
-            return chunk, (gen, narr, ecache), lm, regime, None
+            if typed:
+                ecache = {**ecache, **_precompute_domain_embeds(embedder, typed)}
+            return chunk, (gen, narr, ecache, typed), lm, regime, None
         except BackendUnavailable as e:
             return chunk, None, lm, regime, e        # caller decides: retry vs drop
 
@@ -2794,6 +2883,9 @@ def _distill_parallel(store, kb, lms, embedder, cfg, *, limit=None, bundle=None,
     stop = False
     units = failed = wfail = 0
     consec = {}                                      # id(lm) → consecutive failures
+    writer_busy, t_wall0 = 0.0, time.monotonic()     # saturation gauge (see set_info)
+    if progress:
+        progress.set_info(slots=len(lms))
     # Manual executor lifecycle — the `finally` is the deadlock guard: whatever
     # leaves this block (the all-endpoints-dead raise, or any unexpected exception),
     # `alive` is cleared BEFORE the join, so extract jobs parked on pool.get() see
@@ -2857,21 +2949,24 @@ def _distill_parallel(store, kb, lms, embedder, cfg, *, limit=None, bundle=None,
                             pool.put(lm)             # transient — back into rotation
                 else:
                     consec[id(lm)] = 0
-                    gen, narr, ecache = payload      # generic + narrative + off-lock embeds
+                    gen, narr, ecache, typed = payload   # + off-lock embeds and lenses
                     pool.put(lm)                     # healthy — back into rotation
                     emb = _CacheEmbedder(embedder, ecache) if ecache else embedder
-                    # The write itself can call the LM (reconciliation's 5-way; the
-                    # domain-card lenses on a scripture/legal chunk) — and it runs in
-                    # THIS thread.  A BackendUnavailable here used to propagate out of
-                    # the loop and DEADLOCK the executor exit (workers waiting on pool
-                    # slots are joined forever): Dan's six-hour "timed out" collect.
-                    # Now: retry once WITHOUT the write-side LM (concepts still land,
-                    # cards/adjudication deferred), and only then fail the chunk.
+                    # The write can still call the LM (reconciliation's 5-way — the
+                    # domain lenses are prefetched by the worker now) — and it runs
+                    # in THIS thread.  A BackendUnavailable here used to propagate out
+                    # of the loop and DEADLOCK the executor exit (workers waiting on
+                    # pool slots are joined forever): Dan's six-hour "timed out"
+                    # collect.  Now: retry once WITHOUT the write-side LM (concepts
+                    # and prefetched cards still land, adjudication deferred), and
+                    # only then fail the chunk.
+                    wt0 = time.monotonic()
                     try:
                         with kb_lock, kb.batch():
                             nc, nr, ncard = distill_chunk(kb, writer_lm, emb, chunk, gen,
                                                           source_regime=regime,
-                                                          narrative=narr)
+                                                          narrative=narr,
+                                                          domain_typed=typed)
                             _mark_done(kb, chunk)    # truncated → recard recovers cards
                         wfail = 0
                     except BackendUnavailable as e:
@@ -2879,12 +2974,15 @@ def _distill_parallel(store, kb, lms, embedder, cfg, *, limit=None, bundle=None,
                             with kb_lock, kb.batch():
                                 nc, nr, ncard = distill_chunk(kb, None, emb, chunk, gen,
                                                               source_regime=regime,
-                                                              narrative=narr)
+                                                              narrative=narr,
+                                                              domain_typed=typed)
                                 _mark_done(kb, chunk)
                             wfail = 0
                             log.warning("write-side LM failed for chunk %s (%s) — "
-                                        "landed WITHOUT it (edges unadjudicated, "
-                                        "domain cards skipped)", chunk.get("id"), e)
+                                        "landed WITHOUT it (edges unadjudicated%s)",
+                                        chunk.get("id"), e,
+                                        "; prefetched domain cards kept" if typed
+                                        else ", domain cards skipped")
                         except Exception:
                             failed += 1
                             wfail += 1
@@ -2895,15 +2993,21 @@ def _distill_parallel(store, kb, lms, embedder, cfg, *, limit=None, bundle=None,
                                 log.error("%d consecutive write failures — the write "
                                           "side is down; stopping (resumable)", wfail)
                                 stop = True
+                            writer_busy += time.monotonic() - wt0
                             if not stop:
                                 submit_next()
                             continue
+                    writer_busy += time.monotonic() - wt0
                     done += 1
                     units += _units(chunk)
                     concepts += nc
                     relations += nr
                     cards += ncard
                     if progress:
+                        el = time.monotonic() - t_wall0
+                        progress.set_info(slots=len(alive),
+                                          writer_pct=round(100.0 * writer_busy / el)
+                                          if el > 0 else 0)
                         progress.tick(chunk.get("path_or_url"), n=_units(chunk),
                                       concepts=nc, relations=nr, cards=ncard)
                     if every and done % every == 0:

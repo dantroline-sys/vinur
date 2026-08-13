@@ -141,6 +141,23 @@ def progress_side(cfg, A, B):
     check("the final record is marked done and carries the last count",
           rec.last.get("done") is True and rec.last["step"] == 4)
 
+    # ── gauges (set_info): slots + writer share — overwritten, never summed ──
+    rec4 = Recorder()
+    g = D.DistillProgress(emit=rec4, every_s=0.0)
+    g.set_info(slots=8)
+    g.tick(A)
+    check("gauge fields ride the record as-is (slots)", rec4.last.get("slots") == 8)
+    g.set_info(slots=7, writer_pct=12)
+    g.tick(A)
+    check("a gauge OVERWRITES (a dead slot lowers the count; nothing sums)",
+          rec4.last.get("slots") == 7 and rec4.last.get("writer_pct") == 12)
+    g.set_info(writer_pct=None)
+    g.tick(A)
+    check("None clears a gauge",
+          "writer_pct" not in rec4.last and rec4.last.get("slots") == 7)
+    g.finish()
+    check("gauges survive into the final record", rec4.last.get("slots") == 7)
+
     # ── throttling: these lines share the ops log with the readable detail ──
     rec2 = Recorder()
     q = D.DistillProgress(emit=rec2, every_s=60.0)
@@ -345,7 +362,7 @@ def panel_side():
     RUN = ('{"running":true,"command":"distill","elapsed_s":930,"progress":'
            '{"phase":"distil","step":1240,"steps":8430,"chunks":1240,"left":7190,"doc":"big.pdf",'
            '"doc_step":12,"doc_steps":300,"docs_left":214,"rate_min":41.5,"eta_s":10400,'
-           '"added":{"concepts":900,"cards":42}}}')
+           '"slots":8,"writer_pct":12,"added":{"concepts":900,"cards":42}}}')
     src += f"""
 const RUN = {RUN};
 const out = {{}};
@@ -364,6 +381,8 @@ out.noTotal = opsProgressCard({{phase:"distil",step:77}},
   {{running:true,command:"distill",elapsed_s:10}}, null);
 out.evil = opsProgressCard({{phase:"distil",step:1,doc:"<img src=x onerror=alert(1)>"}},
   {{running:true,command:"distill",elapsed_s:1}}, null);
+out.writerBound = opsProgressCard({{phase:"distil",step:5,slots:8,writer_pct:71}},
+  {{running:true,command:"distill",elapsed_s:9}}, null);
 // a clean-room BUILD: the bar counts phases, the chunk total rides alongside
 const BUILD = {{phase:"distill",step:2,steps:6,chunks:1240,chunk_steps:8430,doc:"big.pdf"}};
 out.buildCard = opsProgressCard(BUILD, {{running:true,command:"collect",elapsed_s:60}}, null);
@@ -402,6 +421,11 @@ console.log(JSON.stringify(out));
           "77" in o["noTotal"] and "%" not in o["noTotal"] and "chunks done" in o["noTotal"])
     check("a document name is escaped, never injected into the panel",
           "<img" not in o["evil"] and "&lt;img" in o["evil"])
+    check("the saturation cell shows slots and the writer's share of wall time",
+          "saturation" in o["card"] and "8 slots · writer 12%" in o["card"]
+          and "LM-bound" in o["card"])
+    check("a busy writer flips the tuning verdict (more slots will not help)",
+          "writer-bound: more slots will not help" in o["writerBound"])
     check("inside a clean-room build the bar stays in PHASE space (2 of 6)…",
           "2/6" in o["buildBar"] and "33%" in o["buildCard"])
     check("…and the chunk counts ride underneath it, not over it",
