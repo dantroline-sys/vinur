@@ -249,10 +249,23 @@ class KB:
 
     @contextmanager
     def batch(self):
+        """One transaction per block.  On an exception the OUTERMOST block rolls the
+        connection back — the old finally COMMITTED whatever had landed before a
+        mid-chunk failure, so a retried chunk re-landed on top of its own half
+        (support/observed_count inflation) and a genuine error persisted half a
+        chunk.  Nested blocks re-raise and let the outermost decide."""
         self._defer += 1
         try:
             yield
-        finally:
+        except BaseException:
+            self._defer -= 1
+            if self._defer == 0:
+                try:
+                    self.db.rollback()
+                except Exception:
+                    pass
+            raise
+        else:
             self._defer -= 1
             if self._defer == 0:
                 self.db.commit()
@@ -1090,12 +1103,21 @@ class KB:
         return pid
 
     # ── gaps (§4.7) ──────────────────────────────────────────────────────────
+    _GAP_CAP = 500          # open gaps kept; beyond it NEW ones are dropped, counts still bump
+
     def log_gap(self, query_text, intent="", effect_label=""):
         row = self.db.execute("SELECT id FROM knowledge_gaps WHERE query_text=? AND status='open'",
                              (query_text,)).fetchone()
         if row:
             self.db.execute("UPDATE knowledge_gaps SET count=count+1 WHERE id=?", (row["id"],))
         else:
+            # /ask is a deliberately public read route, and a miss lands HERE — without
+            # a cap, anonymous LAN clients could grow this table (and steer the research
+            # queue it feeds) without bound, one row per distinct query text.
+            n = self.db.execute("SELECT COUNT(*) FROM knowledge_gaps "
+                                "WHERE status='open'").fetchone()[0]
+            if n >= self._GAP_CAP:
+                return
             self.db.execute(
                 "INSERT INTO knowledge_gaps(query_text,intent,effect_label,first_seen,count,status)"
                 " VALUES(?,?,?,?,1,'open')", (query_text, intent, effect_label, time.time()))
