@@ -49,10 +49,12 @@ _REL = {
     "InstanceOf":       ("taxonomic",   "instance_of",          ""),
     "MannerOf":         ("taxonomic",   "manner_of",            ""),
     "DefinedAs":        ("taxonomic",   "defined_as",           ""),
-    # partonomic / compositional
-    "PartOf":           ("partonomic",  "part_of",              ""),
-    "HasA":             ("partonomic",  "has_a",                ""),
-    "MadeOf":           ("partonomic",  "made_of",              ""),
+    # part-whole / compositional — family "meronymic", matching the distiller and
+    # linker (July #18: importing these as "partonomic" made every family-filtered
+    # walk with families=["meronymic"] silently miss ConceptNet part-whole edges).
+    "PartOf":           ("meronymic",   "part_of",              ""),
+    "HasA":             ("meronymic",   "has_a",                ""),
+    "MadeOf":           ("meronymic",   "made_of",              ""),
     # functional / affordance
     "UsedFor":          ("functional",  "used_for",             ""),
     "CapableOf":        ("functional",  "capable_of",           ""),

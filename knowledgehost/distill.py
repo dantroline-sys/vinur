@@ -731,7 +731,6 @@ NARRATIVE_SYSTEM = (
     "- relations: in-world {src, type, dst} (is_a/part_of/attends/son_of/…).\n"
     "- diegetic_causal: cause→effect INSIDE the story {cause, effect, mechanism "
     "(explain, don't restate), basis, evidence}.\n"
-    "- character_states: {holder, state, trigger, reveals, evidence}.\n"
     "- beliefs: attitudes/judgements held by someone {holder, belief, narrative_stance "
     "(endorsed|undercut|neutral|channelled), evidence}. FIREWALL.\n"
     "- conventions: social/behavioural codes the scene assumes {pattern, domain, evidence}.\n"
