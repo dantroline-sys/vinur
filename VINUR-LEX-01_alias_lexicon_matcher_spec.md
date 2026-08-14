@@ -1,6 +1,8 @@
 # VINUR-LEX-01 — Alias Lexicon & Deterministic Span Matcher
 
-**Status:** Draft for implementation · **Doc version:** 1.0 · **Date:** 2026-07-05
+**Status:** EXECUTED 2026-07 (stamped 2026-08-14) · **Doc version:** 1.0 · **Date:** 2026-07-05
+**Implementation:** `knowledgehost/lex.py` (§11-conformant: NORM-1/TOK-1, Aho–Corasick + SymSpell, fuzzy_suppressed safety) · acceptance harness `tests/lex_acceptance.py`, run by `scripts/gates.sh` ("lex §11")
+**Wiring:** NO runtime callers. Compile and match are library-complete but not wired into any pipeline stage (the intended consumer chain LEX→STAT→retrieval→CONF was never connected); awaits a wire-or-archive decision.
 **Components:** `vinur-lex compile` (write time) · `vinur-lex match` (runtime)
 **Implementation language:** Python ≥ 3.12. The runtime component MUST have no ML, GPU, or network dependencies.
 

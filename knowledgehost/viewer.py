@@ -1,6 +1,6 @@
 """A tiny, dependency-free browser for inspecting the knowledge base.
 
-Six tabs (two-level nav — see VINUR-UI-01_panel_redesign_plan.md) let you
+Seven tabs (two-level nav — see docs/VINUR-UI-01_panel_redesign_plan.md) let you
 *peruse* (not just search) everything the pipeline produces, so you can debug it:
   * **Ask**        — ONE query box, three modes: Answer (kb_ask) · Passages
                      (kb_search with scores) · Library (document FTS); the

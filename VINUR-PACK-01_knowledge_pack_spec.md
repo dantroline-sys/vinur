@@ -2,7 +2,10 @@
 
 **Status:** v1 IMPLEMENTED (producer `pack` verb, manifest v2, license gate, gzip,
 passphrase encryption, import compat table, consumer bootstrap, Vinkona LocalKB) —
-pending: panel "Build pack…" UI (§9), recipient encryption (App. A) · **Doc version:** 1.2 · **Date:** 2026-07-25
+pending (updated 2026-08-14): recipient encryption (App. A); embed/setup consumer rungs;
+the §9 "Build pack…" panel UI now overlaps the newer `collect` verb + its panel wizard
+(clean-room folder builds with completeness manifests, `pack.py`) — decide fold-into-collect
+vs build §9 as specced before any UI work · **Doc version:** 1.2 · **Date:** 2026-07-25
 **Component:** `python3 -m knowledgehost pack` (producer) + `import-brain` extensions (consumer)
 **Builds on:** the `.kdb` bundle machinery (`bundles.py`, manifest format 1) — packs are `.kdb`
 files with a richer manifest and a defined production method; every existing import guarantee

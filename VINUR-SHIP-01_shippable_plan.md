@@ -1,6 +1,8 @@
 # VINUR-SHIP-01 — Shippable Vinur: OS lifecycle + a consumer GUI
 
-**Status:** S1 SHIPPED (machine seam + OS service layer) · **Doc version:** 1.0 · **Date:** 2026-07-25
+**Status:** S1 SHIPPED (machine seam + OS service layer) — S2 (`setup`/`doctor`) is next and
+NOT started (verified 2026-08-14: no such verbs in `vinur.sh` yet; Vinkona's on-ramp is the
+model to mirror) · **Doc version:** 1.0 · **Date:** 2026-07-25
 **Goal:** every aspect of managing a vinur box works BOTH headlessly (CLI + the web panel,
 already the primary surface) and through a consumer-grade native GUI following Apple/macOS
 design principles — installable, start-at-login, understandable by someone who has never

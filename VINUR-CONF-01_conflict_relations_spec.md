@@ -1,6 +1,8 @@
 # VINUR-CONF-01 — Conflict & Dependency Relations with Mechanism Routing
 
-**Status:** Draft for implementation · **Doc version:** 1.2 · **Date:** 2026-07-07 (1.1 erratum 2026-07-12, 1.2 erratum 2026-07-13 — see Errata)
+**Status:** EXECUTED 2026-07 (stamped 2026-08-14) · **Doc version:** 1.2 · **Date:** 2026-07-07 (1.1 erratum 2026-07-12, 1.2 erratum 2026-07-13 — see Errata)
+**Implementation:** `knowledgehost/conflict.py` (§11-conformant) · acceptance harness `tests/conflict_acceptance.py`, run by `scripts/gates.sh` ("conflict §11")
+**Wiring:** NOT in the runtime query path. The only production caller is the `migrate-vocab` CLI verb (`conflict.migrate_vocab`, vocabulary migration to 1.2). The `check` veto stage is built and tested but awaits a wire-or-archive decision; the CONF-02 research-emission contract was never drafted.
 **Components:** the conflict/dependency edge schema (write time, curated + ratified) · `vinur-conf check` (runtime veto stage)
 **Position in pipeline:** runs **after** ranking and **before** presentation, as a default-deny veto layer over the actions named in a retrieved advice card. Domain-neutral: workshop and travel are worked instances (§11).
 **Implementation language:** Python ≥ 3.12. The `check` component has no ML, GPU, or network dependency.

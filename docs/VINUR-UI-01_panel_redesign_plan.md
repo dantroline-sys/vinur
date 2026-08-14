@@ -134,3 +134,22 @@ click-through on a live box, and the first real A/B run on the Stats tab.
 Each stage is a single commit touching viewer.py (+ help.json/server.py only
 where a stage says so).  `git revert <stage-commit>` restores the previous
 panel wholesale — no data-format or config migrations anywhere in this plan.
+
+## Postscript (2026-08-14, on archiving to docs/)
+
+Archived as a historical plan — all eight stages shipped 2026-07-20 and the
+two-level panel has been the live surface since.  Where the panel has moved
+past the IA table above:
+
+- **Serving** gained a **Schedule** sub-tab (autopilot windows).
+- **Settings** gained **Paths** and **Network** sub-tabs (the Network tab
+  arrived with the amiga_net egress broker/posture work).
+- **Ask** ended up with a MODE select in one query box (as Stage 2 intended)
+  rather than sub-tab pills.
+- **Operations** gained the collect wizard and, 2026-08-13, the job-progress
+  header strip (queue survey, chunks-of-total bar, current document, ETA,
+  next-automation-step) shown on every tab, plus the distill saturation cell
+  (LM-bound vs writer-bound verdict).
+
+The design invariants (leaf keys never change; one stage = one commit) held
+throughout and remain binding on future panel work.

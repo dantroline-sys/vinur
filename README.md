@@ -3,9 +3,12 @@
 A standalone service that maintains a large, **local, offline** knowledge base
 and answers over it with **cited passages** — a **Wikipedia snapshot** plus your
 own **PDFs, books, journals and documents**, distilled into typed, cited
-knowledge cards. Vinur is a more or less **headless API**: apart from its web
-control panel (config, operations, browsing) there is no end-user interface —
-it is built to sit behind a front-end.
+knowledge cards. Vinur is built to sit behind a front-end: there is no end-user
+chat surface. What it does carry is a full web **control panel** (seven
+two-level tabs — Ask, Distilled, Curation, Operations, Serving, Stats,
+Settings) for operating the box: running maintenance jobs with live progress,
+browsing what was distilled, managing and tuning served models, steering the
+egress broker — no SSH needed.
 
 **Vinur pairs with [Vinkona](https://github.com/dantroline-sys/vinkona)**, the
 local voice assistant it was originally built for (*vinur* and *vinkona* are
@@ -25,8 +28,15 @@ every passage is sanitized and cited before any LM reads it.
 
 ## Two halves
 
-- **Query service** (`serve`) — light, fast, always up. The tool Vinkona calls.
-- **Ingestion pipeline** (`ingest`) — heavy, batch, run on demand / monthly.
+- **Query service** (`serve`) — light, fast, always up. The tool host Vinkona calls.
+- **Ingestion + distillation pipeline** — heavy, batch, run on demand or by the
+  built-in **Prioritizer** when idle: `ingest` (crawl → sanitize → chunk →
+  embed) → `distill` (raw chunks → typed nodes/edges/cards via the big LM,
+  two-tier extract/verify) → `recard` / `link` / `refine` / `reconcile` /
+  `adjudicate` / `facetize` re-passes, plus janitors (`dedupe`, `edge-audit`).
+  Some 45 CLI verbs share one dispatch (`python3 -m knowledgehost <verb>`); the
+  maintenance set is runnable from the panel's Operations tab with typed,
+  documented arguments and a progress strip that follows you onto every tab.
 
 ## Two store backends (one interface)
 
@@ -112,6 +122,18 @@ A **manifest** (path, content_hash, mtime, version) makes every run incremental;
 chunk ids are `sha1(path+section+text)` so re-ingest is idempotent. A monthly
 Wikipedia refresh: drop in the new ZIM, `bump-version`, re-ingest.
 
+### Canonical texts (scripture & legal)
+
+Structured corpora get their own lane: `analyze` proposes a structure profile
+(scripture or legal — books/chapters/verses, articles/sections), the collect
+wizard **confirms before ingesting** (deferred questions land in the panel's
+"Needs your input" inbox), and reference maps plus first-class **editions** do
+the rest — deuterocanon handled, multi-edition verse alignment with parallel
+reading (`read`), a deterministic cross-reference graph (`citations`),
+commentary layering, and Vulgate↔Hebrew Psalm reconciliation (`psalms`).
+Domain card lenses (themes/parallels for scripture; definitions/obligations/
+exceptions for legal) ride the normal distill pass.
+
 ### Duplicate text
 
 That id covers the same document arriving twice by the same route, but not the
@@ -148,6 +170,35 @@ knowledge = { enabled = true, tool_url = "http://127.0.0.1:8771" }
 On the research path, prefer `kb_search` **before** the web (local-first); use
 web for recency or when `low_confidence` is set.
 
+`kb_search` is one of **seven tools** on the catalogue (`GET /tools`), all
+callable through the same `POST /call` contract:
+
+- `kb_ask` — structured answer from the distilled cards: fit-gated, with a
+  confidence band, provenance and surfaced contradictions; it abstains rather
+  than guesses.
+- `kb_reason` — deterministic graph reasoning, no generation: compare, paths,
+  about, effects, siblings, contradictions, verify.
+- `kb_investigate` — a multi-hop agentic graph walk with a synthesis
+  fact-checked against the graph.
+- `library_search` — the search-only lexical document library.
+- `kb_brain` — list/load/unload knowledge bundles at runtime.
+- `ops_annotate` — the external-oracle annotation surface (VINUR-OPS-01).
+
+## Knowledge packs, bundles & brains
+
+Every source group is a **bundle**, exportable to its own `.kdb` file and
+shippable. `pack` produces a **knowledge pack** — a clean-room ingest+distill
+of one file or folder in a scratch kb, license-gated at export,
+manifest-stamped (authorship, licensing, compatibility), optionally gzip'd or
+passphrase-encrypted. `collect` is its sibling for growing a shareable
+collection document-by-document, with a completeness manifest so an unchanged
+re-collect is a fast no-op. `import-bundle` absorbs a shipped `.kdb` at capped
+trust; **brains** are bundles you can load/unload live (`/brain`, `kb_brain`)
+without touching the master. A Vinkona machine that never runs a host can
+still consume packs **in-process** through its `LocalKB` tier — vinur's read
+path imported as a zero-hard-dependency library. Contract:
+[`VINUR-PACK-01_knowledge_pack_spec.md`](VINUR-PACK-01_knowledge_pack_spec.md).
+
 ## Running Vinur on its own machine (with its own LMs)
 
 Vinur never serves a chat LM itself — distillation and verification are just
@@ -174,6 +225,17 @@ at a time, swapped via `./vinur.sh swap <name>`, `POST /serving/swap`, or a
 Prioritizer step's `"model"` key (so distill batches under one model, then
 verify batches under the other).
 
+Model acquisition is built in and **brokered**: `./vinur.sh find <words>`
+searches the hub with every hit sized and judged against this machine
+(fits / tight / too big), `./vinur.sh pull` downloads through the egress
+broker (policy-checked, audited, resumable — engines then run offline from
+the local store), and `adopt` absorbs legacy HF-cache snapshots without
+re-downloading. `./vinur.sh minimal on` vacates all VRAM while the KB keeps
+serving (Serving › Schedule drives it on a weekly timer);
+`./vinur.sh service install` registers a systemd/launchd start-at-login unit;
+`status --json` is the machine seam for scripts and shells; `./vinur.sh net`
+prints the broker's window — policy, open leases, recent audited egress.
+
 With `[serving]` empty (the default), `./vinur.sh` simply supervises the kb —
 a one-machine Vinkona setup keeps using Vinkona's own tiers as before.
 
@@ -194,27 +256,51 @@ maintenance needs no SSH.
   issue commands.
 - Filenames are treated as **opaque data** — never shelled or prompt-interpolated.
 - Service binds **localhost by default**; a non-loopback bind *requires*
-  `auth_token` (Bearer on `/call` and every control route) — the server
-  refuses to start otherwise.
+  `auth_token` — the server refuses to start otherwise. Every POST route and
+  every control/status GET carries the Bearer gate. The deliberate exceptions
+  are the read-only query routes (`/search`, `/ask`, `/library`, `/tools`,
+  `/health` and the viewer's browse endpoints), which stay public so a LAN
+  client can ask questions — they can read the knowledge, never change it,
+  and `/ask`'s gap logging is capped so an anonymous client cannot grow the
+  research queue unboundedly.
+- **Egress is deny-by-default.** Every byte leaving the box goes through the
+  `amiga_net` broker under lease-only policy rules (`egress.toml`), one JSON
+  audit line per decision; inference engines launch with `HF_HUB_OFFLINE=1`
+  and never see the Hugging Face token. The panel's Settings › Network tab
+  runs a **leak check** — binds, policy, running-engine environment, token
+  file permissions — graded with traffic lights and a one-line fix per
+  finding. The scanned inventory lives in
+  [`docs/net-inventory.md`](docs/net-inventory.md).
+- Settings editable over HTTP are **allowlisted and fail closed** on sensitive
+  names — no endpoint, path, token or bind key is reachable from the panel.
 - Keep parsers (PyMuPDF/Tesseract) patched; parsing needs no network.
 
 ## Layout
 
+The package holds ~55 modules; these are the load-bearing ones:
+
 ```
 knowledgehost/
-  config.py     defaults < TOML < env (KNOWLEDGEHOST_*)
-  embed.py      nomic /v1/embeddings client (stdlib urllib; search_query/document prefixes)
-  chunk.py      section-aware chunking + stable idempotent ids
+  config.py     defaults < TOML < env (KNOWLEDGEHOST_*); HTTP-editable keys allowlisted
   store.py      SqliteStore + LanceStore behind make_store(); shared SQLite manifest
-  rerank.py     RRF fusion + intent-conditioned heuristic reranker (cross-encoder = drop-in)
   ingest.py     incremental crawl + Wikipedia ZIM; sanitize -> chunk -> embed -> upsert
-  tools.py      the kb_search tool (embed+FTS -> fuse -> rerank -> cited passages + confidence)
-  server.py     stdlib HTTP: /health /tools /call (+ /drop, control panel)
-  metrics.py    always-on telemetry sampler (GPU/vLLM-queue/KB history) for the Stats tab
-  supervisor.py ./vinur.sh's engine — the kb + [serving] services, watched
-  serving.py    exec one declared LM/embed service (vllm | llama.cpp)
+  structure.py  canonical-text analyze/confirm (scripture/legal); refmaps/ + editions
+  distill.py    raw chunks -> typed nodes/edges/cards (two-tier extract/verify, fan-out)
+  kb.py         the structured KB: nodes/edges/cards, facets, gaps, provenance
+  retrieval.py  hybrid dense+FTS read path -> RRF -> rerank (with rerank.py)
+  tools.py      the seven-tool catalogue (kb_search/kb_ask/kb_reason/kb_investigate/
+                library_search/kb_brain/ops_annotate)
+  reason.py     deterministic graph reasoning + the derive layer; investigate.py walks
+  server.py     stdlib HTTP: query routes, /call, ops/serving/net control routes
+  viewer.py     the whole control panel — one file, seven two-level tabs
+  ops.py        the panel's job runner: 32 maintenance verbs, typed args, progress
+  autopilot.py  the Prioritizer — ordered idle-work plan + scheduling windows
+  bundles.py    provenance bundles, .kdb export/import, brains; pack.py packs+collect
+  serving.py    [serving] engines (vllm | llama.cpp), tune.toml, exclusive swap
+  supervisor.py ./vinur.sh's engine — the kb + serving services, watched; minimal mode
+  amiga_net/    the egress broker: policy, leases, pull, audit; posture.py leak check
   sources/      pdf, epub, html, text, wikipedia extractors (heavy deps lazy)
-tests/          make_fixtures.sh + smoke.py (zero-install end-to-end)
+tests/          make_fixtures.sh + smoke.py + the scripts/gates.sh battery
 ```
 
 ## Disclaimer

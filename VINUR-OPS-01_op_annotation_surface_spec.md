@@ -1,6 +1,8 @@
 # VINUR-OPS-01 — Op-Annotation Surface (external-oracle candidate annotation)
 
-**Status:** Draft 1 · **Companion to:** RUST-02 (external annotation-layer contract; first consumer programme) and RUST-03 (learned layer) · **Consumer:** implementing agent · **Partner:** the oracle runtime (first instance: the Rust coding layer's rust-analyzer client)
+**Status:** EXECUTED 2026-07 (stamped 2026-08-14) · **Companion to:** RUST-02 (external annotation-layer contract; first consumer programme) and RUST-03 (learned layer) · **Partner:** the oracle runtime (first instance: the Rust coding layer's rust-analyzer client)
+**Implementation:** the `ops_annotate` tool in `knowledgehost/tools.py` (batch id-join annotation, 500-id cap) · gate `tests/ops_annotate_test.py`, run by `scripts/gates.sh` ("ops annotate")
+**Wiring:** LIVE — this is the vinur half of the Oleum Rust-oracle pipeline (the one spec in this family with a real consumer).
 
 The key words MUST, MUST NOT, REQUIRED, SHALL, SHALL NOT, SHOULD, SHOULD NOT, MAY are per RFC 2119.
 

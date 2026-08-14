@@ -1,6 +1,8 @@
 # VINUR-STAT-01 — Corpus Statistics Pass (Card Salience & Concept Co-occurrence)
 
-**Status:** Draft for implementation · **Doc version:** 1.0 · **Date:** 2026-07-05
+**Status:** EXECUTED 2026-07 (stamped 2026-08-14) · **Doc version:** 1.0 · **Date:** 2026-07-05
+**Implementation:** `knowledgehost/corpstats.py` (§11-conformant: TF-IDF salience + PPMI `co_occurs_with`, shadow-table swap, exact `stats_version` match) · acceptance harness `tests/stat_acceptance.py`, run by `scripts/gates.sh` ("stat §11")
+**Wiring:** NO runtime consumers. The pass runs and swaps correctly, but nothing reads the weights yet (spreading activation / RRF consumption is specified elsewhere and unbuilt), and the VINUR-ING-01 postings producer was never drafted; awaits a wire-or-archive decision.
 **Component:** `vinur-stat build` — offline global pass · **Algo version string:** `VINUR-STAT-01/1.0`
 **Implementation language:** Python ≥ 3.12. No ML, GPU, or network dependencies. SQLite ≥ 3.45.
 
