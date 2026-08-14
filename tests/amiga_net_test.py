@@ -327,5 +327,66 @@ assert "deny by default" in out and "test hub" in out
 assert "LEASE_OPEN" in out or "ALLOWED" in out
 ok("status: policy in plain language + recent events")
 
+# ── the configured proxy applies to broker traffic ──────────────────────────
+# A proxy set on Settings › Network must steer request()/download() — urllib's
+# default reads env only, so the config key was silently ignored (hub searches
+# went direct and failed on proxied networks).
+_real_penv = broker._proxy_env
+broker._proxy_env = lambda: {
+    "http_proxy": "http://proxy.corp:3128", "HTTP_PROXY": "http://proxy.corp:3128",
+    "https_proxy": "http://proxy.corp:3129", "HTTPS_PROXY": "http://proxy.corp:3129",
+    "no_proxy": "localhost,127.0.0.1,::1,corp.internal",
+    "NO_PROXY": "localhost,127.0.0.1,::1,corp.internal",
+}
+try:
+    assert broker._proxy_for("https://huggingface.co/api/models?search=x") == "http://proxy.corp:3129"
+    assert broker._proxy_for("http://huggingface.co/x") == "http://proxy.corp:3128"
+    assert broker._proxy_for("https://sub.corp.internal/x") == "", "no_proxy host must go direct"
+    assert broker._proxy_for(f"{BASE}/x") == "", "loopback is always exempt"
+    captured = {}
+    _real_run2 = broker.subprocess.run
+    broker.subprocess.run = lambda cmd, check=True, timeout=None, env=None:         captured.update(cmd=list(cmd), env=dict(env or {}))
+    try:
+        broker._dl_aria2c("https://x/y.bin", Path(TD / "p.bin"), {}, 5)
+        assert captured["env"].get("https_proxy") == "http://proxy.corp:3129"
+        assert "127.0.0.1" in captured["env"].get("no_proxy", "")
+        broker._dl_wget("https://x/y.bin", Path(TD / "p.bin"), {}, 5)
+        assert captured["env"].get("http_proxy") == "http://proxy.corp:3128"
+    finally:
+        broker.subprocess.run = _real_run2
+finally:
+    broker._proxy_env = _real_penv
+assert broker._proxy_env() == {} or isinstance(broker._proxy_env(), dict)
+ok("proxy: config mapping steers request/downloads, scheme-matched; no_proxy + loopback exempt")
+
+# ── credentials never ride argv (world-readable /proc/*/cmdline) ─────────────
+captured = {}
+def _fake_run(cmd, check=True, timeout=None, env=None):
+    captured["cmd"] = list(cmd)
+    captured["env"] = dict(env) if env else {}
+    conf = next((c.split("=", 1)[1] for c in cmd if str(c).startswith("--conf-path=")), None)
+    if conf:
+        captured["conf_text"] = Path(conf).read_text()
+        captured["conf_mode"] = Path(conf).stat().st_mode & 0o777
+    elif captured["env"].get("WGETRC"):
+        captured["conf_text"] = Path(captured["env"]["WGETRC"]).read_text()
+        captured["conf_mode"] = Path(captured["env"]["WGETRC"]).stat().st_mode & 0o777
+    else:
+        captured["conf_text"], captured["conf_mode"] = "", None
+_real_run3 = broker.subprocess.run
+broker.subprocess.run = _fake_run
+try:
+    hdrs = {"Authorization": "Bearer hf_SECRET123", "User-Agent": "amiga"}
+    broker._dl_aria2c("https://x/y.bin", Path(TD / "q.bin"), hdrs, 5)
+    assert not any("hf_SECRET123" in str(c) for c in captured["cmd"]), "token on argv!"
+    assert "hf_SECRET123" in captured["conf_text"] and captured["conf_mode"] == 0o600
+    assert any("User-Agent" in str(c) for c in captured["cmd"]), "plain headers stay on argv"
+    broker._dl_wget("https://x/y.bin", Path(TD / "q.bin"), hdrs, 5)
+    assert not any("hf_SECRET123" in str(c) for c in captured["cmd"])
+    assert "hf_SECRET123" in captured["conf_text"] and captured["conf_mode"] == 0o600
+finally:
+    broker.subprocess.run = _real_run3
+ok("engines: bearer token via 0600 conf/WGETRC file, never argv")
+
 srv.shutdown()
 print(f"amiga_net_test: {OK} checks OK")
