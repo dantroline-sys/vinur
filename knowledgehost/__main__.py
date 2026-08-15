@@ -1120,13 +1120,31 @@ def _run_eval(cfg, log, *, gold=None, retriever="current_path", trace=False) -> 
     return 0 if metrics.get("accept", {}).get("passed") else 2
 
 
-def _run_build_ann(cfg, log) -> int:
+def _run_build_ann(cfg, log, target: str | None = None) -> int:
     """Build the HNSW ANN index over node embeddings (read-path speed).  Re-run after big
-    imports/`embed-nodes` so it reflects the current node set."""
+    imports/`embed-nodes` so it reflects the current node set.
+
+    With --target, index an EXTERNAL standalone KB file instead (a collect .kdb
+    collection, or any kb.db): sidecars land next to it, read-only, the master KB is
+    never opened.  Explicit intent skips the ann_min_nodes floor — you asked for it."""
     from . import ann as ann_mod
     if not ann_mod.available():
         log.error("usearch not installed — `pip install usearch` to build the ANN index.")
         return 1
+    if target:
+        path = os.path.expanduser(target)
+        try:
+            stats = ann_mod.build_for_file(
+                path, path + ".ann",
+                connectivity=cfg["ann_connectivity"],
+                expansion_add=cfg["ann_expansion_add"],
+                expansion_search=cfg["ann_expansion_search"],
+                dtype=cfg["ann_dtype"])
+        except ValueError as e:
+            log.error("build-ann: %s", e)
+            return 1
+        log.info("build-ann (external %s): %s", os.path.basename(path), stats)
+        return 0
     kb = KB(cfg)
     try:
         path = cfg.get("ann_path") or (cfg["kb_path"] + ".ann")
@@ -1437,6 +1455,10 @@ def main(argv=None):
                                   "(or pass it positionally)")
     ap.add_argument("--to", dest="to",
                     help="collect: the .kdb collection file to create or add to")
+    ap.add_argument("--target",
+                    help="build-ann: an EXTERNAL standalone KB file to index (a collect "
+                         ".kdb, or any kb.db) instead of the master — sidecars land "
+                         "next to it, where a KB serving that file looks")
     ap.add_argument("--kind", choices=["scripture", "legal"],
                     help="analyze: force the corpus kind instead of auto-detecting")
     ap.add_argument("--save", dest="save",
@@ -1555,7 +1577,7 @@ def main(argv=None):
         return _run_link(cfg, log, limit=args.limit, top_k=args.top_k, fast=args.fast)
 
     if args.command == "build-ann":           # KB-only; builds the HNSW node index
-        return _run_build_ann(cfg, log)
+        return _run_build_ann(cfg, log, target=args.target)
 
     if args.command == "optimize":            # KB-only; one-time node layout fix
         return _run_optimize(cfg, log, vacuum=args.vacuum)

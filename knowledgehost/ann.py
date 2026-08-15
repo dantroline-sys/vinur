@@ -93,6 +93,34 @@ def index_exists(path) -> bool:
     return os.path.exists(path + ".usearch") and os.path.exists(path + ".ids.json")
 
 
+def build_for_file(db_path, path, *, connectivity=32, expansion_add=128,
+                   expansion_search=128, dtype="f16", min_nodes=0) -> dict:
+    """Build the index for a STANDALONE KB file — a collect ``.kdb`` collection, or any
+    kb.db — without opening it through the full KB class (no migrations, no write access
+    on a shipped artifact).  The sidecars land at ``path`` (+ .usearch/.ids.json), which
+    is exactly where a consumer KB serving that file will look (ann_path defaults to
+    ``<kb file> + '.ann'``).  Read-only connection, so it is safe on a live-served file."""
+    import sqlite3
+    import threading
+    if not os.path.exists(db_path):
+        raise ValueError(f"no such KB file: {db_path}")
+    con = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+    con.row_factory = sqlite3.Row
+    if not con.execute("SELECT name FROM sqlite_master WHERE type='table' "
+                       "AND name='nodes'").fetchone():
+        con.close()
+        raise ValueError(f"{db_path} has no nodes table — not a knowledge base")
+    shim = type("_KBShim", (), {})()
+    shim._raw, shim._lock = con, threading.Lock()
+    try:
+        return build_from_kb(shim, path, connectivity=connectivity,
+                             expansion_add=expansion_add,
+                             expansion_search=expansion_search,
+                             dtype=dtype, min_nodes=min_nodes)
+    finally:
+        con.close()
+
+
 def build_from_kb(kb, path, *, connectivity=32, expansion_add=128, expansion_search=128,
                   dtype="f16", min_nodes=0, log_every=200_000) -> dict:
     """Stream every active, embedded node out of SQLite and build+save the index.

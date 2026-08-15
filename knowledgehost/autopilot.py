@@ -73,6 +73,11 @@ DEFAULT_PLAN = {
          "min_interval_s": 3600,  "label": "Link related cards"},
         {"command": "adjudicate", "args": {"limit": 100},        "enabled": True,
          "min_interval_s": 3600,  "label": "Merge duplicate nodes"},
+        # The master KB's dense index is a USER-CHOSEN step by design (collections
+        # built by `collect` refresh their own automatically): enable this to have
+        # the autopilot keep it fresh, or run build-ann from the Ops tab yourself.
+        {"command": "build-ann",  "args": {},                    "enabled": False,
+         "min_interval_s": 86400, "label": "Refresh the dense node index (search speed)"},
         {"command": "refine",     "args": {"limit": 50},         "enabled": False,
          "min_interval_s": 86400, "label": "Refine cards against their sources"},
         # one-shot backfill after the conversational-families upgrade: sweeps

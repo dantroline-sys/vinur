@@ -73,7 +73,7 @@ COMMANDS: dict = {
     "adjudicate": {"limit": "int", "batch": "int", "fast": "bool",
                    "no_auto": "bool", "auto_only": "bool"},
     "reconcile":  {"limit": "int", "top_k": "int", "anchors": "choice:corpus,all"},
-    "build-ann":  {},
+    "build-ann":  {"target": "path"},
     "embed-nodes": {"limit": "int"},
     "optimize":   {"vacuum": "bool"},
     "edge-audit": {"limit": "int", "apply": "bool"},
@@ -219,7 +219,11 @@ HELP: dict = {
     "reconcile": {"_": "Propose cross-source merges by embedding similarity",
                   "limit": "max clusters", "top_k": "neighbours per anchor",
                   "anchors": "corpus = card-bearing only; all = every node"},
-    "build-ann": {"_": "Build the fast dense-search index over node vectors"},
+    "build-ann": {"_": "Build the fast dense-search index over node vectors "
+                       "(collect refreshes an external collection's own index "
+                       "automatically at export)",
+                  "target": "an external standalone KB file (a collect .kdb) to "
+                            "index instead of the master"},
     "embed-nodes": {"_": "Backfill embeddings for nodes that have none",
                     "limit": "max nodes this run"},
     "optimize": {"_": "One-time node table layout fix",

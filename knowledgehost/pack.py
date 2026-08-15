@@ -232,6 +232,69 @@ def scratch_cfg(cfg: dict, build: Path, src: Path) -> dict:
 _BUILD_STEPS = ("ingest", "distill", "recard", "link", "export", "done")
 
 
+def _index_scratch(kb, scfg: dict, say, label: str) -> None:
+    """Build the scratch KB's ANN index right before the link stage, when the node
+    count clears ann_min_nodes (below it, brute force is exact and effectively free,
+    so no index is worth the build time).  The scratch is COMPLETE at this point —
+    distill/recard are done — so the index can't miss a node the linker wants.
+    Resets the KB's cached ANN state so link's _get_ann() picks the fresh index up.
+    A bonus, never a gate: any failure logs and the linker brute-forces as before."""
+    from . import ann as ann_mod
+    if not ann_mod.available():
+        return                                  # link says ann:false in its stats
+    try:
+        stats = ann_mod.build_from_kb(
+            kb, scfg["ann_path"],
+            connectivity=scfg["ann_connectivity"],
+            expansion_add=scfg["ann_expansion_add"],
+            expansion_search=scfg["ann_expansion_search"],
+            dtype=scfg["ann_dtype"], min_nodes=scfg["ann_min_nodes"])
+        if stats.get("built"):
+            kb._ann, kb._ann_tried = None, False       # re-load lazily → the new index
+            say(f"{label}: dense index built for linking — {stats['nodes']} nodes "
+                f"({stats['elapsed_s']}s)")
+        else:
+            log.info("%s: ann index skipped: %s", label, stats.get("reason"))
+    except Exception as e:
+        log.warning("%s: ann index build failed (link will brute-force): %s", label, e)
+
+
+def _index_collection(tgt, cfg: dict, say) -> dict | None:
+    """Refresh the exported collection's OWN dense index (sidecars next to the .kdb,
+    where a consumer KB serving the file looks).  A sidecar that already exists is
+    rebuilt unconditionally — after a merge it is stale by definition, and a stale
+    index silently hides the newly added nodes from every search.  Absent one, the
+    build only happens above ann_min_nodes (brute force is exact and instant below).
+    Returns the build stats (or None), and never fails the collect."""
+    from . import ann as ann_mod
+    ann_path = str(tgt) + ".ann"
+    if not ann_mod.available():
+        if ann_mod.index_exists(ann_path):
+            say("collect: usearch not installed — the collection's existing dense "
+                "index is now STALE (pip install usearch and re-run, or delete "
+                f"{Path(ann_path).name}.*)")
+        return None
+    try:
+        had = ann_mod.index_exists(ann_path)
+        stats = ann_mod.build_for_file(
+            str(tgt), ann_path,
+            connectivity=cfg["ann_connectivity"],
+            expansion_add=cfg["ann_expansion_add"],
+            expansion_search=cfg["ann_expansion_search"],
+            dtype=cfg["ann_dtype"],
+            min_nodes=0 if had else cfg["ann_min_nodes"])
+        if stats.get("built"):
+            say(f"collect: {'refreshed' if had else 'built'} the collection's dense "
+                f"index — {stats['nodes']} nodes ({stats['elapsed_s']}s)")
+        else:
+            log.info("collect: collection ann skipped: %s", stats.get("reason"))
+        return stats
+    except Exception as e:
+        say(f"collect: dense index skipped ({e}) — searches on the collection "
+            "stay brute-force")
+        return None
+
+
 def _emit(report, phase: str, **extra) -> None:
     """Fire the optional progress reporter with a consistent step number.  A no-op
     when no reporter was passed (build_pack), so the OPS_PROGRESS lines only appear
@@ -357,6 +420,11 @@ def _pipeline(scfg: dict, src: Path, say, *, label: str = "pack", report=None,
             stats["undistilled"] = max(0, store.count() - done_n)
         except Exception:
             stats["undistilled"] = 0
+
+        # Dense index over the now-complete scratch, so the link stage's neighbour
+        # search is ANN instead of a per-anchor brute-force scan (worth it only at
+        # scale — small builds skip and stay exact).
+        _index_scratch(kb, scfg, say, label)
 
         _emit(report, "link", **{k: stats["distill"].get(k) for k in ("concepts", "cards")})
         lm = (verifiers or extractors)[0]
@@ -829,6 +897,11 @@ def add_to_collection(cfg: dict, doc: str, target: str, bundle: str, *,
             dst.close()
     os.replace(tmp, tgt)
 
+    # The collection ships WITH its dense index: a consumer serving this file finds
+    # <file>.ann.* beside it without ever knowing build-ann exists.  (The master KB's
+    # index stays a separate, user-chosen step — the ops verb / autopilot toggle.)
+    ann_stats = _index_collection(tgt, cfg, say)
+
     # Keep the scratch when the build couldn't finish, so re-running the SAME collect
     # resumes distil/recard from the checkpoint and the rest merges in idempotently.
     if complete:
@@ -848,7 +921,8 @@ def add_to_collection(cfg: dict, doc: str, target: str, bundle: str, *,
     return {"ok": True, "target": str(tgt), "bundle": bundle, "created": created,
             "added": added, "totals": totals, "shareable": g["shareable"],
             "complete": complete, "single_tier": single_tier,
-            "recovered_truncated": recovered, "undistilled": undistilled, "stats": stats}
+            "recovered_truncated": recovered, "undistilled": undistilled,
+            "ann": ann_stats, "stats": stats}
 
 
 def _seal_bytes(src: Path, dst: Path, key: str) -> None:
