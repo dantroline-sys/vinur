@@ -16,6 +16,13 @@ Discipline (mirrors §9.4 — *bias toward not destroying*):
     inference from a sourced claim, and weight it accordingly.
   * Resumable: a judged pair is checkpointed in `link_pairs` (even a `none`), so re-runs
     only spend the LM on genuinely new neighbours.  Edge writes are hash-idempotent.
+  * A `limit` is a MOVING window: anchors rotate least-recently-visited-first
+    (`link_anchors` stamps), so the autopilot's small hourly passes sweep the whole
+    card set over time instead of freezing on the first N rows forever.
+  * Judgements are fanned out (`_fan_out`, same policy as distill): a batching endpoint
+    (vLLM) keeps several pair judgements in flight at once — the serial one-call-at-a-time
+    loop was the stage's real bottleneck.  All KB reads/writes stay on the main thread;
+    workers only ever talk to the LM.
 
 Runs as its own command, big-LM work, yielding the GPU whenever Vinkona holds the lease.
 """
@@ -24,9 +31,10 @@ from __future__ import annotations
 import json
 import logging
 import time
+from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 
 from . import lm_lease
-from .distill import _first_json
+from .distill import _fan_out, _first_json
 from .reconcile_import import _is_anchor
 
 log = logging.getLogger("knowledgehost.link")
@@ -122,8 +130,7 @@ def link_concepts(kb, lm, cfg, *, limit: int | None = None,
     `lm` is a live LM client (DistillLM); `lease` is the GPU lease to yield on (BIG by
     default, FAST when driven by the 9B).  Returns a stats dict.  Raises whatever the LM
     transport raises (BackendUnavailable) so the CLI can abort resumably."""
-    np = kb._np
-    if np is None:
+    if kb._np is None:
         raise RuntimeError("link needs numpy (the cached node matrix).")
     k = int(top_k or cfg.get("link_top_k", 8))
     floor = float(cfg.get("link_min_sim", 0.5))
@@ -135,7 +142,9 @@ def link_concepts(kb, lm, cfg, *, limit: int | None = None,
 
     kb.db.executescript(
         "CREATE TABLE IF NOT EXISTS link_pairs("
-        "pair TEXT PRIMARY KEY, relation TEXT, confidence REAL, ts REAL);")
+        "pair TEXT PRIMARY KEY, relation TEXT, confidence REAL, ts REAL);"
+        "CREATE TABLE IF NOT EXISTS link_anchors("
+        "node_id TEXT PRIMARY KEY, ts REAL);")
     kb.register_source(LINKER_DOC, "graph linkage pass (inferred)",
                        source_type="inference", trust_weight=0.3, regime="empirical")
 
@@ -154,6 +163,14 @@ def link_concepts(kb, lm, cfg, *, limit: int | None = None,
         "SELECT DISTINCT node_id FROM procedure_cards WHERE status='active'")]
     anchors = [nid for nid in card_nodes
                if nid in pos and anchor_like.get(nid, True)]
+    # Rotation: least-recently-visited first (never-visited sorts to the front), so a
+    # `limit` is a moving window over the whole anchor set.  The old anchors[:limit] of
+    # an unordered scan froze the autopilot's coverage on the same first N rows forever —
+    # every card beyond them could only ever appear as the B side of someone else's pair.
+    stamps = {r["node_id"]: r["ts"] for r in kb.db.execute(
+        "SELECT node_id, ts FROM link_anchors")}
+    anchors.sort(key=lambda nid: stamps.get(nid) or 0.0)
+    anchor_pool = len(anchors)
     if limit:
         anchors = anchors[:limit]
 
@@ -162,7 +179,14 @@ def link_concepts(kb, lm, cfg, *, limit: int | None = None,
     # ones.  The ~1M commonsense priors otherwise crowd a shallow top-k and starve the linker
     # of genuine relatives — the same dilution kb_ask fights (filter-after-fetch was the bug).
     pool = max(k * int(cfg.get("link_fetch_mult", 20)), 64)
-    st = {"anchors": len(anchors), "embedded_nodes": len(ids), "ann": bool(ann),
+    # Fan the one endpoint out into its request slots (explicit distill_parallel, else
+    # auto: 8 on a batching vLLM/container engine, 1 on llama.cpp) — the serial
+    # judge-one-pair-at-a-time loop was this stage's dominant cost at scale.
+    lms = _fan_out(cfg, [lm])
+    if len(lms) > 1:
+        log.info("link: judging with %d request slots in flight", len(lms))
+    st = {"anchors": len(anchors), "anchor_pool": anchor_pool,
+          "embedded_nodes": len(ids), "ann": bool(ann), "parallel": len(lms),
           "pool": pool, "candidates": 0, "judged": 0, "skipped_checkpoint": 0,
           "unparsed": 0, "lm_none": 0, "low_conf": 0, "linked": 0,
           "by_relation": {}, "sample": [], "raw_misses": []}
@@ -185,7 +209,9 @@ def link_concepts(kb, lm, cfg, *, limit: int | None = None,
         sims = mat @ mat[pos[a_id]]
         sims[pos[a_id]] = -2.0
         cnt = 0
-        for j in np.argsort(sims)[::-1]:
+        # top-`pool` via argpartition (O(N) in C), not a full argsort of every node —
+        # the same over-fetch depth the ANN arm uses, at a fraction of the sort cost.
+        for j in kb._topk_idx(sims, pool):
             s = float(sims[j])
             if s < floor:
                 break
@@ -199,39 +225,62 @@ def link_concepts(kb, lm, cfg, *, limit: int | None = None,
 
     cache: dict = {}
     t0 = time.time()
-    for a_id in anchors:
-        actx = _node_ctx(kb, a_id, cache)
-        if not actx:
-            continue
-        for b_id, sim in _neighbours(a_id):
-            pk = _pair_key(a_id, b_id)
-            if kb.db.execute("SELECT 1 FROM link_pairs WHERE pair=?", (pk,)).fetchone():
-                st["skipped_checkpoint"] += 1
+    outstanding: dict = {}          # a_id -> pairs yielded but not yet consumed
+    fully_yielded: set = set()      # anchors the generator has finished walking
+    dirty = 0                       # consumed results since the last commit
+
+    def _stamp(a_id) -> None:
+        """Rotation stamp: this anchor's turn is DONE (all its pairs resolved this
+        run), so the next limited pass moves on to older/never-visited anchors.
+        An aborted run leaves its unfinished anchors unstamped — they go first."""
+        kb.db.execute("INSERT OR REPLACE INTO link_anchors(node_id, ts) VALUES(?,?)",
+                      (a_id, time.time()))
+
+    def _candidates():
+        """Main-thread generator — ALL KB reads live here (SQLite stays
+        single-threaded); workers only ever see the rendered prompt."""
+        for a_id in anchors:
+            actx = _node_ctx(kb, a_id, cache)
+            if not actx:
+                _stamp(a_id)
                 continue
-            bctx = _node_ctx(kb, b_id, cache)
-            if not bctx:
-                continue
-            st["candidates"] += 1
-            _await_lease(cfg, log, lease)
-            user = (f"A: {actx[0]}\nB: {bctx[0]}\n\nThe single strongest structural "
-                    "relation between A and B:")
-            content = lm._content(_SYSTEM, user, _LINK_SCHEMA, mtok)
+            outstanding[a_id] = 0
+            for b_id, sim in _neighbours(a_id):
+                pk = _pair_key(a_id, b_id)
+                if kb.db.execute("SELECT 1 FROM link_pairs WHERE pair=?", (pk,)).fetchone():
+                    st["skipped_checkpoint"] += 1
+                    continue
+                bctx = _node_ctx(kb, b_id, cache)
+                if not bctx:
+                    continue
+                st["candidates"] += 1
+                outstanding[a_id] += 1
+                yield a_id, b_id, sim, pk, actx, bctx
+            fully_yielded.add(a_id)
+            if not outstanding[a_id]:               # everything checkpointed/skipped
+                _stamp(a_id)
+
+    def _consume(job, content) -> None:
+        """Parse one judgement and write it — main thread only."""
+        nonlocal dirty
+        a_id, b_id, sim, pk, actx, bctx = job
+        try:
             raw = None
             if content is not None:
                 try:
                     raw = json.loads(_first_json(content))
                 except (ValueError, AttributeError):
                     raw = None
-            if raw is None:                           # transient/parse miss — retry next run
+            if raw is None:                       # transient/parse miss — retry next run
                 st["unparsed"] += 1
-                if len(st["raw_misses"]) < 5:         # keep a few raw outputs to diagnose
+                if len(st["raw_misses"]) < 5:     # keep a few raw outputs to diagnose
                     st["raw_misses"].append((content or "<none>")[:200])
-                continue
+                return
             rel = raw.get("relation") or "none"
             conf = float(raw.get("confidence") or 0.0)
             rationale = str(raw.get("rationale") or "")[:200]
             st["judged"] += 1
-            if len(st["sample"]) < 15:                # representative verdicts for diagnosis
+            if len(st["sample"]) < 15:            # representative verdicts for diagnosis
                 st["sample"].append(
                     f"{kb._label_of(a_id)} ⇢ {kb._label_of(b_id)} = {rel} {conf:.2f} (sim {sim:.2f})")
             kb.db.execute("INSERT OR REPLACE INTO link_pairs(pair,relation,confidence,ts) "
@@ -239,25 +288,65 @@ def link_concepts(kb, lm, cfg, *, limit: int | None = None,
             spec = _REL.get(rel)
             if not spec:
                 st["lm_none"] += 1
-                continue
+                return
             gate = related_min_conf if rel == "related" else min_conf
             if conf < gate:
                 st["low_conf"] += 1
-                continue
+                return
             src, dst, family, etype, symmetric = spec
             sid = a_id if src == "a" else b_id
             did = b_id if dst == "b" else a_id
             regime = kb._regime_of_support(json.loads(actx[1] or "[]")) or "empirical"
             kb.add_edge(sid, did, family=family, type=etype, mechanism_basis="inferred",
                         regime=regime, doc_id=LINKER_DOC, evidence=rationale)
-            if symmetric:                             # alternative_to / related_to both ways
+            if symmetric:                         # alternative_to / related_to both ways
                 kb.add_edge(did, sid, family=family, type=etype, mechanism_basis="inferred",
                             regime=regime, doc_id=LINKER_DOC, evidence=rationale)
             st["linked"] += 1
             st["by_relation"][etype] = st["by_relation"].get(etype, 0) + 1
+            if st["judged"] % 200 == 0:
+                log.info("link: judged %d, linked %d (%s)", st["judged"], st["linked"],
+                         st["by_relation"])
+        finally:
+            outstanding[a_id] -= 1
+            if a_id in fully_yielded and not outstanding[a_id]:
+                _stamp(a_id)
+            dirty += 1
+            if dirty >= 25:
+                dirty = 0
+                kb.db.commit()
+
+    # The pool: each in-flight judgement owns one endpoint clone; the main thread
+    # feeds jobs, drains completions, and does every KB touch.  A transport failure
+    # (BackendUnavailable) raises out of fut.result() and aborts resumably — consumed
+    # pairs are committed, unfinished anchors stay unstamped for the next run.
+    ex = ThreadPoolExecutor(max_workers=len(lms))
+    free = list(lms)
+    inflight: dict = {}
+    gen = _candidates()
+    exhausted = False
+    try:
+        while True:
+            while free and not exhausted:
+                job = next(gen, None)
+                if job is None:
+                    exhausted = True
+                    break
+                _await_lease(cfg, log, lease)     # pause SUBMISSION while Vinkona holds it
+                clone = free.pop()
+                user = (f"A: {job[4][0]}\nB: {job[5][0]}\n\nThe single strongest "
+                        "structural relation between A and B:")
+                fut = ex.submit(clone._content, _SYSTEM, user, _LINK_SCHEMA, mtok)
+                inflight[fut] = (clone, job)
+            if not inflight:
+                break
+            done, _ = wait(list(inflight), return_when=FIRST_COMPLETED)
+            for fut in done:
+                clone, job = inflight.pop(fut)
+                free.append(clone)
+                _consume(job, fut.result())
+    finally:
+        ex.shutdown(wait=False, cancel_futures=True)
         kb.db.commit()
-        if st["judged"] and st["judged"] % 200 == 0:
-            log.info("link: judged %d, linked %d (%s)", st["judged"], st["linked"],
-                     st["by_relation"])
     st["elapsed_s"] = round(time.time() - t0, 1)
     return st

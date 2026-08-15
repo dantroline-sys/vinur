@@ -77,6 +77,7 @@ run "conflict §11"       ""     "$PY" tests/conflict_acceptance.py
 run "lex §11"            ""     "$PY" tests/lex_acceptance.py
 run "stat §11"           ""     "$PY" tests/stat_acceptance.py
 run "ann battery"       ""     "$PY" tests/ann_test.py
+run "link battery"      ""     "$PY" tests/link_test.py
 run "lease reader"      ""     "$PY" tests/lm_lease_test.py
 run "supervisor lock"   ""     "$PY" tests/supervisor_lock_test.py
 run "ship battery"      ""     "$PY" tests/ship_test.py
