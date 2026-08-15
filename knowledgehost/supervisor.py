@@ -50,6 +50,7 @@ from urllib.parse import urlparse
 ROOT = Path(__file__).resolve().parent.parent
 LOGS = ROOT / "var" / "log"
 STATE = ROOT / "var" / "run" / "supervisor.json"
+LOCK = ROOT / "var" / "run" / "supervisor.lock"
 
 GRACE_S = 8            # TERM -> KILL budget at shutdown
 CONTAINER_STOP_S = 60  # in-container TERM -> KILL budget (`<runtime> stop -t`):
@@ -362,9 +363,31 @@ def apply_minimal(cfg: dict, action: str) -> dict:
     return {"action": action, **plan}
 
 
+def _claim_lock():
+    """Exclusive single-supervisor claim.  _prepare_start's read_state()+alive()
+    check is only advisory — two racing starts both pass it and boot two whole
+    stacks onto the same GPUs.  The kernel flock is the authority: held for the
+    process lifetime, dropped automatically on ANY death (no stale-lock state).
+    Returns the open file to keep alive, or None when another supervisor holds it."""
+    import fcntl
+    LOCK.parent.mkdir(parents=True, exist_ok=True)
+    f = open(LOCK, "a+")
+    try:
+        fcntl.flock(f, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        f.close()
+        return None
+    return f
+
+
 def _run(svcs: list[dict], cfg: dict) -> None:
     """The resident loop — runs detached, children in their own groups."""
     from . import serving as sv
+    lock = _claim_lock()                       # noqa: F841 — the fd IS the claim
+    if lock is None:
+        print("another supervisor is already running (a start raced this one) — "
+              "exiting without touching its services", flush=True)
+        return
     stop_requested = []
     signal.signal(signal.SIGTERM, lambda *_: stop_requested.append(1))
     signal.signal(signal.SIGINT, lambda *_: stop_requested.append(1))
