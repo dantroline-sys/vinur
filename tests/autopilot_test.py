@@ -93,7 +93,7 @@ def main():
             return {"ok": True}
         def running(self):
             return False
-        def result(self):
+        def result(self, job_id=None):
             return dict(self._r)
         def status(self):
             return {"exit_code": self._exit}
@@ -113,7 +113,7 @@ def main():
     class NoResultOps(FakeOps):
         def __init__(self, exit_code):
             super().__init__(True, exit_code)
-        def result(self):
+        def result(self, job_id=None):
             return None
     pilot = ap.Autopilot({}, NoResultOps(exit_code=1))
     pilot._run_step(A, plan)
@@ -123,6 +123,38 @@ def main():
     pilot._run_step(A, plan)
     check("clean run without OPS_RESULT keeps old always-due behaviour",
           key not in pilot._hold_until)
+
+    # ── the slot race (July #16): a manual job reuses the slot in the window ─
+    class RaceOps(FakeOps):
+        """After OUR job (id 7) finished, a manual 'ingest' claimed the slot and
+        is still running.  The unqualified read used to see the manual job (no
+        result while running, exit_code None) and skip BOTH holds."""
+        def start(self, command, args):
+            return {"ok": True, "status": {"id": 7}}
+        def running(self):
+            return True                          # the manual job occupies the slot
+        def result(self, job_id=None):
+            if job_id == 7:                      # our finished step, by identity
+                return {"command": "distill", "exit_code": 0, "did_work": False}
+            return None                          # the slot's occupant is still running
+        def status(self):
+            return {"running": True, "id": 8, "command": "ingest", "exit_code": None}
+    pilot = ap.Autopilot({}, RaceOps(did_work=False))
+    pilot._run_step(A, plan)
+    check("slot race: the no-work hold survives a manual job claiming the slot",
+          pilot._hold_until.get(key, 0) > time.time() - 1
+          and "no work" in pilot._state["last_reason"])
+
+    class RaceFailOps(RaceOps):
+        def result(self, job_id=None):
+            if job_id == 7:                      # our step FAILED; no OPS_RESULT payload
+                return {"command": "distill", "exit_code": 2}
+            return None
+    pilot = ap.Autopilot({}, RaceFailOps(did_work=True))
+    pilot._run_step(A, plan)
+    check("slot race: the failure backoff survives it too (identified exit code)",
+          pilot._hold_until.get(key, 0) > time.time() - 1
+          and "failed" in pilot._state["last_reason"])
 
     # ── the result channel itself ────────────────────────────────────────────
     buf = io.StringIO()

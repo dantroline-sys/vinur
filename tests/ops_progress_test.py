@@ -258,6 +258,45 @@ def runner_side():
     check("no job at all → no progress", runner.progress() is None)
 
 
+def slot_identity_side():
+    """Job identity (July #16): result(job_id) answers for OUR job even after a
+    manual launch reuses the single slot."""
+    tmp = tempfile.mkdtemp()
+    runner = OPS.OpsRunner({"control_dir": tmp})
+
+    class FakeProc:
+        def __init__(self):
+            self.pid = 4242
+        def poll(self):
+            return 0
+    real_popen = OPS.subprocess.Popen
+    OPS.subprocess.Popen = lambda *a, **k: FakeProc()
+    try:
+        r1 = runner.start("stats", {})
+        id1 = r1["status"]["id"]
+        check("start() hands back a job id", isinstance(id1, int))
+        with open(runner._job["logfile"], "a") as f:
+            f.write(OPS.RESULT_PREFIX + json.dumps({"did_work": False}) + "\n")
+        r2 = runner.start("stats", {})            # the "manual" job claims the slot
+        id2 = r2["status"]["id"]
+        check("a new launch gets a NEW id", id2 != id1)
+        res = runner.result(id1)
+        check("result(old id) still answers for the replaced job",
+              res is not None and res.get("did_work") is False
+              and res.get("exit_code") == 0)
+        # a finished identified job with NO payload still answers exit_code —
+        # the failure backoff can't be blinded; the unqualified legacy read keeps
+        # its None-without-payload contract (the metrics collector relies on it)
+        check("identified: command/exit_code even without OPS_RESULT",
+              runner.result(id2) == {"command": "stats", "exit_code": 0})
+        check("unqualified: no payload → None (legacy contract)",
+              runner.result() is None)
+        check("an aged-out id answers None, never someone else's outcome",
+              runner.result(999) is None)
+    finally:
+        OPS.subprocess.Popen = real_popen
+
+
 def build_side():
     """pack._distil_progress: a clean-room build owns the bar; the distiller's chunk
     counts fold INTO it instead of overwriting it."""
@@ -440,6 +479,8 @@ def main():
     progress_side(cfg, A, B)
     print("\nrunner (ops.OpsRunner.progress):")
     runner_side()
+    print("\nslot identity (ops.OpsRunner.result(job_id)):")
+    slot_identity_side()
     print("\nbuild (pack._distil_progress):")
     build_side()
     print("\nnext up (autopilot.next_up):")

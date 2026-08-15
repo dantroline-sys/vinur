@@ -375,6 +375,8 @@ class OpsRunner:
         self.logdir.mkdir(parents=True, exist_ok=True)
         self._lock = threading.Lock()
         self._job: dict | None = None              # the live job, in memory — the source of truth
+        self._seq = 0                              # job identity for result(job_id) — July #16
+        self._prev: dict = {}                      # last few REPLACED jobs' summaries, by id
 
     def _build_cmd(self, command: str, argv: list) -> list:
         cmd = [sys.executable, "-m", "knowledgehost"]
@@ -400,8 +402,23 @@ class OpsRunner:
                     old["logfh"].close()
                 except OSError:
                     pass
+            if old:
+                # The replaced job is FINISHED (running() refused otherwise) —
+                # keep its summary so result(job_id) can still answer for it
+                # after the slot is reused (July #16: the autopilot read whatever
+                # occupied the slot, so a manual job launched in the window made
+                # it mistake the wrong job's outcome for its own step's).
+                self._prev[old["id"]] = {"command": old["command"],
+                                         "exit_code": old["proc"].poll(),
+                                         "logfile": old["logfile"]}
+                while len(self._prev) > 4:
+                    self._prev.pop(next(iter(self._prev)))
+            self._seq += 1
             ts = time.strftime("%Y%m%d-%H%M%S")
-            logfile = self.logdir / f"{command}-{ts}.log"
+            # The id in the name keeps two same-second launches from sharing a
+            # file (the second used to TRUNCATE the first's log — and with it
+            # the OPS_RESULT line the autopilot reads back).
+            logfile = self.logdir / f"{command}-{ts}-{self._seq}.log"
             lf = open(logfile, "wb", buffering=0)
             cmd = self._build_cmd(command, argv)
             log.info("ops: launching %s", " ".join(cmd))
@@ -410,7 +427,8 @@ class OpsRunner:
                                     start_new_session=True,   # own group → clean tree kill
                                     env=env)
             self._job = {"proc": proc, "logfh": lf, "command": command, "argv": argv,
-                         "started": time.time(), "logfile": str(logfile)}
+                         "started": time.time(), "logfile": str(logfile),
+                         "id": self._seq}
             return {"ok": True, "status": self.status()}
 
     def stop(self) -> dict:
@@ -446,22 +464,14 @@ class OpsRunner:
         return {"running": rc is None, "command": j["command"], "argv": j["argv"],
                 "started": j["started"], "ended": j.get("ended"),
                 "elapsed_s": round((j.get("ended") or time.time()) - j["started"]),
-                "exit_code": rc, "logfile": j["logfile"]}
+                "exit_code": rc, "logfile": j["logfile"], "id": j.get("id")}
 
-    def result(self) -> dict | None:
-        """The finished job's OPS_RESULT line (parsed), plus command/exit_code —
-        or None while running / when the job never emitted one.  The autopilot
-        reads this right after a step completes to learn whether it did work."""
+    @staticmethod
+    def _result_line(logfile) -> dict | None:
         import json as _json
-        j = self._job
-        if not j:
-            return None
-        rc = j["proc"].poll()
-        if rc is None:
-            return None
         payload = None
         try:
-            with open(j["logfile"], "r", errors="replace") as f:
+            with open(logfile, "r", errors="replace") as f:
                 for line in f:
                     if line.startswith(RESULT_PREFIX):
                         try:
@@ -470,9 +480,33 @@ class OpsRunner:
                             pass
         except OSError:
             return None
-        if payload is None:
+        return payload
+
+    def result(self, job_id: int | None = None) -> dict | None:
+        """The finished job's OPS_RESULT line (parsed), plus command/exit_code —
+        or None while running / when the job never emitted one.  The autopilot
+        reads this right after a step completes to learn whether it did work.
+
+        With `job_id` (from status()["id"]) the answer is FOR THAT JOB even if
+        the single slot has since been reused by a manual panel launch — and a
+        finished identified job always answers with at least command/exit_code,
+        payload or not, so the failure backoff can't be blinded by the race."""
+        j = self._job
+        if job_id is not None and (not j or j.get("id") != job_id):
+            prev = self._prev.get(job_id)
+            if not prev:
+                return None
+            return {"command": prev["command"], "exit_code": prev["exit_code"],
+                    **(self._result_line(prev["logfile"]) or {})}
+        if not j:
             return None
-        return {"command": j["command"], "exit_code": rc, **payload}
+        rc = j["proc"].poll()
+        if rc is None:
+            return None
+        payload = self._result_line(j["logfile"])
+        if payload is None and job_id is None:
+            return None                    # legacy contract (metrics collector)
+        return {"command": j["command"], "exit_code": rc, **(payload or {})}
 
     def progress(self) -> dict | None:
         """The live job's LAST OPS_PROGRESS record, parsed — the panel's bar and the

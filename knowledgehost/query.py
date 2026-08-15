@@ -210,6 +210,27 @@ def answer(kb, embedder, query: str, *, rigor=None, k=6, mode=None, modes=None,
             for a in kb.alternatives(nid):
                 a["score"] = round(base * 0.9, 4)
                 items.append(a)
+        if uflags.get("requirements"):      # feasibility → what this depends on
+            for e in kb.edges_from(nid, families=["functional"], empirical_only=high):
+                if e and e.get("type") == "requires":
+                    e["score"] = round(base * 0.9, 4)
+                    e["_role"] = "requirement"
+                    items.append(e)
+        if uflags.get("criteria") or uflags.get("cards"):
+            # observation / diagnostic → the RECOGNITION cards (criteria/staging:
+            # 'which fits these findings'), plus the other card families when the
+            # act asks for cards generally.  Fit-scored like the qfeats branch —
+            # this is the flag-driven twin for utterances with no explicit features.
+            seen_cards = {it["id"] for it in items if it.get("kind") == "card"}
+            for c in kb.cards_for(nid):
+                if not c or c["id"] in seen_cards:
+                    continue
+                is_crit = (c.get("card_type") or "procedure") in ("criteria", "staging")
+                if not (is_crit and uflags.get("criteria")) and not uflags.get("cards"):
+                    continue
+                c["score"] = round(base * (0.85 + 0.25 * grounding.answer_fit(c, query, qfeats)), 4)
+                c["_role"] = "criteria" if is_crit else "management"
+                items.append(c)
 
     # Lexical (BM25) card recall channel (contract §3.1) — the arm dense misses on exact
     # terms (exact names, identifiers, the query→card matching that's currently imprecise).
@@ -401,15 +422,19 @@ def _present(it: dict) -> dict:
 _ROLE_TO_SECTION = {"cause": "caused_by", "effect": "leads_to", "management": "managed_by",
                     "is_a": "is_a", "attribution": "who", "location": "where",
                     "caution": "cautions", "risk_if_omitted": "if_omitted",
-                    "alternative": "alternatives"}
+                    "alternative": "alternatives",
+                    "criteria": "criteria", "requirement": "requires"}
 _SECTION_LABEL = {"is_a": "is a kind of", "caused_by": "caused by",
                   "differential": "differential (looks like, told apart by)",
+                  "criteria": "recognised by (criteria)",
                   "leads_to": "leads to", "managed_by": "managed by",
+                  "requires": "requires / depends on",
                   "cautions": "cautions / incompatibilities", "alternatives": "alternatives",
                   "if_omitted": "risk if omitted",
                   "who": "who", "where": "where", "related": "related — pull next"}
-_SECTION_ORDER = ["is_a", "caused_by", "differential", "leads_to", "managed_by",
-                  "cautions", "if_omitted", "alternatives", "who", "where", "related"]
+_SECTION_ORDER = ["is_a", "caused_by", "differential", "criteria", "leads_to",
+                  "managed_by", "requires", "cautions", "if_omitted", "alternatives",
+                  "who", "where", "related"]
 
 
 def _compose_frame(items: list, related, intent: str):

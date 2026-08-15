@@ -398,8 +398,14 @@ class Autopilot:
             self._state["last_reason"] = f"{step['command']}: {res.get('error','could not start')}"
             self._sleep(10)
             return
-        # Wait for completion, staying responsive to stop.
-        while not self._stop.is_set() and self.ops.running():
+        job_id = (res.get("status") or {}).get("id")
+        # Wait for OUR job to finish, staying responsive to stop.  Identity-aware:
+        # once the slot no longer holds our id, our job is done (the runner only
+        # replaces a FINISHED job) — don't sit out a manual job that slipped in.
+        while not self._stop.is_set():
+            st = self.ops.status()
+            if not st.get("running") or st.get("id") != job_id:
+                break
             self._stop.wait(2)
         now = time.time()
         self._last_run[key] = now
@@ -407,12 +413,22 @@ class Autopilot:
         # or that exited non-zero stands aside for one idle interval, so the steps
         # below it get the slot.  When new work lands it is picked up again within
         # that interval — priority preemption survives, starvation doesn't.
-        result = self.ops.result() or {}
+        # result(job_id) answers for OUR job even if a manual panel launch reused
+        # the slot in the window (July #16 — the unqualified read let that manual
+        # job impersonate the step, silently skipping both holds).
+        result = self.ops.result(job_id) or {}
         backoff = float(plan.get("idle_interval_s", 60) or 60)
+        rc = result.get("exit_code")
+        if rc is None:
+            # No identified result (runner predates ids, or the summary aged out):
+            # the slot's exit code is trustworthy only while the slot is still OURS.
+            st = self.ops.status()
+            if job_id is None or st.get("id") == job_id:
+                rc = st.get("exit_code")
         if result.get("command") == step["command"] and result.get("did_work") is False:
             self._hold_until[key] = now + backoff
             self._state["last_reason"] = f"{label}: no work — standing aside {int(backoff)}s"
-        elif self.ops.status().get("exit_code") not in (0, None):
+        elif rc not in (0, None):
             self._hold_until[key] = now + backoff
             self._state["last_reason"] = f"{label}: failed — backing off {int(backoff)}s"
         else:

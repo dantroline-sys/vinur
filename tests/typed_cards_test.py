@@ -175,6 +175,135 @@ def main():
     check("re-distill dedups the typed card", n == 1)
     kb.close()
 
+    # ── cards_fts stays live with writes (July #15) ──────────────────────────
+    kb2 = KB({"kb_path": os.path.join(td, "kb2.db")})
+    cid, verdict = kb2.add_card(None, title="Flush the zorble valve",
+                                goal="stop the leak",
+                                steps=["close the intake", "vent the line"])
+    hits = kb2.search_cards_bm25("zorble", 5)
+    check("insert-on-write: a fresh card is BM25-findable with NO reindex",
+          verdict == "insert" and len(hits) == 1)
+    kb2.refresh_card(cid, {"title": "Flush the quibbex valve"})
+    check("refine refreshes the FTS row: new term found, old term gone",
+          len(kb2.search_cards_bm25("quibbex", 5)) == 1
+          and kb2.search_cards_bm25("zorble", 5) == [])
+    # upgrade edge: a pre-insert-on-write store (cards indexed by NOTHING) plus
+    # one fresh write must still surface the OLD body — partial index rebuilds.
+    kb2.db.execute("DELETE FROM cards_fts")
+    kb2.db.commit()
+    kb2.add_card(None, title="Grease the sprocket", goal="quiet the chain",
+                 steps=["wipe", "grease"])
+    check("partial index (old un-indexed body + one live row) rebuilds on search",
+          len(kb2.search_cards_bm25("quibbex", 5)) == 1
+          and len(kb2.search_cards_bm25("sprocket", 5)) == 1)
+    kb2.close()
+
+    # ── the judge vets criteria too (July #14) ───────────────────────────────
+    from knowledgehost import verify as V
+
+    class Judge:
+        def __init__(self, out):
+            self.out, self.user, self.schema = out, None, None
+        def chat_json(self, system, user, schema, max_tokens=0):
+            self.user, self.schema = user, schema
+            return self.out
+
+    crit = [
+        {"title": "Zorble syndrome", "concept": "zorble",
+         "required": [{"feature": "sign", "value": "spots"}],
+         "threshold": ">=3 of 5"},
+        {"title": "Invented scale", "concept": "quibbex",
+         "threshold": "2 major + 1 minor"},
+    ]
+    drafts = [{"chunk": {"text": "spots, sometimes stripes"}, "criteria": list(crit),
+               "concepts": [{"label": "z", "summary": "s"}],
+               "relations": [], "procedures": []}]
+    j = Judge({"criteria": [{"c": 0, "i": 1, "verdict": "reject"},
+                            {"c": 0, "i": 0, "verdict": "adjust",
+                             "threshold": ">=2 of 5",
+                             "supportive": [{"feature": "sign", "value": "stripes"}]}]})
+    (co, rl, pr, cr, vs), = V.verify_batch(j, drafts, {})
+    check("criteria ride the judge's prompt", "CRITERIA:" in j.user and "Zorble" in j.user)
+    check("the verdict schema offers criteria", "criteria" in j.schema["properties"])
+    check("a rejected criteria card dies, and is counted",
+          len(cr) == 1 and cr[0]["title"] == "Zorble syndrome" and vs["rejected"] == 1)
+    check("adjust patches threshold + modality arrays",
+          cr[0]["threshold"] == ">=2 of 5"
+          and cr[0]["supportive"] == [{"feature": "sign", "value": "stripes"}]
+          and vs["adjusted"] == 1)
+    (co2, rl2, pr2, cr2, vs2), = V.verify_batch(Judge(None), drafts, {})
+    check("fail-open keeps criteria unchanged", cr2 == crit and vs2["failed"] == 1)
+    check("the judge is told criteria are the highest stakes",
+          "CRITERIA are the highest stakes" in V.VERIFY_SYSTEM)
+    check("a chunk with no criteria adds no CRITERIA section (token thrift)",
+          "CRITERIA:" not in V._fmt_items([{"label": "a"}], [], []))
+
+    # ── speech-act role-pulls: requirements / criteria / cards (July #17) ────
+    from knowledgehost import query as Q
+    from knowledgehost import understand as U
+
+    NODE = {"kind": "node", "id": "n1", "label": "zorble", "text": "a bench device",
+            "score": 0.9, "support": []}
+    REQ_EDGE = {"kind": "edge", "id": "e1", "type": "requires", "family": "functional",
+                "src": "zorble", "dst": "calibration", "label": "calibration",
+                "text": "a zorble requires calibration before use", "support": []}
+    CRIT_CARD = {"kind": "card", "id": "c-crit", "node_id": "n1",
+                 "label": "Zorble syndrome", "text": "spots + stripes",
+                 "card_type": "criteria", "support": []}
+    PROC_CARD = {"kind": "card", "id": "c-proc", "node_id": "n1",
+                 "label": "Run the zorble", "text": "steps", "card_type": "procedure",
+                 "support": []}
+
+    class RoleKB:
+        def search(self, qvec, n, empirical_only=False):
+            return [dict(NODE)]
+        def edges_from(self, nid, families=None, direction=None, empirical_only=False):
+            return [dict(REQ_EDGE)] if families == ["functional"] else []
+        def cards_for(self, nid, limit=10):
+            return [dict(CRIT_CARD), dict(PROC_CARD)]
+        def alternatives(self, nid, limit=8):
+            return []
+        def search_cards_bm25(self, q, pool):
+            return []
+        def neighbours(self, nid, limit=8):
+            return []
+        def contra_pressure(self, it):
+            return 0.0
+        def log_gap(self, q, intent):
+            pass
+
+    class Emb:
+        def embed_one(self, text, kind):
+            return [0.1] * 8
+
+    def sections(bundle):
+        return {s["role"]: s for s in bundle.get("structure") or []}
+
+    b = Q.answer(RoleKB(), Emb(), "can we run the zorble without calibration?")
+    s = sections(b)
+    check("feasibility pulls `requires` edges into their own section",
+          b["speech_act"] == "feasibility" and "requires" in s
+          and s["requires"]["entries"][0]["relation"] == "requires")
+
+    b = Q.answer(RoleKB(), Emb(), "why is the zorble wilting?")
+    s = sections(b)
+    check("diagnostic surfaces the RECOGNITION card (criteria), not the how-to",
+          b["speech_act"] == "diagnostic" and "criteria" in s
+          and [e["id"] for e in s["criteria"]["entries"]] == ["c-crit"])
+
+    b = Q.answer(RoleKB(), Emb(), "the zorble developed spots and stripes")
+    s = sections(b)
+    check("observation pulls criteria AND the other card families",
+          b["speech_act"] == "observation" and "criteria" in s
+          and any(e["id"] == "c-proc" for e in s.get("managed_by", {}).get("entries", [])))
+
+    check("mid_procedure flag is gone — in_progress is a plain `how` plan",
+          U.TRAVERSAL_PLANS["in_progress"] == {"intent": "how"})
+    check("every remaining plan flag is consumed by query.answer",
+          all(f in ("intent", "safety", "requirements", "criteria", "cards",
+                    "counterfactual", "alternatives", "broaden")
+              for plan in U.TRAVERSAL_PLANS.values() for f in plan))
+
     print()
     if check.failed:
         print(f"{check.failed} FAILURE(S)")

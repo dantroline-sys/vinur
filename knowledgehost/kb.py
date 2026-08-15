@@ -1004,6 +1004,7 @@ class KB:
              json.dumps(escalation or []), card_type,
              json.dumps(criteria) if criteria else None,
              json.dumps(grade) if grade else None))
+        self._fts_upsert_card(cid)
         self._maybe_commit()
         return cid, "insert"
 
@@ -1074,6 +1075,7 @@ class KB:
             sets.append("embedding=?"); vals.append(_pack(embedding))
         vals.append(card_id)
         self.db.execute(f"UPDATE procedure_cards SET {', '.join(sets)} WHERE id=?", vals)
+        self._fts_upsert_card(card_id)
         if surface is not None:                    # retire the stale "how do you {old}?" Q
             self.db.execute("DELETE FROM surface_questions WHERE target_kind='card' "
                             "AND target_id=?", (card_id,))
@@ -1426,6 +1428,22 @@ class KB:
         parts.append(self._label_of(r["node_id"]) or "")
         return " ".join(p for p in parts if p)
 
+    def _fts_upsert_card(self, card_id: str) -> None:
+        """Keep cards_fts in step with ONE card write (July #15: the index was only
+        built when empty or reindexed at end-of-job reload, so cards written
+        mid-run were invisible to the BM25 arm for the whole run).  Delete+insert
+        in the SAME transaction as the card write; the end-of-job reindex remains
+        the true-up for indirect drift (node merges re-pointing labels)."""
+        try:
+            self.db.execute("DELETE FROM cards_fts WHERE card_id=?", (card_id,))
+            r = self.db.execute("SELECT * FROM procedure_cards WHERE id=? "
+                                "AND status='active'", (card_id,)).fetchone()
+            if r is not None:
+                self.db.execute("INSERT INTO cards_fts(card_id, text) VALUES(?,?)",
+                                (card_id, self._card_fts_text(r)))
+        except Exception as e:                # pragma: no cover - defensive
+            log.debug("cards_fts upsert skipped (%s)", e)
+
     def reindex_cards_fts(self) -> int:
         """(Re)build the card BM25 index from procedure_cards.  Fast at card scale; run
         after distillation, or it self-builds lazily on first search."""
@@ -1440,10 +1458,14 @@ class KB:
         return len(rows)
 
     def _ensure_cards_fts(self):
-        if self._raw.execute("SELECT count(*) FROM cards_fts").fetchone()[0]:
-            return
-        if self._raw.execute(
-                "SELECT count(*) FROM procedure_cards WHERE status='active'").fetchone()[0]:
+        # Rebuild when the index trails the cards — not only when it is EMPTY:
+        # an existing store upgraded to insert-on-write can have one fresh row
+        # beside a body of never-indexed cards, and empty-only would leave the
+        # body invisible to BM25 until the next end-of-job reindex.
+        have = self._raw.execute("SELECT count(*) FROM cards_fts").fetchone()[0]
+        want = self._raw.execute(
+            "SELECT count(*) FROM procedure_cards WHERE status='active'").fetchone()[0]
+        if want and have < want:
             self.reindex_cards_fts()
 
     def search_cards_bm25(self, query: str, k: int = 20) -> list:

@@ -3515,7 +3515,8 @@ def _distill_pipeline(store, kb, extractors, verifiers, embedder, cfg, *, limit=
                 todo = [j for j, b in enumerate(batch) if b[2][0]]
                 try:
                     drafts = [{"chunk": batch[j][0], "concepts": batch[j][2][0],
-                               "relations": batch[j][2][1], "procedures": batch[j][2][2]}
+                               "relations": batch[j][2][1], "procedures": batch[j][2][2],
+                               "criteria": batch[j][2][3] if len(batch[j][2]) > 3 else []}
                               for j in todo]
                     res = dict(zip(todo, verify_mod.verify_batch(vlm, drafts, cfg)))
                     fails = 0
@@ -3561,13 +3562,17 @@ def _distill_pipeline(store, kb, extractors, verifiers, embedder, cfg, *, limit=
                 for j, b in enumerate(batch):
                     ch, reg, gen, narr = b
                     if j in res:
-                        co, rl, pr, vs = res[j]
-                        # Carry the draft's criteria AND extras through — the verifier
-                        # only vets concepts/relations/procedures, and rebuilding a
-                        # short tuple here once silently dropped every diagnostic-
-                        # criteria card in pipeline mode (same trap for extras).
-                        gen = (co, rl, pr, b[2][3] if len(b[2]) > 3 else [],
-                               b[2][4] if len(b[2]) > 4 else {})
+                        # The verifier vets concepts/relations/procedures/criteria
+                        # (criteria joined with July #14); tolerate a 4-tuple from a
+                        # stubbed/older verifier — then criteria carry through
+                        # unvetted, exactly the old behaviour.  Extras always carry
+                        # through (rebuilding a short tuple here once silently
+                        # dropped every diagnostic-criteria card in pipeline mode).
+                        co, rl, pr, *restv = res[j]
+                        vs = restv[-1]
+                        cr = (restv[0] if len(restv) > 1
+                              else (b[2][3] if len(b[2]) > 3 else []))
+                        gen = (co, rl, pr, cr, b[2][4] if len(b[2]) > 4 else {})
                         with lock:
                             st["rejected"] += vs["rejected"]
                             st["adjusted"] += vs["adjusted"]

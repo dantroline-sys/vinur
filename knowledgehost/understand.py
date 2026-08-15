@@ -28,13 +28,16 @@ SPEECH_ACTS = ("factual", "feasibility", "hypothetical", "counterfactual_omit",
 
 # speech act → traversal plan over the EXISTING graph ops.  `intent` picks the primary
 # walk (None ⇒ defer to the intent classifier); the flags request additive role-pulls.
+# Every flag here IS consumed by query.answer (July #17 wired requirements/criteria/
+# cards; a former `mid_procedure` flag was deleted — `in_progress` routes to the `how`
+# walk, which already pulls the procedure cards, and the flag requested nothing more).
 TRAVERSAL_PLANS: dict = {
     "factual":            {"intent": None},
     "feasibility":        {"intent": "how", "safety": True, "requirements": True},
     "hypothetical":       {"intent": "what_if"},
     "counterfactual_omit": {"intent": "what_if", "counterfactual": True},
     "observation":        {"intent": "what_if", "criteria": True, "cards": True},
-    "in_progress":        {"intent": "how", "mid_procedure": True},
+    "in_progress":        {"intent": "how"},
     "diagnostic":         {"intent": "why_diag", "criteria": True},
     "comparison":         {"intent": "what", "alternatives": True},
     "ambiguous":          {"intent": None, "broaden": True},
