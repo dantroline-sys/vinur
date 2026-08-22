@@ -286,6 +286,59 @@ def _run_refine(cfg, store, embedder, log, *, limit=None, force=False) -> int:
     return 0
 
 
+def _run_yield(cfg, store, embedder, log, args) -> int:
+    """yield-audit: list documents that distilled to (almost) nothing.
+    redistil: put one document (--doc) or every flagged one (--low-yield) back
+    on the queue, optionally starting a distil pass straight after."""
+    from . import ops as _ops
+    from . import yield_audit as Y
+    kb = KB(cfg)
+    try:
+        kw = {}
+        if getattr(args, "ratio", None) is not None:
+            kw["ratio"] = args.ratio
+        if getattr(args, "min_chunks", None) is not None:
+            kw["min_chunks"] = args.min_chunks
+        if args.command == "yield-audit":
+            res = Y.audit(store, kb, limit=args.limit or 200, **kw)
+            if not res.get("ok"):
+                log.error(res.get("error", "audit failed")); return 1
+            med = res["median_per_chunk"]
+            log.info("yield audit: %d document(s) judged, corpus rate %s item(s)/chunk, "
+                     "%d flagged at ≤ %d%% of expected",
+                     res["judged"], med if med is not None else "n/a",
+                     res["flagged_total"], round(res["ratio"] * 100))
+            for f in res["flagged"]:
+                log.info("  %-60s landed %4d  items %4d  expected %6s  — %s",
+                         (f["title"] or f["doc_id"])[:60], f["landed"], f["items"],
+                         f["expected"] if f["expected"] is not None else "?", f["reason"])
+            _ops.emit_result(False, flagged=res["flagged_total"], judged=res["judged"],
+                             median_per_chunk=med)
+            return 0
+        docs = [args.doc] if getattr(args, "doc", None) else []
+        if getattr(args, "low_yield", False):
+            aud = Y.audit(store, kb, limit=1000, **kw)
+            docs = sorted(set(docs) | {f["doc_id"] for f in aud.get("flagged", [])})
+        if not docs:
+            log.error("redistil: give --doc <path> or --low-yield"); return 1
+        res = Y.reset_docs(store, kb, docs)
+        for doc, n in res.get("per_doc", {}).items():
+            log.info("  re-queued %4d chunk(s)  %s", n, doc)
+        log.info("redistil: %d chunk(s) across %d document(s) back on the queue%s",
+                 res.get("chunks", 0), res.get("docs", 0),
+                 " — starting a distil pass" if getattr(args, "distill", False) else
+                 " — run `distill` to pick them up")
+        _ops.emit_result(res.get("chunks", 0) > 0, docs=res.get("docs", 0),
+                         chunks=res.get("chunks", 0))
+    finally:
+        kb.close()
+    if getattr(args, "distill", False) and res.get("chunks", 0):
+        store.close()                          # _run_distill owns its own store handle
+        return _run_distill(cfg, embedder, log, limit=args.limit, watch=False,
+                            interval=getattr(args, "interval", 0), bundle=None)
+    return 0
+
+
 def _run_dedupe(cfg, store, log, *, near=False, threshold=0.9, apply=False,
                 bundle=None) -> int:
     """The janitor: find chunks that hold text the corpus already has.
@@ -1362,7 +1415,8 @@ def main(argv=None):
                              "bundles", "split", "source", "scenario", "eval", "facetize",
                              "ingest-library", "rebuild-fts", "import-bundle", "eject-bundle",
                              "collect", "analyze", "citations", "psalms", "read",
-                             "reason", "derive", "investigate", "clear-queue"])
+                             "reason", "derive", "investigate", "clear-queue",
+                             "yield-audit", "redistil"])
     # positional args for the modular-bundle verbs:
     #   source <doc_id> [--title ..] [--bundle ..]   scenario [name]   split [dir]
     #   import-bundle <file.kdb>     eject-bundle <bundle>
@@ -1500,6 +1554,13 @@ def main(argv=None):
                     help="dedupe: also find near-duplicates (same text, different wording)")
     ap.add_argument("--threshold", type=float, default=0.9,
                     help="dedupe --near: similarity floor (default 0.9)")
+    ap.add_argument("--low-yield", action="store_true",
+                    help="redistil: every document the yield audit flags")
+    ap.add_argument("--ratio", type=float, default=None,
+                    help="yield-audit/redistil: flag at or below this fraction of the "
+                         "expected yield (default 0.1)")
+    ap.add_argument("--min-chunks", type=int, default=None,
+                    help="yield-audit/redistil: size floor in landed chunks (default 3)")
     ap.add_argument("--apply", action="store_true",
                     help="dedupe --near / edge-audit: apply changes (default reports only)")
     ap.add_argument("--model", help="pull: the HF model id to fetch (org/Name), "
@@ -1769,6 +1830,9 @@ def main(argv=None):
             log.error("pull failed: %s — partial files are kept; re-run to resume", e)
         ops_mod.emit_result(False, model=model)
         return 1
+
+    if args.command in ("yield-audit", "redistil"):   # yield audit + re-queue, no LM
+        return _run_yield(cfg, store, embedder, log, args)
 
     if args.command == "dedupe":               # janitor: duplicate text, no LM
         return _run_dedupe(cfg, store, log, near=getattr(args, "near", False),

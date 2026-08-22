@@ -875,7 +875,66 @@ function renderSources(rows, pending, totals, bundles) {
          <label style="font-size:12px;opacity:.8"><input type="checkbox" id="clearPartial"> also trim partially-distilled docs</label>
        </div>`
     : '';
-  setRows(chips + summary + controls + '<table>' + head + body + '</table>');
+  // the yield audit: documents the checkpoint calls finished that landed
+  // (almost) nothing — a failed pass leaves them looking complete everywhere else
+  const yieldCtl = `<div style="margin:2px 0 10px;display:flex;gap:14px;flex-wrap:wrap;align-items:center">
+       <button class="toolbtn" onclick="yieldAudit()"
+         title="Find documents whose distillation yielded far less than their size predicts (at or below 10% of this corpus's items-per-chunk), and offer to put them back on the queue">
+         Check for low-yield distils</button>
+       <span id="yieldOut" style="font-size:12px;opacity:.8"></span>
+     </div><div id="yieldTable"></div>`;
+  setRows(chips + summary + controls + yieldCtl + '<table>' + head + body + '</table>');
+}
+
+// ── low-yield audit (rows are index-keyed: doc ids are untrusted paths/URLs) ──
+let YIELDROWS = [];
+async function yieldAudit() {
+  const out = $('#yieldOut'), tbl = $('#yieldTable');
+  out.textContent = 'checking…'; tbl.innerHTML = '';
+  const res = await fetch('/yield_audit').then(r => r.json())
+    .catch(e => ({ ok: false, error: netErr(e) }));
+  if (!res.ok) { out.innerHTML = '✗ ' + esc(res.error || 'failed'); return; }
+  YIELDROWS = res.flagged || [];
+  const med = res.median_per_chunk != null ? `${res.median_per_chunk} item(s) per chunk` : 'no healthy document to calibrate against';
+  if (!YIELDROWS.length) {
+    out.innerHTML = `✓ nothing abnormal — ${fmtCompact(res.judged)} document(s) judged, corpus rate ${esc(med)}`;
+    return;
+  }
+  out.innerHTML = `<b>${fmtCompact(res.flagged_total)}</b> of ${fmtCompact(res.judged)} judged document(s) `
+    + `yielded ≤ ${Math.round((res.ratio || 0.1) * 100)}% of what their size predicts (corpus rate: ${esc(med)})`
+    + (res.truncated ? ` — showing ${YIELDROWS.length}` : '');
+  const head = '<tr><th>document</th><th>chunks landed</th><th>items (concepts · relations · cards)</th>'
+    + '<th>expected</th><th>why flagged</th><th></th></tr>';
+  const body = YIELDROWS.map((r, i) =>
+    `<tr><td>${esc(r.title)}<div style="opacity:.55;font-size:11px">${esc(r.doc_id)}</div></td>
+     <td>${fmtCompact(r.landed)}${r.zoned ? ` <span style="opacity:.6;font-size:11px">+${r.zoned} furniture</span>` : ''}</td>
+     <td>${r.items} <span style="opacity:.6;font-size:11px">(${r.nodes} · ${r.edges} · ${r.cards})</span></td>
+     <td>${r.expected != null ? '~' + Math.round(r.expected) : '—'}</td>
+     <td style="font-size:12px">${esc(r.reason)}</td>
+     <td><button class="toolbtn" style="font-size:11px;padding:2px 8px" onclick="redistil(${i})">Re-distil</button></td></tr>`).join('');
+  tbl.innerHTML = `<div style="margin:0 0 8px;display:flex;gap:14px;align-items:center;flex-wrap:wrap">
+      <button class="toolbtn" onclick="redistil('all')">Re-distil all ${fmtCompact(res.flagged_total)}…</button>
+      <label style="font-size:12px;opacity:.8"><input type="checkbox" id="yieldRun" checked> then start a distil pass</label>
+      <span style="font-size:11px;opacity:.6">Re-queueing un-stamps the chunks; what already landed stays (ids are content hashes, a re-distil merges).</span>
+    </div><table>${head}${body}</table>`;
+}
+async function redistil(which) {
+  const all = which === 'all';
+  const rows = all ? YIELDROWS : [YIELDROWS[which]].filter(Boolean);
+  if (!rows.length) return;
+  const n = all ? null : rows[0];
+  if (!confirm(all
+      ? `Put all ${fmtCompact(YIELDROWS.length)} flagged document(s) back on the distil queue?`
+      : `Put\n\n${n.doc_id}\n\nback on the distil queue (${fmtCompact(n.landed)} chunk(s))?`))
+    return;
+  const run = !!($('#yieldRun') && $('#yieldRun').checked);
+  const body = all ? { all_flagged: true, distill: run } : { docs: [n.doc_id], distill: run };
+  const res = await postJSON('/redistil', body).catch(e => ({ ok: false, error: netErr(e) }));
+  $('#banner').innerHTML = `<div class="note">${res.ok
+    ? `✓ re-queued ${fmtCompact(res.chunks || 0)} chunk(s) across ${fmtCompact(res.docs || 0)} document(s)`
+      + (res.job ? (res.job.ok ? ' — distil pass started (Operations tab)' : ' — could not start the pass: ' + esc(res.job.error || '')) : '')
+    : '✗ ' + esc(res.error || 'failed — auth token?')}</div>`;
+  if (res.ok) load('sources');
 }
 
 // gaps get a per-row dismiss; rows are index-keyed (query text is untrusted —

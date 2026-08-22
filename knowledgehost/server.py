@@ -337,6 +337,20 @@ class Handler(BaseHTTPRequestHandler):
                 "dense": store.has_vectors(),
                 "version": store.manifest.meta_get("version", "1"),
                 "by_source": by_source, "job": self._job_brief()})
+        if path == "/yield_audit":                 # Sources: documents that distilled to ~nothing
+            kb = getattr(self.server, "kb", None)
+            if kb is None:
+                return self._send_json({"ok": False, "error": "no KB loaded"}, 400)
+            from . import yield_audit
+            try:
+                res = yield_audit.audit(
+                    store, kb,
+                    min_chunks=int((q.get("min_chunks") or [yield_audit.DEFAULT_MIN_CHUNKS])[0]),
+                    ratio=float((q.get("ratio") or [yield_audit.DEFAULT_RATIO])[0]),
+                    limit=min(int((q.get("limit") or ["200"])[0]), 1000))
+            except ValueError as e:
+                return self._send_json({"ok": False, "error": f"bad parameter: {e}"}, 400)
+            return self._send_json(res)
         if path == "/sample":                      # viewer: eyeball stored chunks
             n = min(int((q.get("n") or ["20"])[0] or 20), 100)
             src = (q.get("source_type") or [None])[0] or None
@@ -717,7 +731,8 @@ class Handler(BaseHTTPRequestHandler):
                         "/serving/model", "/serving/add",
                         "/serving/pull", "/serving/download", "/serving/tune", "/net",
                         "/metrics/mark", "/gaps/close", "/queue/delete", "/queue/clear",
-                        "/pending/answer", "/pending/dismiss", "/settings/paths"):
+                        "/pending/answer", "/pending/dismiss", "/settings/paths",
+                        "/redistil"):
             return self._send_json({"ok": False, "error": "not found"}, 404)
         if not self._authed():
             return self._send_json({"ok": False, "error": "unauthorized"}, 401)
@@ -788,6 +803,38 @@ class Handler(BaseHTTPRequestHandler):
             except Exception as e:
                 return self._send_json({"ok": False, "error": str(e)}, 500)
             return self._send_json({"ok": ok})
+        if path == "/redistil":                        # Sources: re-queue low-yield documents
+            kb = getattr(self.server, "kb", None)
+            store = getattr(self.server, "store", None)
+            if kb is None or store is None:
+                return self._send_json({"ok": False, "error": "no KB/store loaded"}, 400)
+            from . import yield_audit
+            docs = [str(d) for d in (req.get("docs") or []) if str(d).strip()]
+            if req.get("all_flagged"):
+                try:
+                    aud = yield_audit.audit(
+                        store, kb,
+                        min_chunks=int(req.get("min_chunks") or yield_audit.DEFAULT_MIN_CHUNKS),
+                        ratio=float(req.get("ratio") or yield_audit.DEFAULT_RATIO),
+                        limit=1000)
+                except ValueError as e:
+                    return self._send_json({"ok": False, "error": f"bad parameter: {e}"}, 400)
+                docs = sorted(set(docs) | {f["doc_id"] for f in aud.get("flagged", [])})
+            if not docs:
+                return self._send_json({"ok": False, "error": "nothing to re-queue"}, 400)
+            if self.server.ops.running():
+                return self._send_json(
+                    {"ok": False, "error": "a job is running — re-queueing under a live "
+                     "distil pass would race its checkpoint; wait for it to finish"}, 409)
+            res = yield_audit.reset_docs(store, kb, docs)
+            log.info("redistil: %d document(s), %d chunk(s) re-queued", res.get("docs", 0),
+                     res.get("chunks", 0))
+            if res.get("ok") and req.get("distill"):
+                try:
+                    res["job"] = self.server.ops.start("distill", {})
+                except ValueError as e:
+                    res["job"] = {"ok": False, "error": str(e)}
+            return self._send_json(res)
         if path == "/queue/delete":                    # Sources: drop a QUEUED doc + its chunks
             store = getattr(self.server, "store", None)
             if store is None or not hasattr(store, "purge_source"):

@@ -43,6 +43,10 @@ COMMANDS: dict = {
     # under a named bundle (creates the file or merges into it — one bundle per file)
     "collect":    {"doc": "path", "to": "path", "bundle": "str", "license": "str",
                    "allow_unlicensed": "bool", "answers_file": "path"},
+    # yield audit: documents the checkpoint calls done that landed ~nothing (no LM)
+    "yield-audit": {"ratio": "float", "min_chunks": "int", "limit": "int"},
+    "redistil":   {"doc": "path", "low_yield": "bool", "ratio": "float",
+                   "min_chunks": "int", "distill": "bool"},
     # deterministic cross-reference graph over structured (scripture/legal) docs (no LM)
     "citations":  {},
     # align a Vulgate-numbered edition's Psalms onto the Hebrew frame of a reference (no LM)
@@ -147,6 +151,25 @@ HELP: dict = {
                     "(opposite-polarity assertions → surface questions) and sibling-"
                     "completion gaps (→ knowledge gaps, feeding the research loop). "
                     "Safe to re-run; one DELETE reverses the whole layer."},
+    "yield-audit": {"_": "Report (no LM): documents the checkpoint calls distilled "
+                         "whose yield is abnormally low for their size — at or below "
+                         "`ratio` of this corpus's median items per landed chunk. A "
+                         "failed pass (context overflow, unparseable replies, a "
+                         "poisoned duplicate claim) leaves them looking complete in "
+                         "every other view",
+                    "ratio": "flag at or below this fraction of the expected yield (default 0.1)",
+                    "min_chunks": "documents with fewer landed chunks are too small to judge (default 3)",
+                    "limit": "most documents to list (default 200)"},
+    "redistil": {"_": "Put documents back on the distil queue: un-stamps their chunks "
+                      "(checkpoint, recard stamp, duplicate rows, text claims) so the "
+                      "next pass re-extracts them. What already landed stays — ids are "
+                      "content hashes, so a re-distil merges rather than duplicates. "
+                      "Furniture-zone skips are kept",
+                 "doc": "one document (its path/URL as shown in Sources)",
+                 "low_yield": "every document the yield audit flags",
+                 "ratio": "low_yield: the audit's ratio (default 0.1)",
+                 "min_chunks": "low_yield: the audit's size floor (default 3)",
+                 "distill": "start a distil pass right after re-queueing"},
     "dedupe": {"_": "Janitor (no LM): find chunks holding text the corpus already "
                     "has. A chunk id is sha1(path+section+text), so the same text "
                     "arriving by another route — a research drop re-exported under "
