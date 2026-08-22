@@ -764,6 +764,9 @@ _NARR_FAMILY = {
 # template + grammar preamble, so a big distill_max_tokens is capped to fit rather
 # than sent as-is (which drops the chunk as a "permanent" 4xx veto).
 _CTX_MARGIN_TOK = 512
+_CTX_MARGIN_FRAC = 0.25        # the chars/3 estimate runs ~15% light on dense/technical
+#                                text — scale the margin with the prompt, not just a flat 512
+_REFIT_SLACK_TOK = 64          # headroom under the server's OWN prompt count on a refit
 _MIN_OUTPUT_TOK = 256          # below this an extraction reply is useless
 
 
@@ -822,7 +825,14 @@ class DistillLM:
         ctx = self._ctx()
         if ctx <= 0:
             return want                         # unknown window → reactive retry handles it
-        est_in = (len(system) + len(user)) // 3 + _CTX_MARGIN_TOK
+        if want > ctx // 2 and not getattr(self, "_warned_budget", False):
+            self._warned_budget = True
+            log.warning("distill: distill_max_tokens=%d is more than half the %d-tok "
+                        "context — the output budget is clamped per chunk, and a "
+                        "budget that fills the window leaves no slack for the prompt "
+                        "estimate; 3072 is plenty for one chunk's cards", want, ctx)
+        est = (len(system) + len(user)) // 3
+        est_in = est + max(_CTX_MARGIN_TOK, int(est * _CTX_MARGIN_FRAC))
         room = ctx - est_in
         if room < _MIN_OUTPUT_TOK:
             exc = BackendUnavailable(
@@ -886,10 +896,13 @@ class DistillLM:
             return False
 
     def _content(self, system: str, user: str, schema: dict, max_tokens: int,
-                 _retry: bool = False):
+                 _retry: bool = False, _exact: bool = False):
         """Raw assistant content for a grammar-constrained chat, or None if the
-        response has no content.  Raises BackendUnavailable on transport failure."""
-        max_tokens = self._fit_output(system, user, max_tokens)
+        response has no content.  Raises BackendUnavailable on transport failure.
+        `_exact`: max_tokens was sized from the server's own prompt count (the
+        refit retry) — send it as-is instead of re-estimating."""
+        if not _exact:
+            max_tokens = self._fit_output(system, user, max_tokens)
         payload = {
             "model": self.model,
             "messages": [{"role": "system", "content": system},
@@ -911,17 +924,32 @@ class DistillLM:
                 body = (e.read() or b"").decode("utf-8", "replace")[:300]
             except Exception:
                 pass
-            # Context overflow on a server that didn't advertise its window: it just
-            # told us the real limit — learn it and retry ONCE, now that _fit_output
-            # can size the output budget to fit.  The net for llama-server et al.
+            # Context overflow: the server just told us the real window — and
+            # (vLLM) how many prompt tokens IT counted.  Refit from those exact
+            # numbers and retry ONCE.  Re-running the chars/3 estimate was a
+            # no-op whenever the window was already known (same request, same
+            # 400) and every such chunk was dropped; the server's own count
+            # cannot miss.  Without a prompt count (llama-server wording) back
+            # off hard instead.
             if e.code == 400 and not _retry:
                 m = re.search(r"maximum context length is (\d+)", body)
+                m_in = re.search(r"at least (\d+) input tokens", body)
                 if m:
-                    self._ctx_cached = int(m.group(1))
-                    log.warning("distill: output budget overflowed the model context — "
-                                "refitting to the server's %d-tok window and retrying once",
-                                self._ctx_cached)
-                    return self._content(system, user, schema, max_tokens, _retry=True)
+                    ctx = self._ctx_cached = int(m.group(1))
+                    if m_in:
+                        fit = ctx - int(m_in.group(1)) - _REFIT_SLACK_TOK
+                        how = f"the server counted {m_in.group(1)} prompt tokens"
+                    else:
+                        fit = int(max_tokens * 0.8)
+                        how = "no prompt count in the reply — backing the budget off 20%"
+                    if fit >= _MIN_OUTPUT_TOK:
+                        log.warning("distill: output budget overflowed the %d-tok context "
+                                    "(%s) — refitting to %d output tokens and retrying once",
+                                    ctx, how, fit)
+                        return self._content(system, user, schema, fit,
+                                             _retry=True, _exact=True)
+                    body += (f" — the prompt alone nearly fills the {ctx}-tok window; "
+                             "chunk too big for this model")
             permanent = 400 <= e.code < 500 and e.code not in (408, 425, 429)
             exc = BackendUnavailable(
                 f"distill LM {'rejected this request (a retry cannot help)' if permanent else 'unreachable'}: "
@@ -2563,6 +2591,18 @@ def distill_corpus(store, kb, extractors, embedder, cfg, *, limit=None, verifier
     if not extractors:
         raise BackendUnavailable("no distill endpoints available")
     _stage_reset()
+    # Heal the poisoned-claim state before surveying: chunks stamped as exact
+    # duplicates of an owner that never distilled go back on the queue (see
+    # KB.release_phantom_dupes).  Safe here — no claims are in flight yet.
+    try:
+        healed = kb.release_phantom_dupes()
+    except Exception as e:                       # an old kb.db without the tables
+        healed = 0
+        log.debug("phantom-dupe check skipped: %s", e)
+    if healed:
+        log.warning("distill: %d chunk(s) had been skipped as duplicates of text that "
+                    "never landed (their owner was dropped or re-ingested) — "
+                    "re-queued; they distil in this pass", healed)
     # Degenerate two-tier: when an exclusive swap leaves ONE resident model,
     # resident_url() heals both tiers onto the same server and both adopt the
     # same served name — extract and verify become the SAME LM.  Self-
@@ -2643,6 +2683,8 @@ def _pending_chunks(store, kb, counter, bundle=None, cfg=None):
     it is actually ignoring the rest of the corpus by design."""
     skip = _zone_skip_set(cfg)
     dedupe_on = (cfg or {}).get("distill_dedupe", True)
+    claimed_now: set = set()      # hashes claimed by THIS pass (owners in flight)
+    reclaimed = 0
     for ch in store.iter_chunks():
         if bundle is not None and _chunk_bundle(ch) != bundle:
             if len(counter) > 3:
@@ -2664,12 +2706,26 @@ def _pending_chunks(store, kb, counter, bundle=None, cfg=None):
             th = dedupe.text_hash(ch.get("text") or "")
             owner = kb.claim_text(th, ch["id"])
             if owner != ch["id"]:
-                kb.record_dupe(ch["id"], owner, th, kind="exact", similarity=1.0)
-                kb.mark_distilled(ch["id"])
-                if len(counter) > 2:
-                    counter[2] += 1
-                continue
+                # A claim is only worth honouring once its holder has LANDED (or
+                # is in flight in this very pass).  A stale claim — held by a
+                # chunk that was vetoed/failed out/re-ingested under a new id —
+                # used to turn every later copy of the text into a "duplicate"
+                # of knowledge that never existed: the chunk was stamped done
+                # without reaching an extractor, the document fell off the
+                # queue, and nothing ever landed.  Take such claims over.
+                if th in claimed_now or kb.is_distilled(owner):
+                    kb.record_dupe(ch["id"], owner, th, kind="exact", similarity=1.0)
+                    kb.mark_distilled(ch["id"])
+                    if len(counter) > 2:
+                        counter[2] += 1
+                    continue
+                kb.reclaim_text(th, ch["id"])
+                reclaimed += 1
+            claimed_now.add(th)
         yield ch
+    if reclaimed:
+        log.info("distill: took over %d stale text claim(s) whose holder never "
+                 "landed — those chunks were distilled after all", reclaimed)
 
 
 # ── structured-unit windows ──────────────────────────────────────────────────

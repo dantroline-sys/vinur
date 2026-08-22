@@ -139,4 +139,58 @@ assert got2 == ["c1", "c2", "c3"] and counter2[2] == 0, (got2, counter2)
 ok("distill_dedupe = false leaves every chunk in the queue")
 kb2.close(); kb3.close()
 
+# ── stale claims: a holder that never landed must not poison later copies ───
+# The regression: a pass claimed every chunk's text, then every chunk was
+# vetoed (context overflow) and dropped un-stamped.  The claims stayed.  A
+# re-ingest gave the same text new ids; each lost the claim, was stamped as a
+# "duplicate of the owner", never reached an extractor, fell off the queue —
+# and the owner had produced nothing.
+kb4 = _kb()
+gone = [{"id": "old1", "path_or_url": "/books/a.pdf", "section": "", "text": same}]
+counter = [0, 0, 0]
+assert [c["id"] for c in D._pending_chunks(_Store(gone), kb4, counter, cfg={})] == ["old1"]
+assert not kb4.is_distilled("old1")           # …and then old1 was dropped, never stamped
+fresh = [{"id": "new1", "path_or_url": "/books/a.pdf", "section": "", "text": same}]
+counter = [0, 0, 0]
+got = [c["id"] for c in D._pending_chunks(_Store(fresh), kb4, counter, cfg={})]
+assert got == ["new1"] and counter[2] == 0, (got, counter)
+assert not kb4.is_distilled("new1") and kb4.dupe_of("new1") is None
+ok("a claim whose holder never landed is TAKEN OVER, not honoured: the new copy distils")
+
+# …while a genuine duplicate (owner landed) is still skipped
+kb4.mark_distilled("new1")
+again = [{"id": "new2", "path_or_url": "/books/a-copy.pdf", "section": "", "text": same}]
+counter = [0, 0, 0]
+got = [c["id"] for c in D._pending_chunks(_Store(again), kb4, counter, cfg={})]
+assert got == [] and counter[2] == 1 and kb4.dupe_of("new2")["of_chunk_id"] == "new1"
+ok("…and a copy of text whose owner DID land is still a duplicate (skipped)")
+
+# two copies in ONE pass: the second still dedupes against the in-flight first
+kb5 = _kb()
+pair = [{"id": "p1", "path_or_url": "/x.md", "section": "", "text": same},
+        {"id": "p2", "path_or_url": "/y.md", "section": "", "text": same}]
+counter = [0, 0, 0]
+got = [c["id"] for c in D._pending_chunks(_Store(pair), kb5, counter, cfg={})]
+assert got == ["p1"] and counter[2] == 1, (got, counter)
+ok("within one pass the second copy dedupes against the in-flight first")
+
+# healing the poisoned state: stamped-as-dupe-of-a-phantom chunks are re-queued
+kb6 = _kb()
+h2 = dd.text_hash(same)
+kb6.claim_text(h2, "phantom")                  # claimed, never distilled
+kb6.record_dupe("victim", "phantom", h2, kind="exact", similarity=1.0)
+kb6.mark_distilled("victim")                   # the poisoned stamp
+kb6.claim_text(dd.text_hash("other text here"), "real")
+kb6.mark_distilled("real")                     # a real owner
+kb6.record_dupe("legit", "real", "", kind="exact", similarity=1.0)
+kb6.mark_distilled("legit")                    # a legitimate dupe stamp
+n = kb6.release_phantom_dupes()
+assert n == 1, n
+assert not kb6.is_distilled("victim") and kb6.dupe_of("victim") is None
+assert kb6.is_distilled("legit") and kb6.dupe_of("legit") is not None
+assert kb6.claim_text(h2, "newcomer") == "newcomer"     # the phantom's claim was released
+assert kb6.claim_text(dd.text_hash("other text here"), "x") == "real"   # the real one stands
+ok("release_phantom_dupes re-queues victims of never-landed owners, keeps real dupes")
+kb4.close(); kb5.close(); kb6.close()
+
 print(f"dedupe_test: {OK} checks OK")

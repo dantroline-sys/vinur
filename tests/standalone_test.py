@@ -773,11 +773,13 @@ def main():
         assert res["proc_offered"] == 0
         assert any("offered no procedures/criteria" in m for m in _DGrab.msgs)
         # cards flowing -> no DIAGNOSIS noise (the fan-out provenance line is
-        # deliberate: a silent x1 hid a day of 4-chunks/min on the live box)
+        # deliberate: a silent x1 hid a day of 4-chunks/min on the live box;
+        # so is the queue survey's "queue ahead" line)
         _DGrab.msgs.clear()
         D._distill_sequential = lambda *a, **k: {"chunks": 5, "cards": 3}
         D.distill_corpus(None, None, [object()], None, {"verify": False})
-        noise = [m for m in _DGrab.msgs if "fan-out" not in m]
+        noise = [m for m in _DGrab.msgs
+                 if "fan-out" not in m and "queue ahead" not in m]
         assert not noise, noise
         assert any("fan-out" in m for m in _DGrab.msgs), "provenance line must log"
     finally:
@@ -912,14 +914,23 @@ def main():
                 d["max_model_len"] = _CtxLM.ctx
             self._send(200, {"data": [d]})
 
+        posts = 0
+
         def do_POST(self):                       # /v1/chat/completions
             n = int(self.headers.get("Content-Length", 0))
             req = json.loads(self.rfile.read(n) or b"{}")
+            _CtxLM.posts += 1
             _CtxLM.last_max = int(req.get("max_tokens", 0))
-            if _CtxLM.last_max >= _CtxLM.ctx:    # no room for any prompt -> the real vLLM 400
+            # Count the prompt like vLLM does — and deliberately HARSHER than the
+            # client's chars/3 estimate (2 chars/token), so a budget that fills
+            # the window overflows exactly the way the live box did.
+            prompt_tok = sum(len(m.get("content", "")) for m in req.get("messages", [])) // 2
+            if prompt_tok + _CtxLM.last_max > _CtxLM.ctx:   # the real vLLM 400 text
                 self._send(400, {"error": {"message":
                     f"This model's maximum context length is {_CtxLM.ctx} tokens. "
-                    f"However, you requested {_CtxLM.last_max} output tokens."}})
+                    f"However, you requested {_CtxLM.last_max} output tokens and your "
+                    f"prompt contains at least {prompt_tok} input tokens, for a total "
+                    f"of at least {prompt_tok + _CtxLM.last_max} tokens."}})
                 return
             self._send(200, {"choices": [{"message": {"content": '{"ok": true}'}}]})
 
@@ -946,6 +957,23 @@ def main():
         assert outr is not None, "retry after learning the window should succeed"
         assert lmr._ctx_cached == 16384, lmr._ctx_cached
         ok("DistillLM: context-overflow 400 learned from the server message, retried once")
+
+        # the live-box failure: window KNOWN, budget over-set, a dense prompt the
+        # chars/3 estimate undercounts -> 400 -> refit from the server's OWN prompt
+        # count -> lands on the second request (it used to re-send the same
+        # request, 400 again, and drop the chunk)
+        _CtxLM.expose_len = True
+        _CtxLM.last_max = None
+        _CtxLM.posts = 0
+        lmx = D.DistillLM({"distill_url": cbase, "distill_model": "m",
+                           "distill_timeout_s": 5, "distill_max_tokens": 16384})
+        big_sys, big_user = "s" * 9000, "u" * 9000          # 18k chars: est 6000, server 9000
+        outx = lmx._content(big_sys, big_user, {}, 16384)
+        assert outx is not None, "exact refit must land"
+        assert _CtxLM.posts == 2, _CtxLM.posts
+        assert _CtxLM.last_max == 16384 - 9000 - D._REFIT_SLACK_TOK, _CtxLM.last_max
+        assert lmx._warned_budget, "an over-set distill_max_tokens is called out"
+        ok("DistillLM: overflow on a known window refits from the server's prompt count (lands on the 2nd request)")
 
         # a prompt too big for the window -> permanent + actionable (not an opaque 400)
         lmb = D.DistillLM({"distill_url": cbase, "distill_model": "m",
@@ -1079,7 +1107,7 @@ def main():
                                D._RETRY_BACKOFF_S)
     try:
         D.distill_chunk = (lambda kb, lm, emb, ch, extraction=None,
-                           source_regime=None, narrative=None: (1, 0, 0))
+                           source_regime=None, narrative=None, **kw: (1, 0, 0))
         D._precompute_node_embeds = lambda emb, gen: {}
         D.verify_mod.verify_batch = lambda vlm, drafts, cfg: [
             (d["concepts"], d["relations"], d["procedures"],

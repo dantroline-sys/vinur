@@ -1296,6 +1296,40 @@ class KB:
         self._maybe_commit()
         return row["chunk_id"] if row else chunk_id
 
+    def reclaim_text(self, text_hash: str, chunk_id: str) -> None:
+        """Hand a text claim to `chunk_id`.  The distill gate calls this when the
+        holder never landed (dropped on a server veto, failed out, or re-ingested
+        under a new id): a claim is only worth honouring once its holder has
+        actually been distilled — otherwise every later copy of the text is
+        skipped as a 'duplicate' of knowledge that does not exist."""
+        self.db.execute(
+            "UPDATE chunk_texts SET chunk_id=?, claimed_at=? WHERE text_hash=?",
+            (chunk_id, time.time(), text_hash))
+        self._maybe_commit()
+
+    def release_phantom_dupes(self) -> int:
+        """Heal the poisoned state: chunks stamped 'distilled' as an EXACT duplicate
+        of an owner that was never distilled itself.  Their stamps and dupe rows go
+        (they re-enter the queue), and every claim held by an un-distilled chunk is
+        released so the next chunk carrying that text simply wins it.  Returns how
+        many chunks were re-queued.  Run at the start of a pass, never mid-pass
+        (in-flight claims of the running pass would read as stale)."""
+        rows = self.db.execute(
+            "SELECT cd.chunk_id FROM chunk_dupes cd "
+            "WHERE cd.kind='exact' "
+            "AND EXISTS(SELECT 1 FROM distilled_chunks d WHERE d.chunk_id=cd.chunk_id) "
+            "AND NOT EXISTS(SELECT 1 FROM distilled_chunks d2 "
+            "               WHERE d2.chunk_id=cd.of_chunk_id)").fetchall()
+        ids = [r["chunk_id"] for r in rows]
+        for cid in ids:
+            self.db.execute("DELETE FROM distilled_chunks WHERE chunk_id=?", (cid,))
+            self.db.execute("DELETE FROM chunk_dupes WHERE chunk_id=?", (cid,))
+        self.db.execute(
+            "DELETE FROM chunk_texts WHERE NOT EXISTS("
+            "SELECT 1 FROM distilled_chunks d WHERE d.chunk_id=chunk_texts.chunk_id)")
+        self._maybe_commit()
+        return len(ids)
+
     def record_dupe(self, chunk_id: str, of_chunk_id: str, text_hash: str = "",
                     kind: str = "exact", similarity: float = 1.0) -> None:
         self.db.execute(
