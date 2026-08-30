@@ -416,6 +416,19 @@ class OpsRunner:
         return bool(j and j["proc"].poll() is None)
 
     def start(self, command: str, args: dict | None = None) -> dict:
+        # Endpoint mode: the box's LM(s) are reserved for outside applications
+        # — no job may run (LM-free ones included: one contract, no per-verb
+        # judgement calls).  Checked here, the single choke point, so the
+        # panel, the autopilot and any future caller all hit the same wall.
+        try:
+            from . import serving as _sv
+            if _sv.endpoint_state().get("on"):
+                return {"ok": False, "status": self.status(),
+                        "error": "endpoint mode is on — this box only serves its "
+                                 "LM(s) to outside apps. Turn it off (Serving tab, "
+                                 "or './vinur.sh endpoint off') to run jobs."}
+        except ImportError:                        # pragma: no cover - defensive
+            pass
         with self._lock:
             if self.running():
                 return {"ok": False, "error": "a job is already running", "status": self.status()}

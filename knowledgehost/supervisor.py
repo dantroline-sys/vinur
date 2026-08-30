@@ -6,6 +6,7 @@ kb server itself — as direct children in their own process groups:
 
     python -m knowledgehost.supervisor start|stop|restart [svc]|status [--json]|swap <llm>|logs [svc]
     python -m knowledgehost.supervisor minimal on|off|status   # vacate VRAM, keep serving the KB
+    python -m knowledgehost.supervisor endpoint on|off|status  # LM-endpoint-only: serve outside apps, hold own jobs
     python -m knowledgehost.supervisor run              # foreground (systemd/launchd mode)
     python -m knowledgehost.supervisor service install|uninstall|status [--dry-run]
 
@@ -322,6 +323,12 @@ def _reconcile_schedule(cfg: dict, last_want):
     only when the box isn't already in the wanted state.  Returns the new want."""
     from datetime import datetime
     from . import serving as sv
+    if sv.endpoint_state().get("on"):
+        # Endpoint mode: the box is a standing LM endpoint for outside apps —
+        # a schedule boundary must not vacate the model out from under them.
+        # last_want passes through unchanged so turning endpoint off later
+        # doesn't replay a stale boundary as a fresh crossing.
+        return last_want
     sched = sv.read_schedule()
     want = sv.schedule_wants_minimal(sched, datetime.now())
     if want is None:                       # schedule disabled — stop governing
@@ -346,6 +353,12 @@ def apply_minimal(cfg: dict, action: str) -> dict:
     active = str((sv.swap_state() or {}).get("active") or "")
     restore = str((sv.minimal_state() or {}).get("restore") or "")
     plan = plan_minimal(cfg, action, active=active, restore=restore)
+    # Minimal vacates the LM — that deliberately ENDS endpoint mode (the more
+    # recent explicit act wins; nothing later silently undoes either switch).
+    cleared_endpoint = False
+    if action == "on" and sv.endpoint_state().get("on"):
+        sv.clear_endpoint()
+        cleared_endpoint = True
     # Order: (re)write the flag FIRST so a re-spawned embedder reads the right
     # device, THEN fire the async service/swap requests.
     if plan["flag"] is not None:
@@ -360,7 +373,27 @@ def apply_minimal(cfg: dict, action: str) -> dict:
         sv.request_service(name, "start")
     if plan.get("swap"):
         sv.request_swap(plan["swap"])
-    return {"action": action, **plan}
+    return {"action": action, "cleared_endpoint": cleared_endpoint, **plan}
+
+
+def apply_endpoint(cfg: dict, action: str) -> dict:
+    """Flip endpoint mode: the box hosts its LM(s) purely as an endpoint for
+    OUTSIDE applications; all self-initiated work (autopilot, panel jobs, the
+    weekly schedule) stands down.  Turning it on while minimal is on first
+    restores the LM — an endpoint with no model resident serves nobody."""
+    from . import serving as sv
+    if action not in ("on", "off"):
+        raise ValueError("action must be on|off")
+    out = {"action": action, "restored_llm": False}
+    if action == "on":
+        if sv.minimal_state().get("on"):
+            summary = apply_minimal(cfg, "off")
+            out["restored_llm"] = True
+            out["swap"] = summary.get("swap")
+        sv.set_endpoint({"on": True, "since": time.time()})
+    else:
+        sv.clear_endpoint()
+    return out
 
 
 def _claim_lock():
@@ -743,9 +776,11 @@ def status_data() -> dict:
         from . import serving as sv
         out["swap"] = sv.swap_state() or {}
         out["minimal"] = sv.minimal_state() or {}
+        out["endpoint"] = sv.endpoint_state() or {}
     except Exception:
         out["swap"] = {}
         out["minimal"] = {}
+        out["endpoint"] = {}
     return out
 
 
@@ -764,6 +799,10 @@ def cmd_status(as_json: bool = False) -> int:
         print(f"  ** MINIMAL MODE — VRAM vacated, serving the KB (embed: "
               f"{m.get('embed', 'cpu')}).  './vinur.sh minimal off' restores "
               f"{m.get('restore') or 'the default LM'} **")
+    if (d.get("endpoint") or {}).get("on"):
+        print("  ** ENDPOINT MODE — the LM(s) serve outside apps only; this box's "
+              "own jobs (autopilot, panel operations, the weekly schedule) stand "
+              "down.  './vinur.sh endpoint off' resumes them **")
     for s in d["services"]:
         if s["state"] == "failed":
             print(f"  {s['name']:<12} FAILED  {s['note']}")
@@ -875,6 +914,39 @@ def cmd_minimal(action: str | None) -> int:
     return 0
 
 
+def cmd_endpoint(action: str | None) -> int:
+    """LM-endpoint-only mode: host the model(s) for OUTSIDE applications
+    (agents, other machines) and hold all of this box's own jobs — the
+    permanent yield-all.  A hot switch like minimal; survives restarts."""
+    from . import serving as sv
+    action = (action or "status").lower()
+    if action == "status":
+        if sv.endpoint_state().get("on"):
+            print("endpoint mode ON — the LM(s) serve outside apps only; the "
+                  "autopilot, panel jobs and the weekly schedule stand down")
+        else:
+            print("endpoint mode OFF (normal operation)")
+        return 0
+    if action not in ("on", "off"):
+        print("usage: ./vinur.sh endpoint on|off|status")
+        return 2
+    if not alive(read_state().get("supervisor", 0)):
+        print("not running — './vinur.sh start'")
+        return 1
+    summary = apply_endpoint(load_cfg(), action)
+    if action == "on":
+        note = (f" (restoring {summary.get('swap') or 'the default LM'} first — "
+                "minimal mode was on; weights load over minutes)"
+                if summary["restored_llm"] else "")
+        print(f"endpoint mode ON{note} — the LM endpoints keep answering outside "
+              "apps; this box runs none of its own jobs until "
+              "'./vinur.sh endpoint off'.")
+    else:
+        print("endpoint mode OFF — autopilot, panel jobs and the weekly schedule "
+              "resume on their own timers.")
+    return 0
+
+
 def cmd_logs(target: str | None) -> int:
     names = [target] if target else list((read_state().get("services") or {}).keys()) or ["kb"]
     files = {n: LOGS / f"{n}.log" for n in names}
@@ -928,6 +1000,8 @@ def main(argv: list[str] | None = None) -> int:
         return cmd_swap(args[1] if len(args) > 1 else None)
     if cmd == "minimal":
         return cmd_minimal(args[1] if len(args) > 1 else "status")
+    if cmd == "endpoint":
+        return cmd_endpoint(args[1] if len(args) > 1 else "status")
     if cmd == "logs":
         return cmd_logs(args[1] if len(args) > 1 else None)
     print(__doc__.split("\n\n")[1])

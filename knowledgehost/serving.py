@@ -879,6 +879,40 @@ def clear_minimal() -> None:
         pass
 
 
+# ── endpoint mode: serve the LM(s) to OUTSIDE clients only ────────────────────
+# The permanent yield-all.  Weights stay resident and the OpenAI-compatible
+# ports keep answering (agents, other machines, Vinkona) — but every
+# SELF-INITIATED consumer of this box's LMs stands down until the switch is
+# turned off: the autopilot, panel Operations jobs, and the weekly minimal
+# schedule.  kb_search/kb_ask keep answering (they serve outside callers too).
+# The mirror image of minimal mode (LM down, box quiet): here the LM is the
+# point and the box's own work is what yields.  Same flag-file idiom —
+# survives restarts, flips live, no config edit needed.
+ENDPOINT_FLAG = ROOT / "var" / "run" / "endpoint.flag"
+
+
+def endpoint_state() -> dict:
+    try:
+        d = json.loads(ENDPOINT_FLAG.read_text())
+        return d if isinstance(d, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
+def set_endpoint(d: dict) -> None:
+    ENDPOINT_FLAG.parent.mkdir(parents=True, exist_ok=True)
+    tmp = ENDPOINT_FLAG.with_suffix(".tmp")
+    tmp.write_text(json.dumps(d))
+    os.replace(tmp, ENDPOINT_FLAG)
+
+
+def clear_endpoint() -> None:
+    try:
+        ENDPOINT_FLAG.unlink()
+    except OSError:
+        pass
+
+
 # ── weekly schedule (drives minimal mode by day-of-week + time window) ────────
 # The panel's Serving › Schedule tab writes this; the supervisor re-reads it live
 # each ~30s and flips minimal mode at window boundaries.  Windows are FULL-POWER
@@ -1842,6 +1876,7 @@ def serving_status(cfg: dict) -> dict:
             "supervisor": {"running": sup_alive,
                            "pid": st.get("supervisor") if sup_alive else None},
             "swap": swap_state(), "llms": llms, "embed": embed, "reranker": reranker,
+            "endpoint": endpoint_state(),
             "unserved": unserved, "cache": hf_cache_status(),
             "vram_budget_gb": vb}
 

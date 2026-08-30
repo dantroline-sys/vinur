@@ -520,6 +520,7 @@ class Handler(BaseHTTPRequestHandler):
             return self._send_json(
                 {"ok": True, "schedule": sched,
                  "minimal": sv.minimal_state(),          # current live posture
+                 "endpoint": sv.endpoint_state(),        # schedule is held while on
                  # server-local clock so the editor can show "now" against the grid —
                  # tz included so a UTC-vs-wall-clock mismatch (a classic "timer fires at
                  # the wrong hour" cause) is visible at a glance
@@ -727,7 +728,8 @@ class Handler(BaseHTTPRequestHandler):
         if path not in ("/call", "/ops/run", "/ops/stop", "/ops/reload", "/config",
                         "/ops/autopilot", "/library/config", "/library/root",
                         "/source", "/scenario", "/brain", "/drop", "/serving/swap",
-                        "/serving/control", "/serving/minimal", "/serving/schedule",
+                        "/serving/control", "/serving/minimal", "/serving/endpoint",
+                        "/serving/schedule",
                         "/serving/model", "/serving/add",
                         "/serving/pull", "/serving/download", "/serving/tune", "/net",
                         "/metrics/mark", "/gaps/close", "/queue/delete", "/queue/clear",
@@ -957,6 +959,24 @@ class Handler(BaseHTTPRequestHandler):
             summary = sup.apply_minimal(self.cfg, action)
             return self._send_json({"ok": True, **summary,
                                     "note": "the supervisor acts within a few seconds — "
+                                            "re-poll /serving/status"})
+        if path == "/serving/endpoint":                # LM-endpoint-only (permanent yield-all)
+            # The Serving tab's switch: host the model(s) purely for outside
+            # applications; the autopilot / panel jobs / weekly schedule stand
+            # down until it's turned off.  Flag flips live, survives restarts.
+            from . import supervisor as sup
+            st = sup.read_state()
+            if not sup.alive(st.get("supervisor", 0)):
+                return self._send_json(
+                    {"ok": False, "error": "the supervisor is not running "
+                                           "(./vinur.sh start)"}, 409)
+            action = str(req.get("action") or "")
+            if action not in ("on", "off"):
+                return self._send_json(
+                    {"ok": False, "error": "action must be on|off"}, 400)
+            summary = sup.apply_endpoint(self.cfg, action)
+            return self._send_json({"ok": True, **summary,
+                                    "note": "takes effect immediately — "
                                             "re-poll /serving/status"})
         if path == "/serving/schedule":                # save the weekly minimal-mode plan
             # Validated + normalised, then written to var/run/schedule.json; the

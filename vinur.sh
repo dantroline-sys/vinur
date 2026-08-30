@@ -14,6 +14,9 @@
 #                               #   resident one (waits for /health; minutes for big weights)
 #   ./vinur.sh minimal on|off   # vacate ALL VRAM but keep serving the KB to Vinkona
 #                               #   (stops the LM(s); embed -> CPU or off; kb stays up)
+#   ./vinur.sh endpoint on|off  # LM-endpoint-only (permanent yield-all): host the
+#                               #   model(s) purely for OUTSIDE apps (agents, other
+#                               #   machines); autopilot/jobs/schedule stand down
 #   ./vinur.sh logs [svc]       # follow logs (Ctrl-C detaches)
 #   ./vinur.sh find <words>     # search the hub for models — each hit sized and
 #                               #   judged (fits / tight / too big) for THIS machine

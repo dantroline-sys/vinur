@@ -249,7 +249,7 @@ def main():
             calls = []
             pilot = ap.Autopilot(deadcfg, SimpleNamespace(
                 start=lambda c, a: calls.append(c) or {"ok": True},
-                running=lambda: False, result=lambda: {},
+                running=lambda: False, result=lambda job_id=None: {},
                 status=lambda: {"exit_code": 0}))
             sv.SWAP_STATE.write_text(json.dumps({"active": "primary", "status": "ready"}))
             pilot._run_step({"command": "distill", "model": "primary", "label": "d"},
@@ -303,7 +303,7 @@ def main():
             calls.clear()
             pilot_live = ap.Autopilot(livecfg, SimpleNamespace(
                 start=lambda c, a: calls.append(c) or {"ok": True},
-                running=lambda: False, result=lambda: {},
+                running=lambda: False, result=lambda job_id=None: {},
                 status=lambda: {"exit_code": 0}))
             assert not sv.SWAP_STATE.exists()
             pilot_live._run_step({"command": "distill", "label": "manual"},

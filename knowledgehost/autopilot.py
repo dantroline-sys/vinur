@@ -290,6 +290,16 @@ class Autopilot:
         except Exception:                           # pragma: no cover
             return False
 
+    def _endpoint_on(self) -> bool:
+        """Endpoint mode = this box hosts its LM(s) purely for OUTSIDE
+        applications (the permanent yield-all).  The autopilot must not touch
+        the model — not even a swap — so it stands down entirely."""
+        try:
+            from . import serving as _sv
+            return bool(_sv.endpoint_state().get("on"))
+        except Exception:                           # pragma: no cover
+            return False
+
     def _minimal_on(self) -> bool:
         """Minimal mode = the big LM is deliberately stopped and its VRAM freed
         (manual switch or the weekly schedule).  The autopilot MUST stand down:
@@ -325,6 +335,12 @@ class Autopilot:
                 if not plan.get("enabled"):
                     self._state.update(running_step=None, last_reason="disabled")
                     self._sleep(5)
+                    continue
+                if self._endpoint_on():            # LM reserved for outside apps
+                    self._state.update(running_step=None, last_reason=(
+                        "paused — endpoint mode: the LM serves outside apps only "
+                        "(Serving tab, or './vinur.sh endpoint off', to resume)"))
+                    self._sleep(min(30, plan["idle_interval_s"]))
                     continue
                 if self._minimal_on():             # VRAM vacated (switch/schedule) — no ingest
                     self._state.update(running_step=None, last_reason=self._minimal_reason())

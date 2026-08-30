@@ -1661,6 +1661,30 @@ async function doSwap(name) {
   if (!r.ok) svNote('✗ ' + esc(r.error || 'swap request failed'), 30);
   pollServing();
 }
+// ── endpoint mode: the permanent yield-all switch ────────────────────────────
+// Host the model(s) purely as an endpoint for OUTSIDE applications: the
+// Prioritizer, Operations jobs and the weekly schedule all stand down until
+// it's turned off; kb queries keep answering.  State lives server-side
+// (var/run/endpoint.flag) — flips live, survives restarts.
+function epStrip(ep) {
+  const on = !!(ep || {}).on;
+  return `<div style="display:flex;gap:10px;align-items:center;flex-wrap:wrap;
+      border:1px solid ${on ? '#2e7d32aa' : '#8884'};border-radius:6px;padding:8px 12px;margin:0 0 12px;${on ? 'background:#2e7d3214' : ''}">
+    <b>Endpoint mode</b> ${on ? '<b style="color:#2e7d32">ON</b>' : '<span style="opacity:.6">off</span>'}
+    <span style="opacity:.75;font-size:12px;flex:1;min-width:280px">host the model(s) purely as an
+      OpenAI-compatible endpoint for your other apps (agents, other machines): this box runs none of its own
+      jobs — Prioritizer, Operations and the weekly schedule stand down — and kb queries keep answering.</span>
+    <button class="toolbtn" onclick="epToggle('${on ? 'off' : 'on'}')">${on ? 'Turn off' : 'Turn on'}</button></div>`;
+}
+async function epToggle(action) {
+  const r = await postJSON('/serving/endpoint', { action }).catch(e => ({ ok: false, error: netErr(e) }));
+  svNote(r.ok
+    ? `<span style="color:#0a0">✓ endpoint mode ${action}${r.restored_llm
+        ? ' — minimal was on, restoring the LM first (weights load over minutes)' : ''}</span>`
+    : `<span style="color:#c00">✗ ${esc(r.error || 'failed')}</span>`, 12);
+  pollServing();
+}
+
 let SVBUSY = false;
 let SVNOTE = null;      // the last action's outcome — survives poll re-renders
 function svNote(html, secs) {
@@ -1760,8 +1784,9 @@ async function pollServing_() {
     + (sup.running ? ` — supervisor pid ${sup.pid}.` : '.')
     + ` Weight chips show the on-disk state: <i>incomplete</i> during a download <b>and</b> after a
        failed one (the note column carries the service's last log line — a crash there plus
-       incomplete weights usually means the fetch died: gated repo token, disk, network).</p>
-     <table><tr><th>model</th><th>what</th><th>service</th><th>weights</th><th>note</th><th></th></tr>
+       incomplete weights usually means the fetch died: gated repo token, disk, network).</p>`
+    + epStrip(r.endpoint)
+    + `<table><tr><th>model</th><th>what</th><th>service</th><th>weights</th><th>note</th><th></th></tr>
      ${rows}${auxRows}</table>`
     + dlHtml + unHtml + svLogPanel() + svCache(r.cache);
   const pre = $('#svlogpre');
@@ -2598,7 +2623,8 @@ async function loadSchedule() {
   if (!r.ok) { $('#results').className = 'empty'; $('#results').textContent = 'enter the auth token above to edit the schedule'; return; }
   SCHED = r.schedule && r.schedule.windows ? r.schedule : { enabled: !!(r.schedule || {}).enabled, windows: {} };
   if (!SCHED.windows) SCHED.windows = {};
-  SCHED_META = { now: r.now || {}, minimal: r.minimal || {}, wants: r.wants_minimal, at: Date.now() };
+  SCHED_META = { now: r.now || {}, minimal: r.minimal || {}, endpoint: r.endpoint || {},
+                 wants: r.wants_minimal, at: Date.now() };
   renderSchedule();
 }
 // A ticking box-clock: seed from the server's reported time + elapsed since the
@@ -2646,15 +2672,19 @@ function renderSchedule() {
       <td>${cells || '<span style="opacity:.45">minimal all day</span>'} </td>
       <td><button class="toolbtn" onclick="schAddWindow('${k}')">+ window</button></td></tr>`;
   }).join('');
-  const warn = (SCHED.enabled && !anyWin)
+  const epHold = (m.endpoint || {}).on
+    ? `<div class="note" style="margin:6px 0">⏸ <b>Endpoint mode is on</b> (Models tab) — the box is a standing
+         LM endpoint for outside apps, so this schedule is <b>held</b>: no boundary will vacate or restore the
+         model until endpoint mode is turned off.</div>` : '';
+  const warn = epHold + ((SCHED.enabled && !anyWin)
     ? `<div class="note" style="margin:6px 0">⚠ Schedule is <b>enabled but has no windows</b> on any day, so it
          is <b>not governing</b> — the box follows the manual switch and the Prioritizer runs as normal. Add at
          least one full-power window below (or turn the schedule off) to drive minimal mode by the clock.</div>`
-    : disagree
+    : disagree && !(m.endpoint || {}).on
     ? `<div class="note" style="margin:6px 0">⚠ The schedule wants <b>${esc(wants)}</b> but the box is
          <b>${on ? 'minimal' : 'full'}</b>. The supervisor reconciles within ~30 s of a boundary — if this
          persists, the schedule timer isn't running (is the supervisor up, and running this build?), or the
-         box clock/timezone above isn't what you expected.</div>` : '';
+         box clock/timezone above isn't what you expected.</div>` : '');
   $('#results').innerHTML =
     `${clockLine}${warn}
      <div style="margin:6px 0 12px;font-size:13px">
