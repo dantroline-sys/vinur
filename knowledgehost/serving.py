@@ -113,6 +113,61 @@ def _mapped_flags(entry: dict, table: list) -> list[str]:
     return out
 
 
+def _conflict_flags(entry: dict, engine: str) -> set[str]:
+    """The CLI spellings of every knob this (tune-merged) entry sets
+    first-class — the flags a raw `args` entry must not silently re-set."""
+    flags: set[str] = set()
+    if engine in ("vllm", "container"):
+        for key, flag, kind in _VLLM_KEYS:
+            if key in entry:
+                flags.add(flag)
+                if kind == "onoff":
+                    flags.add(flag.replace("--", "--no-", 1))
+    elif engine == "llama":
+        if "ctx_size" in entry:
+            flags |= {"-c", "--ctx-size"}
+        if "n_gpu_layers" in entry:
+            flags |= {"-ngl", "--n-gpu-layers", "--gpu-layers"}
+    return flags
+
+
+def _strip_conflicts(args: list[str], flags: set[str]) -> tuple[list[str], list[str]]:
+    """Drop occurrences of `flags` (and their value token) from a raw args
+    list.  The Tune editor's saved value must WIN: `args` is appended last so
+    it overrides engine defaults, and before this a stale duplicate there —
+    e.g. --gpu-memory-utilization from an old fit recipe — silently beat the
+    tuned value (the engines take the last occurrence).  Returns
+    (kept, dropped-flag-names)."""
+    kept: list[str] = []
+    dropped: list[str] = []
+    i = 0
+    while i < len(args):
+        a = args[i]
+        base = a.split("=", 1)[0]
+        if base in flags:
+            dropped.append(base)
+            # a separate value token follows unless the flag was --k=v form
+            # or the next token is itself a flag (boolean spelling)
+            if "=" not in a and i + 1 < len(args) and not args[i + 1].startswith("-"):
+                i += 1
+            i += 1
+            continue
+        kept.append(a)
+        i += 1
+    return kept, dropped
+
+
+def args_superseded(entry: dict, root: Path = ROOT) -> list[str]:
+    """Which raw-args flags on this entry are superseded by tuned keys — for
+    the Serving tab's note column, so the shadowing is visible, never silent."""
+    engine = str(entry.get("engine") or "")
+    tune, _ = read_model_tuning(entry, root)
+    merged = {**tune, **entry} if tune else entry
+    _, dropped = _strip_conflicts([str(a) for a in (entry.get("args") or [])],
+                                  _conflict_flags(merged, engine))
+    return sorted(set(dropped))
+
+
 # What the Serving tab's Tune editor offers: every first-class knob with a
 # recommended starting point and a plain-language explanation.  `applies` says
 # what has to restart before a change takes effect: "service" = Restart (or
@@ -141,7 +196,12 @@ TUNING_SCHEMA = [
      "help": "The fraction of GPU memory vLLM claims at startup for weights plus "
              "KV cache. 0.90 for an exclusive model. Models running TOGETHER must "
              "share — their fractions (plus headroom) must sum below 1.0 or the "
-             "second one dies at start.", "applies": "service", "scope": "model"},
+             "second one dies at start. A fraction is vLLM's own vocabulary (there "
+             "is no absolute-GB knob): multiply by the VRAM budget shown here for "
+             "the GB figure. Applies on the service's restart / next swap-in — "
+             "0.90 still claimed after that means something else was re-setting "
+             "the flag (see the row's note).",
+     "applies": "service", "scope": "model"},
     {"key": "max_num_seqs", "label": "Parallel sequences", "type": "int",
      "engines": ["vllm", "container"], "min": 1, "max": 4096,
      "recommended": 64,
@@ -572,8 +632,14 @@ def llm_argv(entry: dict, root: Path = ROOT) -> list[str]:
         entry = {**tune, **entry}
     host = str(entry.get("host") or "127.0.0.1")
     port = str(int(entry["port"]))
-    args = [str(a) for a in (entry.get("args") or [])]
     engine = entry["engine"]
+    # args still overrides anything NOT set first-class (engine defaults,
+    # exotic flags) — but a knob the user set through the Tune editor (or the
+    # entry) wins over a stale duplicate here, instead of losing to it
+    # silently because args comes last and the engines take the last
+    # occurrence.  serving_status names any superseded flag in the note.
+    args, _ = _strip_conflicts([str(a) for a in (entry.get("args") or [])],
+                               _conflict_flags(entry, engine))
     if engine == "container":
         # The official vLLM image via podman/docker: the image carries the
         # matched CUDA toolkit + compiler the wheels were built against, so
@@ -626,8 +692,10 @@ def llm_argv(entry: dict, root: Path = ROOT) -> list[str]:
         if not os.path.isfile(model):
             raise FileNotFoundError(f"GGUF not found: {model}")
         # -ngl 99 default (a box serving LMs wants them on GPU); ctx_size /
-        # n_gpu_layers are the first-class knobs, args can override anything
-        # because llama-server takes the LAST occurrence of a repeated flag.
+        # n_gpu_layers are the first-class knobs.  args overrides anything the
+        # user did NOT set first-class (llama-server takes the LAST occurrence
+        # of a repeated flag); an explicitly tuned knob's duplicate is
+        # stripped from args above, so the tuned value wins.
         argv = [_llama_server(), "-m", model, "--host", host, "--port", port,
                 "-ngl", str(entry.get("n_gpu_layers", 99))]
         if "ctx_size" in entry:
@@ -1844,6 +1912,11 @@ def serving_status(cfg: dict) -> dict:
                 "tuning": tun,
                 "tune_file": str(tuning_path(e) or ""),
                 "weights": weights_status(engine, str(e.get("model") or ""))}
+        sup_args = args_superseded(e)
+        if sup_args:
+            tnote = (tnote + " · " if tnote else "") + (
+                "entry args also set " + ", ".join(sup_args) + " — the tuned "
+                "value wins; tidy config.toml's args to silence this")
         if tnote:
             item["tune_note"] = tnote
         item.update(svc_state(f"llm-{name}", name))
@@ -1905,6 +1978,10 @@ def main(argv: list[str] | None = None) -> None:
     ap.add_argument("name", help="an llms[] entry's name, or 'embed'")
     ap.add_argument("-c", "--config", default=None,
                     help="config.toml (default: ./config.toml when present)")
+    ap.add_argument("--dry-run", action="store_true",
+                    help="print the exact command (and which tune.toml fed it) "
+                         "instead of exec'ing — the one-look answer to 'is my "
+                         "tuned value actually reaching the engine?'")
     ns = ap.parse_args(argv)
 
     from .config import load_config
@@ -1917,8 +1994,11 @@ def main(argv: list[str] | None = None) -> None:
     cfg = load_config(cfg_path)
 
     if ns.name == "embed":
-        _llama_server()          # resolve the binary BEFORE the ~260 MB download
-        cmd = embed_argv(cfg, ensure_embed_model())
+        if ns.dry_run:           # no download on a dry run — the expected path suffices
+            cmd = embed_argv(cfg, str(ROOT / "models" / EMBED_MODEL_FILE))
+        else:
+            _llama_server()      # resolve the binary BEFORE the ~260 MB download
+            cmd = embed_argv(cfg, ensure_embed_model())
     else:
         entries = {str(e.get("name")): e for e in cfg["serving"]["llms"]}
         if ns.name not in entries:
@@ -1945,9 +2025,10 @@ def main(argv: list[str] | None = None) -> None:
             # flags (host env doesn't cross); an explicit entry env still wins.
             entry = {**entry, "env": {**hf, **dict(entry.get("env") or {})}}
         cmd = llm_argv(entry)
-        if entry.get("engine") == "container":
+        if entry.get("engine") == "container" and not ns.dry_run:
             # env went into the argv as -e flags; just guarantee the mounted
             # cache exists so the runtime doesn't invent it with odd labels.
+            # (--dry-run skips this: an image pull is no part of a dry run.)
             (ROOT / "var" / "cache" / "huggingface").mkdir(parents=True, exist_ok=True)
             _ensure_image(entry)               # declared egress, never a side effect
         else:
@@ -1965,6 +2046,20 @@ def main(argv: list[str] | None = None) -> None:
                 os.environ["CUDA_HOME"] = home
                 os.environ["PATH"] = f"{home}/bin:" + os.environ.get("PATH", "")
                 print(f"CUDA_HOME not set — using the toolkit at {home}", flush=True)
+    if ns.dry_run:
+        if ns.name != "embed":
+            tp = tuning_path(entry)
+            tvals, tnote = read_model_tuning(entry)
+            print(f"tune file: {tp if tp else '(none — tuning lives on the config entry)'}")
+            if tvals:
+                print("tuned:     " + ", ".join(f"{k}={v}" for k, v in sorted(tvals.items())))
+            if tnote:
+                print(f"note:      {tnote}")
+            sup = args_superseded(entry)
+            if sup:
+                print("superseded args flag(s) (the tuned value wins): " + ", ".join(sup))
+        print("would exec:", " ".join(redact_argv(cmd)), flush=True)
+        return
     print("exec:", " ".join(redact_argv(cmd)), flush=True)
     os.execvp(cmd[0], cmd)
 

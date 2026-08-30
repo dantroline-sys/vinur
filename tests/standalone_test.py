@@ -104,7 +104,7 @@ def main():
                 "max_model_len": 16384, "gpu_memory_utilization": 0.9,
                 "max_num_seqs": 32, "tensor_parallel": 2, "enforce_eager": True,
                 "trust_remote_code": False, "served_model_name": "primary",
-                "args": ["--kv-cache-dtype", "auto"]}
+                "args": ["--kv-cache-dtype", "auto", "--seed", "7"]}
         argv = serving.llm_argv(full, root=Path(td))
         s = " ".join(argv)
         assert "--quantization modelopt" in s and "--kv-cache-dtype fp8" in s
@@ -112,8 +112,13 @@ def main():
         assert "--max-num-seqs 32" in s and "--tensor-parallel-size 2" in s
         assert "--served-model-name primary" in s
         assert "--enforce-eager" in s and "--trust-remote-code" not in s
-        assert argv[-2:] == ["--kv-cache-dtype", "auto"], "args must come LAST (override)"
-        ok("vLLM keys map to flags; false flags omitted; args override last")
+        # since the VRAM-share fix: an args duplicate of a FIRST-CLASS key is
+        # stripped (the tuned value must win — the engines take the last
+        # occurrence); args still rides last for everything else.
+        assert argv.count("--kv-cache-dtype") == 1 and "auto" not in argv, \
+            "a tuned key's args duplicate must be stripped"
+        assert argv[-2:] == ["--seed", "7"], "non-conflicting args still come LAST"
+        ok("vLLM keys map to flags; tuned keys beat args duplicates; other args last")
 
         lean = serving.llm_argv({"name": "p", "engine": "vllm",
                                  "model": "org/M", "port": 1}, root=Path(td))
