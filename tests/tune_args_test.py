@@ -20,6 +20,10 @@ tuned value silently: the user sets 0.6, vLLM still claims 0.9.
     tune.toml reach the engine, args duplicates are stripped, validate_tuning
     coerces them (a false Tool calling REMOVES the key — engine default off),
     and they are vLLM/container-only.
+  * the Thinking default (enable_thinking, bool3) emits
+    --default-chat-template-kwargs {"enable_thinking":…} — off is a real
+    value, unset means the template's own default; per-request
+    chat_template_kwargs (Vinkona's own calls) still override it.
 
 Run:  python tests/tune_args_test.py     (stdlib only)
 """
@@ -170,6 +174,41 @@ def main():
         check("the knobs are vLLM/container-only", False)
     except ValueError:
         check("the knobs are vLLM/container-only", True)
+
+    # ── the Thinking default (tri-state chat-template kwarg) ─────────────────
+    check("Thinking on emits the server-default kwarg as compact JSON",
+          SV._mapped_flags({"enable_thinking": True}, SV._VLLM_KEYS)
+          == ["--default-chat-template-kwargs", '{"enable_thinking":true}'])
+    check("Thinking off emits false (a real value, not an absence)",
+          SV._mapped_flags({"enable_thinking": False}, SV._VLLM_KEYS)
+          == ["--default-chat-template-kwargs", '{"enable_thinking":false}'])
+    check("unset Thinking emits nothing — the template's own default rules",
+          SV._mapped_flags({}, SV._VLLM_KEYS) == [])
+    check("validate_tuning keeps a false Thinking (bool3: off ≠ unset)",
+          SV.validate_tuning("container", {"enable_thinking": False})
+          == {"enable_thinking": False})
+    check("…and empties it back to the template default",
+          SV.validate_tuning("container", {"enable_thinking": ""})
+          == {"enable_thinking": None})
+    kept, dropped = SV._strip_conflicts(
+        ["--default-chat-template-kwargs", '{"enable_thinking":true}', "-x"],
+        SV._conflict_flags({"enable_thinking": False}, "container"))
+    check("a tuned Thinking strips the args duplicate (flag AND its JSON value)",
+          kept == ["-x"] and dropped == ["--default-chat-template-kwargs"])
+    with tempfile.TemporaryDirectory() as td:
+        model_dir = Path(td) / "weights"
+        model_dir.mkdir()
+        (model_dir / "tune.toml").write_text("enable_thinking = false\n")
+        rt0 = SV._container_runtime
+        SV._container_runtime = lambda e: "podman"
+        try:
+            argv = SV.llm_argv({"name": "big", "engine": "container",
+                                "model": str(model_dir), "port": 8010},
+                               root=Path(td))
+            check("tune.toml's Thinking reaches the engine",
+                  '{"enable_thinking":false}' in argv)
+        finally:
+            SV._container_runtime = rt0
 
     print()
     if check.failed:

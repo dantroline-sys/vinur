@@ -95,6 +95,7 @@ _VLLM_KEYS = [
     ("enable_auto_tool_choice", "--enable-auto-tool-choice", "flag"),
     ("tool_call_parser",       "--tool-call-parser",       "value"),
     ("reasoning_parser",       "--reasoning-parser",       "value"),
+    ("enable_thinking",        "--default-chat-template-kwargs", "tmpl_bool"),
     ("enforce_eager",          "--enforce-eager",          "flag"),
     ("trust_remote_code",      "--trust-remote-code",      "flag"),
 ]
@@ -111,6 +112,11 @@ def _mapped_flags(entry: dict, table: list) -> list[str]:
                 out.append(flag)
         elif kind == "onoff":                 # tri-state: absent = engine default
             out.append(flag if v else flag.replace("--", "--no-", 1))
+        elif kind == "tmpl_bool":             # tri-state chat-template kwarg:
+            # absent = the template's own default; the value is a JSON object
+            # keyed by the toml key ({"enable_thinking": true/false}).  A
+            # request's own chat_template_kwargs still override this default.
+            out += [flag, json.dumps({key: bool(v)}, separators=(",", ":"))]
         elif v is not None and str(v) != "":
             out += [flag, str(v)]
     return out
@@ -257,6 +263,16 @@ TUNING_SCHEMA = [
              "non-reasoning models; a reasoning model doing tool calls "
              "usually needs BOTH parsers set.",
      "applies": "service", "scope": "model"},
+    {"key": "enable_thinking", "label": "Thinking", "type": "bool3",
+     "engines": ["vllm", "container"], "recommended": None,
+     "help": "The SERVER default for hybrid thinking models (Qwen3 family): "
+             "on = requests think unless they say otherwise, off = they "
+             "don't, unset = the model template's own default. Clients that "
+             "pass chat_template_kwargs themselves (Vinkona's own calls do) "
+             "override this per request — the knob is for outside apps that "
+             "send plain OpenAI requests. With thinking on, set the "
+             "Reasoning parser too, or the thinking stream leaks into the "
+             "answer.", "applies": "service", "scope": "model"},
     {"key": "ctx_size", "label": "Context size", "type": "int",
      "engines": ["llama"], "min": 256, "max": 1048576, "recommended": 4096,
      "why": "knowledge chunks are ≤2048 tokens — a few k is plenty",
@@ -1230,6 +1246,10 @@ _FAILURE_HINTS = [
      "the Tool-call parser name isn't one this vLLM build knows — the log "
      "line lists the valid names ('vllm serve --help' does too); fix it in "
      "the row's TUNE editor."),
+    ("unrecognized arguments: --default-chat-template-kwargs",
+     "this vLLM build predates the Thinking knob's flag — update vLLM (a "
+     "container entry: its image tag), or unset Thinking in the row's TUNE "
+     "editor and control thinking per request instead."),
     ("Could not find nvcc",
      "CUDA toolkit missing — vLLM's JIT kernels (NVFP4/FP8 MoE on consumer "
      "Blackwell needs them) can't build. Switch the entry to engine="
