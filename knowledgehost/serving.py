@@ -92,6 +92,9 @@ _VLLM_KEYS = [
     ("cpu_offload_gb",         "--cpu-offload-gb",         "value"),
     ("swap_space",             "--swap-space",             "value"),
     ("served_model_name",      "--served-model-name",      "value"),
+    ("enable_auto_tool_choice", "--enable-auto-tool-choice", "flag"),
+    ("tool_call_parser",       "--tool-call-parser",       "value"),
+    ("reasoning_parser",       "--reasoning-parser",       "value"),
     ("enforce_eager",          "--enforce-eager",          "flag"),
     ("trust_remote_code",      "--trust-remote-code",      "flag"),
 ]
@@ -231,6 +234,28 @@ TUNING_SCHEMA = [
      "help": "Reuse computed KV for prompts that share a prefix. The distiller "
              "sends thousands of prompts with the same header, so this saves real "
              "prefill time. Turn it off only when VRAM is critically tight.",
+     "applies": "service", "scope": "model"},
+    {"key": "enable_auto_tool_choice", "label": "Tool calling", "type": "bool",
+     "engines": ["vllm", "container"], "recommended": None,
+     "help": "Let OpenAI-style clients send a tools list and have the model "
+             "pick one — coding agents (opencode, pi, …) need this or their "
+             "requests fail at the endpoint. Needs the Tool-call parser below "
+             "set to the model's family. Off = plain chat only.",
+     "applies": "service", "scope": "model"},
+    {"key": "tool_call_parser", "label": "Tool-call parser", "type": "str",
+     "engines": ["vllm", "container"],
+     "help": "How this model family writes tool calls: hermes (Qwen and most "
+             "ChatML models), mistral, llama3_json, glm45, deepseek_v3, "
+             "granite, … — 'vllm serve --help' lists what your build knows. "
+             "Read only while Tool calling is on; a wrong name fails at "
+             "startup with the valid list in the log.",
+     "applies": "service", "scope": "model"},
+    {"key": "reasoning_parser", "label": "Reasoning parser", "type": "str",
+     "engines": ["vllm", "container"],
+     "help": "For reasoning models only: separates the thinking stream from "
+             "the answer (deepseek_r1, qwen3, glm45, …). Leave empty for "
+             "non-reasoning models; a reasoning model doing tool calls "
+             "usually needs BOTH parsers set.",
      "applies": "service", "scope": "model"},
     {"key": "ctx_size", "label": "Context size", "type": "int",
      "engines": ["llama"], "min": 256, "max": 1048576, "recommended": 4096,
@@ -1197,6 +1222,14 @@ def cuda_home_probe(environ: dict = None, prefixes: tuple = ("/usr/local", "/opt
 # status put these next to the dead service so nobody has to re-diagnose a
 # failure mode we've already seen in the wild.
 _FAILURE_HINTS = [
+    ("requires --tool-call-parser",
+     "Tool calling is on but no parser is set — open the row's TUNE editor "
+     "and pick a Tool-call parser matching the model family (hermes for "
+     "Qwen/ChatML models, mistral, llama3_json, glm45, …)."),
+    ("Invalid tool call parser",
+     "the Tool-call parser name isn't one this vLLM build knows — the log "
+     "line lists the valid names ('vllm serve --help' does too); fix it in "
+     "the row's TUNE editor."),
     ("Could not find nvcc",
      "CUDA toolkit missing — vLLM's JIT kernels (NVFP4/FP8 MoE on consumer "
      "Blackwell needs them) can't build. Switch the entry to engine="

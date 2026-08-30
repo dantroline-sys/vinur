@@ -15,6 +15,11 @@ tuned value silently: the user sets 0.6, vLLM still claims 0.9.
     UN-tuned -ngl in args still wins over the built-in default (the
     documented args-override behaviour is only narrowed, not removed).
   * args_superseded names the shadowed flags for the Serving tab's note.
+  * the tool-calling knobs (enable_auto_tool_choice / tool_call_parser /
+    reasoning_parser) ride the same first-class lane: Tune-editor values in
+    tune.toml reach the engine, args duplicates are stripped, validate_tuning
+    coerces them (a false Tool calling REMOVES the key — engine default off),
+    and they are vLLM/container-only.
 
 Run:  python tests/tune_args_test.py     (stdlib only)
 """
@@ -122,6 +127,49 @@ def main():
                   and argv2[len(argv2) - 1 - argv2[::-1].index("-ngl") + 1] == "40")
         finally:
             SV._llama_server = ls0
+
+    # ── tool-calling knobs ride the same first-class lane ────────────────────
+    fl = SV._conflict_flags({"enable_auto_tool_choice": True,
+                             "tool_call_parser": "hermes"}, "container")
+    check("tool-calling keys join the conflict set",
+          {"--enable-auto-tool-choice", "--tool-call-parser"} <= fl)
+    with tempfile.TemporaryDirectory() as td:
+        model_dir = Path(td) / "weights"
+        model_dir.mkdir()
+        (model_dir / "tune.toml").write_text(
+            'enable_auto_tool_choice = true\ntool_call_parser = "hermes"\n')
+        rt0 = SV._container_runtime
+        SV._container_runtime = lambda e: "podman"
+        try:
+            entry = {"name": "big", "engine": "container",
+                     "model": str(model_dir), "port": 8010,
+                     "args": ["--tool-call-parser", "stale"]}
+            argv = SV.llm_argv(entry, root=Path(td))
+            check("tuned tool calling reaches the engine, args duplicate "
+                  "stripped",
+                  "--enable-auto-tool-choice" in argv
+                  and argv.count("--tool-call-parser") == 1
+                  and argv[argv.index("--tool-call-parser") + 1] == "hermes"
+                  and "stale" not in argv)
+        finally:
+            SV._container_runtime = rt0
+    check("validate_tuning accepts the parser + flag",
+          SV.validate_tuning("container", {"tool_call_parser": "hermes",
+                                           "enable_auto_tool_choice": True})
+          == {"tool_call_parser": "hermes", "enable_auto_tool_choice": True})
+    check("a false Tool calling just removes the key (engine default = off)",
+          SV.validate_tuning("container", {"enable_auto_tool_choice": False})
+          == {"enable_auto_tool_choice": None})
+    try:
+        SV.validate_tuning("container", {"tool_call_parser": "her mes"})
+        check("a parser with spaces is rejected", False)
+    except ValueError:
+        check("a parser with spaces is rejected", True)
+    try:
+        SV.validate_tuning("llama", {"tool_call_parser": "hermes"})
+        check("the knobs are vLLM/container-only", False)
+    except ValueError:
+        check("the knobs are vLLM/container-only", True)
 
     print()
     if check.failed:
