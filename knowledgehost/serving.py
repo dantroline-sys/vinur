@@ -630,7 +630,7 @@ def llm_argv(entry: dict, root: Path = ROOT) -> list[str]:
     tune, _ = read_model_tuning(entry, root)
     if tune:
         entry = {**tune, **entry}
-    host = str(entry.get("host") or "127.0.0.1")
+    host, _why = llm_bind_host(entry)
     port = str(int(entry["port"]))
     engine = entry["engine"]
     # args still overrides anything NOT set first-class (engine defaults,
@@ -997,6 +997,23 @@ def endpoint_state() -> dict:
     ov = override_state()
     return ({"on": True, "since": ov.get("since")} if ov.get("mode") == "endpoint"
             else {})
+
+
+def llm_bind_host(entry: dict) -> tuple[str, str]:
+    """The address an LM entry binds, and why ("entry" | "endpoint mode" |
+    "default").  An explicit `host` on the entry is authoritative in EVERY
+    mode — a hand-set 127.0.0.1 stays loopback even as an endpoint, and a
+    hand-set 0.0.0.0 stays wide in every posture.  Without one the default
+    is loopback, except under a pinned endpoint mode — whose whole point is
+    outside callers — which widens it to all interfaces.  Read at spawn:
+    apply_override restarts the running LMs when endpoint-ness changes, so
+    the bind actually follows the mode."""
+    h = str(entry.get("host") or "").strip()
+    if h:
+        return h, "entry"
+    if endpoint_state().get("on"):
+        return "0.0.0.0", "endpoint mode"
+    return "127.0.0.1", "default"
 
 
 # ── weekly schedule (drives minimal mode by day-of-week + time window) ────────
@@ -1917,6 +1934,17 @@ def serving_status(cfg: dict) -> dict:
             tnote = (tnote + " · " if tnote else "") + (
                 "entry args also set " + ", ".join(sup_args) + " — the tuned "
                 "value wins; tidy config.toml's args to silence this")
+        bind, bwhy = llm_bind_host({**fvals, **e})
+        item["bind"] = bind
+        if bwhy == "endpoint mode":
+            has_key = any(str(a) == "--api-key" or str(a).startswith("--api-key=")
+                          for a in (e.get("args") or []))
+            tnote = (tnote + " · " if tnote else "") + (
+                "endpoint mode: binds 0.0.0.0 — reachable from other machines "
+                "(open the port in the host firewall"
+                + ("" if has_key else
+                   "; no --api-key in args, so no key is required")
+                + ")")
         if tnote:
             item["tune_note"] = tnote
         item.update(svc_state(f"llm-{name}", name))
@@ -2058,6 +2086,8 @@ def main(argv: list[str] | None = None) -> None:
             sup = args_superseded(entry)
             if sup:
                 print("superseded args flag(s) (the tuned value wins): " + ", ".join(sup))
+            bhost, bwhy = llm_bind_host(entry)
+            print(f"bind:      {bhost} ({bwhy})")
         print("would exec:", " ".join(redact_argv(cmd)), flush=True)
         return
     print("exec:", " ".join(redact_argv(cmd)), flush=True)

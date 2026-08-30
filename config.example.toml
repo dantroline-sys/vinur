@@ -54,7 +54,9 @@ auth_token = ""         # if set, /call requires Authorization: Bearer <token>
 # engine    = "vllm"              # required — vllm | llama
 # model     = "org/Model-NVFP4"   # required — HF id or local snapshot dir
 # port      = 11438               # required — 11438 = distill_urls default
-# host      = "127.0.0.1"         # bind (keep localhost; the kb proxies nothing)
+# host      = "127.0.0.1"         # bind — set = authoritative in EVERY mode; unset =
+#                                 #   loopback, except 0.0.0.0 while mode endpoint is
+#                                 #   pinned (LAN endpoint for your other apps)
 # exclusive = true                # can't co-reside with the other exclusive
 #                                 #   entries: ONE of them runs, swap loads another
 #                                 #   (./vinur.sh swap <name> / POST /serving/swap /

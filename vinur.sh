@@ -19,7 +19,9 @@
 #                               #   until 'mode automatic'); endpoint = host the
 #                               #   model(s) purely for OUTSIDE apps (agents, other
 #                               #   machines) while this box runs none of its own
-#                               #   jobs.  Same selector sits in the panel header.
+#                               #   jobs — LM ports bind 0.0.0.0 while pinned
+#                               #   (an entry's own host= beats that).  Same
+#                               #   selector sits in the panel header.
 #   ./vinur.sh endpoint on|off  # shorthand: mode endpoint / mode automatic
 #   ./vinur.sh logs [svc]       # follow logs (Ctrl-C detaches)
 #   ./vinur.sh find <words>     # search the hub for models — each hit sized and

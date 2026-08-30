@@ -241,7 +241,12 @@ minimal / prioritiser: <step>* while automation governs, and grows an
 hosts its model(s) purely as an OpenAI-compatible endpoint for your *other*
 applications (agents, other machines) while every self-initiated consumer
 stands down — the Prioritizer pauses, panel jobs are refused, the weekly
-schedule is held — and kb queries keep answering. Pins survive restarts;
+schedule is held — and kb queries keep answering. While the endpoint pin is
+on, LM ports bind `0.0.0.0` (LAN-reachable — open the port in the host
+firewall, and add `--api-key <secret>` to the entry's `args` if it should
+require a key) instead of loopback; an entry's own `host =` beats that in
+every mode, and running LMs restart to rebind on the way in and out.
+Pins survive restarts;
 `./vinur.sh endpoint on|off` remains as shorthand;
 `./vinur.sh service install` registers a systemd/launchd start-at-login unit;
 `status --json` is the machine seam for scripts and shells; `./vinur.sh net`

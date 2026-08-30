@@ -528,6 +528,8 @@ function renderJobBar(job) {
 // no automated scheduler changes it until Unset (which reconciles at once).
 // Endpoint only = the permanent yield-all: the LM(s) answer outside apps
 // while this box runs none of its own jobs; kb queries keep answering.
+// While pinned, LM ports bind 0.0.0.0 (LAN-reachable) instead of loopback —
+// an entry's own host= beats that — and running LMs restart to rebind.
 const MODE_OPTS = [['automatic', 'Automatic'], ['full', 'Full power'],
                    ['minimal', 'Minimal'], ['endpoint', 'Endpoint only']];
 function modeCtl(m) {
@@ -544,7 +546,7 @@ function modeCtl(m) {
     ? `mode pinned by you: ${ov} — every automated scheduler is held until Unset`
     : 'Automatic: the weekly schedule and the Prioritizer govern the box. Pick a '
       + 'mode to pin it (Endpoint only = serve the LM to your other apps and run '
-      + 'none of this box\\'s own jobs).';
+      + 'none of this box\\'s own jobs; LM ports bind 0.0.0.0 while pinned).';
   return `<span class="lbl${ov ? ' ovr' : ''}" title="${tip}">mode${ov ? ' ⚑' : ''}:</span>`
     + `<select id="modeSel" title="${tip}" onchange="setMode(this.value)">${opts}</select>`
     + (ov ? `<button class="toolbtn" onclick="setMode('automatic')"
@@ -557,11 +559,13 @@ async function setMode(mode) {
       + `${r.error === 'unauthorized' ? ' — enter the auth token (Operations tab) first' : ''}</span>`;
   } else if (mode === 'automatic') {
     $('#banner').innerHTML = `<span style="color:#0a0">✓ mode automatic — the schedule/prioritiser govern again`
-      + `${r.reconciled ? ' (reconciling to ' + esc(r.reconciled) + ' now)' : ''}</span>`;
+      + `${r.reconciled ? ' (reconciling to ' + esc(r.reconciled) + ' now)' : ''}`
+      + `${(r.rebound || []).length ? ' (rebinding ' + r.rebound.map(esc).join(', ') + ' back onto 127.0.0.1)' : ''}</span>`;
   } else {
     $('#banner').innerHTML = `<span style="color:#0a0">✓ mode pinned: ${esc(mode)}`
       + `${r.restored_llm ? ' — restoring the LM first (weights load over minutes)' : ''}`
-      + `${mode === 'endpoint' ? ' — this box now just serves its LM(s) to outside apps' : ''}</span>`;
+      + `${mode === 'endpoint' ? ' — this box now just serves its LM(s) to outside apps on 0.0.0.0' : ''}`
+      + `${(r.rebound || []).length ? ' (rebinding ' + r.rebound.map(esc).join(', ') + ')' : ''}</span>`;
   }
   refreshStats();
 }

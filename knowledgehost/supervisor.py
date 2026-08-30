@@ -381,6 +381,27 @@ def apply_minimal(cfg: dict, action: str) -> dict:
     return {"action": action, "cleared_override": cleared_override, **plan}
 
 
+def _rebind_llms(cfg: dict) -> list[str]:
+    """Endpoint-ness just changed: the LM bind address is computed at spawn
+    (serving.llm_bind_host — loopback normally, 0.0.0.0 under an endpoint
+    pin), so every RUNNING llm service whose entry doesn't pin its own
+    `host` is restarted to pick the new address up.  Stopped and standby LMs
+    need nothing — they read the flag whenever they next start.  Returns the
+    service names asked to restart."""
+    from . import serving as sv
+    st = read_state()
+    out: list[str] = []
+    for e in cfg["serving"]["llms"]:
+        name = str(e.get("name") or "")
+        if not name or str(e.get("host") or "").strip():
+            continue
+        svc = f"llm-{name}"
+        if alive((st.get("services") or {}).get(svc, 0)):
+            sv.request_service(svc, "restart")
+            out.append(svc)
+    return out
+
+
 def apply_override(cfg: dict, mode: str | None) -> dict:
     """Pin a posture (the header selector / './vinur.sh mode …'), or hand
     control back with mode=None (Automatic).  While pinned, no automated
@@ -394,10 +415,16 @@ def apply_override(cfg: dict, mode: str | None) -> dict:
                 Entering it from minimal restores the LM first — an endpoint
                 with no model resident serves nobody.
       None      unset: clear the pin and reconcile IMMEDIATELY to what the
-                schedule wants now (not at the next boundary)."""
+                schedule wants now (not at the next boundary).
+
+    The LM bind address follows endpoint-ness (0.0.0.0 while pinned endpoint,
+    loopback otherwise; an entry's own `host` beats both) and is computed at
+    spawn — so a transition that changes it restarts the running LMs to
+    rebind, reported as `rebound`."""
     from . import serving as sv
     if mode is not None and mode not in sv.OVERRIDE_MODES:
         raise ValueError("mode must be automatic|full|minimal|endpoint")
+    was_endpoint = bool(sv.endpoint_state().get("on"))
     out = {"mode": mode or "automatic", "restored_llm": False, "reconciled": None}
     if mode is None:
         sv.clear_override()
@@ -406,18 +433,25 @@ def apply_override(cfg: dict, mode: str | None) -> dict:
         if want is not None and want != bool(sv.minimal_state().get("on")):
             apply_minimal(cfg, "on" if want else "off")
             out["reconciled"] = "minimal" if want else "full"
+        if was_endpoint and out["reconciled"] != "minimal":
+            out["rebound"] = _rebind_llms(cfg)      # narrow back onto loopback
         return out
     if mode == "minimal":
         if not sv.minimal_state().get("on"):
-            apply_minimal(cfg, "on")
+            apply_minimal(cfg, "on")                # stops the LMs — nothing to rebind
         sv.set_override({"mode": "minimal", "since": time.time()})
         return out
-    # full and endpoint both need the LM(s) resident
+    # full and endpoint both need the LM(s) resident.  The pin is written
+    # FIRST so LMs spawned by a minimal-off restore read the new mode's bind
+    # (apply_minimal's contradiction rule then sees a pin its 'off' matches,
+    # not the stale one it would wrongly clear).
+    sv.set_override({"mode": mode, "since": time.time()})
     if sv.minimal_state().get("on"):
         summary = apply_minimal(cfg, "off")
         out["restored_llm"] = True
         out["swap"] = summary.get("swap")
-    sv.set_override({"mode": mode, "since": time.time()})
+    if (mode == "endpoint") != was_endpoint and not out["restored_llm"]:
+        out["rebound"] = _rebind_llms(cfg)          # running LMs rebind live
     return out
 
 
@@ -828,10 +862,10 @@ def cmd_status(as_json: bool = False) -> int:
               f"{m.get('restore') or 'the default LM'} **")
     ov = (d.get("override") or {}).get("mode")
     if ov == "endpoint":
-        print("  ** MODE PINNED: ENDPOINT — the LM(s) serve outside apps only; "
-              "this box's own jobs (autopilot, panel operations, the weekly "
-              "schedule) stand down.  './vinur.sh mode automatic' hands control "
-              "back **")
+        print("  ** MODE PINNED: ENDPOINT — the LM(s) serve outside apps only, "
+              "bound on 0.0.0.0 (an entry's own host= beats that); this box's "
+              "own jobs (autopilot, panel operations, the weekly schedule) "
+              "stand down.  './vinur.sh mode automatic' hands control back **")
     elif ov:
         print(f"  ** MODE PINNED: {ov.upper()} — the schedule won't change the "
               "posture until './vinur.sh mode automatic' (or Unset in the "
@@ -970,18 +1004,26 @@ def cmd_mode(mode: str | None) -> int:
         print("not running — './vinur.sh start'")
         return 1
     summary = apply_override(load_cfg(), None if mode == "automatic" else mode)
+    rb = summary.get("rebound") or []
     if mode == "automatic":
         rec = summary.get("reconciled")
         print("mode automatic — the schedule/prioritizer govern again"
-              + (f" (reconciling to {rec} now)" if rec else "") + ".")
+              + (f" (reconciling to {rec} now)" if rec else "")
+              + (f" (rebinding {', '.join(rb)} back onto 127.0.0.1)" if rb else "")
+              + ".")
     elif mode == "endpoint":
         note = (f" (restoring {summary.get('swap') or 'the default LM'} first — "
                 "weights load over minutes)" if summary["restored_llm"] else "")
-        print(f"mode PINNED: endpoint{note} — the LM endpoints keep answering "
-              "outside apps; this box runs none of its own jobs until "
+        if rb:
+            note += f" (rebinding {', '.join(rb)} onto 0.0.0.0)"
+        print(f"mode PINNED: endpoint{note} — the LM endpoints answer outside "
+              "apps on 0.0.0.0 (LAN-reachable; open the port in the firewall); "
+              "this box runs none of its own jobs until "
               "'./vinur.sh mode automatic'.")
     else:
-        print(f"mode PINNED: {mode} — no schedule boundary will change the "
+        print(f"mode PINNED: {mode}"
+              + (f" (rebinding {', '.join(rb)} back onto 127.0.0.1)" if rb else "")
+              + " — no schedule boundary will change the "
               "posture until './vinur.sh mode automatic'.")
     return 0
 
