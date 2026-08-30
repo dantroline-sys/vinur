@@ -34,7 +34,12 @@ INDEX_HTML = """<!doctype html>
   header { padding: 12px 20px 0; border-bottom: 1px solid #8884;
            position: sticky; top: 0; background: Canvas; z-index: 2; }
   h1 { font-size: 17px; margin: 0 0 6px; }
-  #stats { font-size: 13px; opacity: .85; margin-bottom: 6px; }
+  #stats { font-size: 13px; opacity: .85; margin-bottom: 6px;
+           display: flex; align-items: center; gap: 4px; flex-wrap: wrap; }
+  /* the mode selector: rightmost on the badge row (backend / dense / …) */
+  #modectl { margin-left: auto; display: inline-flex; gap: 6px; align-items: center; }
+  #modectl select { font: inherit; font-size: 12px; }
+  #modectl .ovr { color: #b26a00; font-weight: 600; }
   #live { display: flex; gap: 16px; flex-wrap: wrap; align-items: baseline;
           font-size: 13px; margin-bottom: 8px; }
   #live .stat { display: inline-flex; gap: 5px; align-items: baseline; }
@@ -199,7 +204,7 @@ INDEX_HTML = """<!doctype html>
 <header>
   <div class="hwrap">
     <h1>Knowledge Host — viewer</h1>
-    <div id="stats">loading…</div>
+    <div id="stats"><span id="statsbadges">loading…</span><span id="modectl"></span></div>
     <div id="live"></div>
     <div id="jobbar" onclick="go('ops')" title="open Operations"></div>
     <div class="tabs" id="tabs"></div>
@@ -517,6 +522,50 @@ function renderJobBar(job) {
     + `<span class="jb-go">Operations →</span>`;
 }
 
+// ── the header mode selector: Automatic vs a pinned posture ─────────────────
+// Automatic = the schedule/prioritizer govern; the label says what automation
+// is doing right now.  Picking full / minimal / endpoint PINS that posture —
+// no automated scheduler changes it until Unset (which reconciles at once).
+// Endpoint only = the permanent yield-all: the LM(s) answer outside apps
+// while this box runs none of its own jobs; kb queries keep answering.
+const MODE_OPTS = [['automatic', 'Automatic'], ['full', 'Full power'],
+                   ['minimal', 'Minimal'], ['endpoint', 'Endpoint only']];
+function modeCtl(m) {
+  m = m || {};
+  const ov = m.override || '';
+  const pr = m.prioritizer || {};
+  const doing = m.endpoint ? 'endpoint' : m.minimal ? 'minimal'
+    : pr.running_step ? 'prioritiser: ' + pr.running_step : 'full';
+  const cur = ov || 'automatic';
+  const opts = MODE_OPTS.map(([v, l]) =>
+    `<option value="${v}" ${v === cur ? 'selected' : ''}>`
+    + `${v === 'automatic' ? l + ' — ' + esc(doing) : l}</option>`).join('');
+  const tip = ov
+    ? `mode pinned by you: ${ov} — every automated scheduler is held until Unset`
+    : 'Automatic: the weekly schedule and the Prioritizer govern the box. Pick a '
+      + 'mode to pin it (Endpoint only = serve the LM to your other apps and run '
+      + 'none of this box\\'s own jobs).';
+  return `<span class="lbl${ov ? ' ovr' : ''}" title="${tip}">mode${ov ? ' ⚑' : ''}:</span>`
+    + `<select id="modeSel" title="${tip}" onchange="setMode(this.value)">${opts}</select>`
+    + (ov ? `<button class="toolbtn" onclick="setMode('automatic')"
+              title="hand control back to the schedule/prioritiser (reconciles immediately)">Unset</button>` : '');
+}
+async function setMode(mode) {
+  const r = await postJSON('/serving/mode', { mode }).catch(e => ({ ok: false, error: netErr(e) }));
+  if (!r.ok) {
+    $('#banner').innerHTML = `<span style="color:#c00">✗ mode: ${esc(r.error || 'failed')}`
+      + `${r.error === 'unauthorized' ? ' — enter the auth token (Operations tab) first' : ''}</span>`;
+  } else if (mode === 'automatic') {
+    $('#banner').innerHTML = `<span style="color:#0a0">✓ mode automatic — the schedule/prioritiser govern again`
+      + `${r.reconciled ? ' (reconciling to ' + esc(r.reconciled) + ' now)' : ''}</span>`;
+  } else {
+    $('#banner').innerHTML = `<span style="color:#0a0">✓ mode pinned: ${esc(mode)}`
+      + `${r.restored_llm ? ' — restoring the LM first (weights load over minutes)' : ''}`
+      + `${mode === 'endpoint' ? ' — this box now just serves its LM(s) to outside apps' : ''}</span>`;
+  }
+  refreshStats();
+}
+
 async function refreshStats() {
   let s = {}, kb = {};
   try { s = await (await fetch('stats')).json(); } catch (e) {}
@@ -528,8 +577,12 @@ async function refreshStats() {
   LASTCOUNTS = Object.assign({ sources: kb.sources }, counts);
   const { dt, rates } = computeRates(counts);
   const by = Object.entries(s.by_source || {}).map(([k, v]) => badge(`${k}: ${fmt(v)}`)).join('');
-  $('#stats').innerHTML = badge('backend: ' + (s.backend || '?'))
+  $('#statsbadges').innerHTML = badge('backend: ' + (s.backend || '?'))
     + badge('dense: ' + (s.dense ? 'yes' : 'no')) + badge('v' + (s.version || '1')) + (by ? ' ' + by : '');
+  // the mode selector re-renders each poll — but never under the user's open
+  // dropdown (the same yank-it-shut problem svHold solves on Serving)
+  const mSel = $('#modeSel');
+  if (!mSel || document.activeElement !== mSel) $('#modectl').innerHTML = modeCtl(s.mode);
   const order = [['chunks', 'chunks'], ['nodes', 'nodes'], ['edges', 'edges'], ['cards', 'cards'],
     ['distilled', 'distilled'], ['adjudicate', 'adjudicate'], ['gaps', 'gaps']];
   $('#live').innerHTML = order.map(([k, lbl]) => statEl(lbl, counts[k], rates[k])).join('')
@@ -1661,30 +1714,6 @@ async function doSwap(name) {
   if (!r.ok) svNote('✗ ' + esc(r.error || 'swap request failed'), 30);
   pollServing();
 }
-// ── endpoint mode: the permanent yield-all switch ────────────────────────────
-// Host the model(s) purely as an endpoint for OUTSIDE applications: the
-// Prioritizer, Operations jobs and the weekly schedule all stand down until
-// it's turned off; kb queries keep answering.  State lives server-side
-// (var/run/endpoint.flag) — flips live, survives restarts.
-function epStrip(ep) {
-  const on = !!(ep || {}).on;
-  return `<div style="display:flex;gap:10px;align-items:center;flex-wrap:wrap;
-      border:1px solid ${on ? '#2e7d32aa' : '#8884'};border-radius:6px;padding:8px 12px;margin:0 0 12px;${on ? 'background:#2e7d3214' : ''}">
-    <b>Endpoint mode</b> ${on ? '<b style="color:#2e7d32">ON</b>' : '<span style="opacity:.6">off</span>'}
-    <span style="opacity:.75;font-size:12px;flex:1;min-width:280px">host the model(s) purely as an
-      OpenAI-compatible endpoint for your other apps (agents, other machines): this box runs none of its own
-      jobs — Prioritizer, Operations and the weekly schedule stand down — and kb queries keep answering.</span>
-    <button class="toolbtn" onclick="epToggle('${on ? 'off' : 'on'}')">${on ? 'Turn off' : 'Turn on'}</button></div>`;
-}
-async function epToggle(action) {
-  const r = await postJSON('/serving/endpoint', { action }).catch(e => ({ ok: false, error: netErr(e) }));
-  svNote(r.ok
-    ? `<span style="color:#0a0">✓ endpoint mode ${action}${r.restored_llm
-        ? ' — minimal was on, restoring the LM first (weights load over minutes)' : ''}</span>`
-    : `<span style="color:#c00">✗ ${esc(r.error || 'failed')}</span>`, 12);
-  pollServing();
-}
-
 let SVBUSY = false;
 let SVNOTE = null;      // the last action's outcome — survives poll re-renders
 function svNote(html, secs) {
@@ -1784,9 +1813,8 @@ async function pollServing_() {
     + (sup.running ? ` — supervisor pid ${sup.pid}.` : '.')
     + ` Weight chips show the on-disk state: <i>incomplete</i> during a download <b>and</b> after a
        failed one (the note column carries the service's last log line — a crash there plus
-       incomplete weights usually means the fetch died: gated repo token, disk, network).</p>`
-    + epStrip(r.endpoint)
-    + `<table><tr><th>model</th><th>what</th><th>service</th><th>weights</th><th>note</th><th></th></tr>
+       incomplete weights usually means the fetch died: gated repo token, disk, network).</p>
+     <table><tr><th>model</th><th>what</th><th>service</th><th>weights</th><th>note</th><th></th></tr>
      ${rows}${auxRows}</table>`
     + dlHtml + unHtml + svLogPanel() + svCache(r.cache);
   const pre = $('#svlogpre');
@@ -2623,7 +2651,7 @@ async function loadSchedule() {
   if (!r.ok) { $('#results').className = 'empty'; $('#results').textContent = 'enter the auth token above to edit the schedule'; return; }
   SCHED = r.schedule && r.schedule.windows ? r.schedule : { enabled: !!(r.schedule || {}).enabled, windows: {} };
   if (!SCHED.windows) SCHED.windows = {};
-  SCHED_META = { now: r.now || {}, minimal: r.minimal || {}, endpoint: r.endpoint || {},
+  SCHED_META = { now: r.now || {}, minimal: r.minimal || {}, override: r.override || {},
                  wants: r.wants_minimal, at: Date.now() };
   renderSchedule();
 }
@@ -2672,15 +2700,15 @@ function renderSchedule() {
       <td>${cells || '<span style="opacity:.45">minimal all day</span>'} </td>
       <td><button class="toolbtn" onclick="schAddWindow('${k}')">+ window</button></td></tr>`;
   }).join('');
-  const epHold = (m.endpoint || {}).on
-    ? `<div class="note" style="margin:6px 0">⏸ <b>Endpoint mode is on</b> (Models tab) — the box is a standing
-         LM endpoint for outside apps, so this schedule is <b>held</b>: no boundary will vacate or restore the
-         model until endpoint mode is turned off.</div>` : '';
+  const epHold = (m.override || {}).mode
+    ? `<div class="note" style="margin:6px 0">⏸ <b>The mode is pinned to ${esc(m.override.mode)}</b> (the selector
+         in the header) — your choice beats the clock, so this schedule is <b>held</b>: no boundary will change
+         the posture until the pin is Unset.</div>` : '';
   const warn = epHold + ((SCHED.enabled && !anyWin)
     ? `<div class="note" style="margin:6px 0">⚠ Schedule is <b>enabled but has no windows</b> on any day, so it
          is <b>not governing</b> — the box follows the manual switch and the Prioritizer runs as normal. Add at
          least one full-power window below (or turn the schedule off) to drive minimal mode by the clock.</div>`
-    : disagree && !(m.endpoint || {}).on
+    : disagree && !(m.override || {}).mode
     ? `<div class="note" style="margin:6px 0">⚠ The schedule wants <b>${esc(wants)}</b> but the box is
          <b>${on ? 'minimal' : 'full'}</b>. The supervisor reconciles within ~30 s of a boundary — if this
          persists, the schedule timer isn't running (is the supervisor up, and running this build?), or the

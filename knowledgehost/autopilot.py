@@ -338,8 +338,9 @@ class Autopilot:
                     continue
                 if self._endpoint_on():            # LM reserved for outside apps
                     self._state.update(running_step=None, last_reason=(
-                        "paused — endpoint mode: the LM serves outside apps only "
-                        "(Serving tab, or './vinur.sh endpoint off', to resume)"))
+                        "paused — mode pinned to ENDPOINT: the LM serves outside "
+                        "apps only (the header selector's Unset, or './vinur.sh "
+                        "mode automatic', resumes)"))
                     self._sleep(min(30, plan["idle_interval_s"]))
                     continue
                 if self._minimal_on():             # VRAM vacated (switch/schedule) — no ingest

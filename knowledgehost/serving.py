@@ -879,38 +879,56 @@ def clear_minimal() -> None:
         pass
 
 
-# ── endpoint mode: serve the LM(s) to OUTSIDE clients only ────────────────────
-# The permanent yield-all.  Weights stay resident and the OpenAI-compatible
-# ports keep answering (agents, other machines, Vinkona) — but every
-# SELF-INITIATED consumer of this box's LMs stands down until the switch is
-# turned off: the autopilot, panel Operations jobs, and the weekly minimal
-# schedule.  kb_search/kb_ask keep answering (they serve outside callers too).
-# The mirror image of minimal mode (LM down, box quiet): here the LM is the
-# point and the box's own work is what yields.  Same flag-file idiom —
-# survives restarts, flips live, no config edit needed.
-ENDPOINT_FLAG = ROOT / "var" / "run" / "endpoint.flag"
+# ── manual mode override (the header selector) ────────────────────────────────
+# Absent flag = AUTOMATIC: the weekly schedule drives minimal/full and the
+# autopilot runs when due.  Present = the user PINNED a posture from the
+# viewer's header selector (or './vinur.sh mode …') and every automated
+# scheduler keeps its hands off until it is unset:
+#
+#   full      LM(s) up, normal operation — but the schedule can't drop the box
+#             to minimal.
+#   minimal   VRAM vacated (the minimal.flag mechanism) — and the schedule
+#             can't restore it at the next window.
+#   endpoint  the permanent yield-all: the LM(s) stay resident and answer their
+#             OpenAI-compatible ports for OUTSIDE applications (agents, other
+#             machines) while every self-initiated consumer stands down — the
+#             autopilot pauses, ops jobs are refused, the schedule is held.
+#             kb_search/kb_ask keep answering (they serve outside callers too).
+#
+# Same flag-file idiom as minimal's — survives restarts, flips live.
+OVERRIDE_FLAG = ROOT / "var" / "run" / "override.flag"
+OVERRIDE_MODES = ("full", "minimal", "endpoint")
 
 
-def endpoint_state() -> dict:
+def override_state() -> dict:
     try:
-        d = json.loads(ENDPOINT_FLAG.read_text())
-        return d if isinstance(d, dict) else {}
+        d = json.loads(OVERRIDE_FLAG.read_text())
+        return d if isinstance(d, dict) and d.get("mode") in OVERRIDE_MODES else {}
     except (OSError, ValueError):
         return {}
 
 
-def set_endpoint(d: dict) -> None:
-    ENDPOINT_FLAG.parent.mkdir(parents=True, exist_ok=True)
-    tmp = ENDPOINT_FLAG.with_suffix(".tmp")
+def set_override(d: dict) -> None:
+    OVERRIDE_FLAG.parent.mkdir(parents=True, exist_ok=True)
+    tmp = OVERRIDE_FLAG.with_suffix(".tmp")
     tmp.write_text(json.dumps(d))
-    os.replace(tmp, ENDPOINT_FLAG)
+    os.replace(tmp, OVERRIDE_FLAG)
 
 
-def clear_endpoint() -> None:
+def clear_override() -> None:
     try:
-        ENDPOINT_FLAG.unlink()
+        OVERRIDE_FLAG.unlink()
     except OSError:
         pass
+
+
+def endpoint_state() -> dict:
+    """Endpoint mode as its consumers see it (autopilot gate, ops gate,
+    status banners).  It exists only as a manual override — there is no
+    automated driver — so this is a view over override_state()."""
+    ov = override_state()
+    return ({"on": True, "since": ov.get("since")} if ov.get("mode") == "endpoint"
+            else {})
 
 
 # ── weekly schedule (drives minimal mode by day-of-week + time window) ────────
@@ -1876,7 +1894,7 @@ def serving_status(cfg: dict) -> dict:
             "supervisor": {"running": sup_alive,
                            "pid": st.get("supervisor") if sup_alive else None},
             "swap": swap_state(), "llms": llms, "embed": embed, "reranker": reranker,
-            "endpoint": endpoint_state(),
+            "override": override_state(),
             "unserved": unserved, "cache": hf_cache_status(),
             "vram_budget_gb": vb}
 

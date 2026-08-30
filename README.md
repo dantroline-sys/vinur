@@ -232,13 +232,17 @@ broker (policy-checked, audited, resumable — engines then run offline from
 the local store), and `adopt` absorbs legacy HF-cache snapshots without
 re-downloading. `./vinur.sh minimal on` vacates all VRAM while the KB keeps
 serving (Serving › Schedule drives it on a weekly timer);
-`./vinur.sh endpoint on` is the opposite stance — **endpoint mode**, the
-permanent yield-all: the box hosts its model(s) purely as an OpenAI-compatible
-endpoint for your *other* applications (agents, other machines) while every
-self-initiated consumer stands down — the Prioritizer pauses, panel jobs are
-refused, the weekly schedule is held — and kb queries keep answering (the
-switch also lives at the top of the panel's Serving tab, and survives
-restarts);
+`./vinur.sh mode full|minimal|endpoint` **pins a posture** — a manual override
+that beats every automated scheduler until `mode automatic` hands control back
+(which reconciles to the schedule immediately). The same control is the
+selector at the right of the panel's header bar: it reads *Automatic — full /
+minimal / prioritiser: <step>* while automation governs, and grows an
+**Unset** button while pinned. `endpoint` is the permanent yield-all: the box
+hosts its model(s) purely as an OpenAI-compatible endpoint for your *other*
+applications (agents, other machines) while every self-initiated consumer
+stands down — the Prioritizer pauses, panel jobs are refused, the weekly
+schedule is held — and kb queries keep answering. Pins survive restarts;
+`./vinur.sh endpoint on|off` remains as shorthand;
 `./vinur.sh service install` registers a systemd/launchd start-at-login unit;
 `status --json` is the machine seam for scripts and shells; `./vinur.sh net`
 prints the broker's window — policy, open leases, recent audited egress.

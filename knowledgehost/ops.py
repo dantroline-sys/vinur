@@ -424,9 +424,10 @@ class OpsRunner:
             from . import serving as _sv
             if _sv.endpoint_state().get("on"):
                 return {"ok": False, "status": self.status(),
-                        "error": "endpoint mode is on — this box only serves its "
-                                 "LM(s) to outside apps. Turn it off (Serving tab, "
-                                 "or './vinur.sh endpoint off') to run jobs."}
+                        "error": "the mode is pinned to ENDPOINT — this box only "
+                                 "serves its LM(s) to outside apps. Unset it (the "
+                                 "selector in the panel header, or './vinur.sh "
+                                 "mode automatic') to run jobs."}
         except ImportError:                        # pragma: no cover - defensive
             pass
         with self._lock:

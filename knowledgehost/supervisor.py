@@ -6,7 +6,8 @@ kb server itself — as direct children in their own process groups:
 
     python -m knowledgehost.supervisor start|stop|restart [svc]|status [--json]|swap <llm>|logs [svc]
     python -m knowledgehost.supervisor minimal on|off|status   # vacate VRAM, keep serving the KB
-    python -m knowledgehost.supervisor endpoint on|off|status  # LM-endpoint-only: serve outside apps, hold own jobs
+    python -m knowledgehost.supervisor mode [automatic|full|minimal|endpoint]  # pin a posture / hand back
+    python -m knowledgehost.supervisor endpoint on|off|status  # shorthand: mode endpoint / mode automatic
     python -m knowledgehost.supervisor run              # foreground (systemd/launchd mode)
     python -m knowledgehost.supervisor service install|uninstall|status [--dry-run]
 
@@ -323,11 +324,11 @@ def _reconcile_schedule(cfg: dict, last_want):
     only when the box isn't already in the wanted state.  Returns the new want."""
     from datetime import datetime
     from . import serving as sv
-    if sv.endpoint_state().get("on"):
-        # Endpoint mode: the box is a standing LM endpoint for outside apps —
-        # a schedule boundary must not vacate the model out from under them.
-        # last_want passes through unchanged so turning endpoint off later
-        # doesn't replay a stale boundary as a fresh crossing.
+    if sv.override_state():
+        # A manual mode override is pinned (header selector / vinur.sh mode):
+        # the user's choice beats the clock — no boundary may flip the posture
+        # until the override is unset.  last_want passes through unchanged so
+        # unsetting later doesn't replay a stale boundary as a fresh crossing.
         return last_want
     sched = sv.read_schedule()
     want = sv.schedule_wants_minimal(sched, datetime.now())
@@ -353,12 +354,16 @@ def apply_minimal(cfg: dict, action: str) -> dict:
     active = str((sv.swap_state() or {}).get("active") or "")
     restore = str((sv.minimal_state() or {}).get("restore") or "")
     plan = plan_minimal(cfg, action, active=active, restore=restore)
-    # Minimal vacates the LM — that deliberately ENDS endpoint mode (the more
-    # recent explicit act wins; nothing later silently undoes either switch).
-    cleared_endpoint = False
-    if action == "on" and sv.endpoint_state().get("on"):
-        sv.clear_endpoint()
-        cleared_endpoint = True
+    # A manual mechanism flip that CONTRADICTS a pinned override deliberately
+    # ends the override (the more recent explicit act wins; automation stays
+    # governed by whatever remains — usually the schedule again).  A flip that
+    # matches the pin (minimal on under a minimal override) leaves it alone.
+    ov = sv.override_state().get("mode")
+    cleared_override = False
+    if (action == "on" and ov in ("endpoint", "full")) \
+            or (action == "off" and ov == "minimal"):
+        sv.clear_override()
+        cleared_override = True
     # Order: (re)write the flag FIRST so a re-spawned embedder reads the right
     # device, THEN fire the async service/swap requests.
     if plan["flag"] is not None:
@@ -373,26 +378,46 @@ def apply_minimal(cfg: dict, action: str) -> dict:
         sv.request_service(name, "start")
     if plan.get("swap"):
         sv.request_swap(plan["swap"])
-    return {"action": action, "cleared_endpoint": cleared_endpoint, **plan}
+    return {"action": action, "cleared_override": cleared_override, **plan}
 
 
-def apply_endpoint(cfg: dict, action: str) -> dict:
-    """Flip endpoint mode: the box hosts its LM(s) purely as an endpoint for
-    OUTSIDE applications; all self-initiated work (autopilot, panel jobs, the
-    weekly schedule) stands down.  Turning it on while minimal is on first
-    restores the LM — an endpoint with no model resident serves nobody."""
+def apply_override(cfg: dict, mode: str | None) -> dict:
+    """Pin a posture (the header selector / './vinur.sh mode …'), or hand
+    control back with mode=None (Automatic).  While pinned, no automated
+    scheduler may change the posture.
+
+      full      LM(s) up, normal operation, schedule can't drop to minimal.
+      minimal   VRAM vacated and HELD there (unlike a bare 'minimal on', which
+                the schedule may flip at its next boundary).
+      endpoint  the permanent yield-all: LM(s) serve outside apps only; the
+                autopilot pauses, jobs are refused, the schedule is held.
+                Entering it from minimal restores the LM first — an endpoint
+                with no model resident serves nobody.
+      None      unset: clear the pin and reconcile IMMEDIATELY to what the
+                schedule wants now (not at the next boundary)."""
     from . import serving as sv
-    if action not in ("on", "off"):
-        raise ValueError("action must be on|off")
-    out = {"action": action, "restored_llm": False}
-    if action == "on":
-        if sv.minimal_state().get("on"):
-            summary = apply_minimal(cfg, "off")
-            out["restored_llm"] = True
-            out["swap"] = summary.get("swap")
-        sv.set_endpoint({"on": True, "since": time.time()})
-    else:
-        sv.clear_endpoint()
+    if mode is not None and mode not in sv.OVERRIDE_MODES:
+        raise ValueError("mode must be automatic|full|minimal|endpoint")
+    out = {"mode": mode or "automatic", "restored_llm": False, "reconciled": None}
+    if mode is None:
+        sv.clear_override()
+        from datetime import datetime
+        want = sv.schedule_wants_minimal(sv.read_schedule(), datetime.now())
+        if want is not None and want != bool(sv.minimal_state().get("on")):
+            apply_minimal(cfg, "on" if want else "off")
+            out["reconciled"] = "minimal" if want else "full"
+        return out
+    if mode == "minimal":
+        if not sv.minimal_state().get("on"):
+            apply_minimal(cfg, "on")
+        sv.set_override({"mode": "minimal", "since": time.time()})
+        return out
+    # full and endpoint both need the LM(s) resident
+    if sv.minimal_state().get("on"):
+        summary = apply_minimal(cfg, "off")
+        out["restored_llm"] = True
+        out["swap"] = summary.get("swap")
+    sv.set_override({"mode": mode, "since": time.time()})
     return out
 
 
@@ -777,10 +802,12 @@ def status_data() -> dict:
         out["swap"] = sv.swap_state() or {}
         out["minimal"] = sv.minimal_state() or {}
         out["endpoint"] = sv.endpoint_state() or {}
+        out["override"] = sv.override_state() or {}
     except Exception:
         out["swap"] = {}
         out["minimal"] = {}
         out["endpoint"] = {}
+        out["override"] = {}
     return out
 
 
@@ -799,10 +826,16 @@ def cmd_status(as_json: bool = False) -> int:
         print(f"  ** MINIMAL MODE — VRAM vacated, serving the KB (embed: "
               f"{m.get('embed', 'cpu')}).  './vinur.sh minimal off' restores "
               f"{m.get('restore') or 'the default LM'} **")
-    if (d.get("endpoint") or {}).get("on"):
-        print("  ** ENDPOINT MODE — the LM(s) serve outside apps only; this box's "
-              "own jobs (autopilot, panel operations, the weekly schedule) stand "
-              "down.  './vinur.sh endpoint off' resumes them **")
+    ov = (d.get("override") or {}).get("mode")
+    if ov == "endpoint":
+        print("  ** MODE PINNED: ENDPOINT — the LM(s) serve outside apps only; "
+              "this box's own jobs (autopilot, panel operations, the weekly "
+              "schedule) stand down.  './vinur.sh mode automatic' hands control "
+              "back **")
+    elif ov:
+        print(f"  ** MODE PINNED: {ov.upper()} — the schedule won't change the "
+              "posture until './vinur.sh mode automatic' (or Unset in the "
+              "panel header) **")
     for s in d["services"]:
         if s["state"] == "failed":
             print(f"  {s['name']:<12} FAILED  {s['note']}")
@@ -914,37 +947,55 @@ def cmd_minimal(action: str | None) -> int:
     return 0
 
 
-def cmd_endpoint(action: str | None) -> int:
-    """LM-endpoint-only mode: host the model(s) for OUTSIDE applications
-    (agents, other machines) and hold all of this box's own jobs — the
-    permanent yield-all.  A hot switch like minimal; survives restarts."""
+def cmd_mode(mode: str | None) -> int:
+    """Pin a posture (overrides every automated scheduler until unset), show
+    the current one, or hand control back with 'automatic'."""
     from . import serving as sv
-    action = (action or "status").lower()
-    if action == "status":
-        if sv.endpoint_state().get("on"):
-            print("endpoint mode ON — the LM(s) serve outside apps only; the "
-                  "autopilot, panel jobs and the weekly schedule stand down")
+    mode = (mode or "status").lower()
+    if mode == "status":
+        ov = sv.override_state()
+        if ov:
+            print(f"mode PINNED: {ov['mode']} — automation is held; "
+                  "'./vinur.sh mode automatic' (or Unset in the panel header) "
+                  "hands control back")
         else:
-            print("endpoint mode OFF (normal operation)")
+            m = "minimal" if sv.minimal_state().get("on") else "full"
+            print(f"mode automatic — the schedule/prioritizer govern (posture "
+                  f"now: {m})")
         return 0
-    if action not in ("on", "off"):
-        print("usage: ./vinur.sh endpoint on|off|status")
+    if mode not in ("automatic", "full", "minimal", "endpoint"):
+        print("usage: ./vinur.sh mode [automatic|full|minimal|endpoint]")
         return 2
     if not alive(read_state().get("supervisor", 0)):
         print("not running — './vinur.sh start'")
         return 1
-    summary = apply_endpoint(load_cfg(), action)
-    if action == "on":
+    summary = apply_override(load_cfg(), None if mode == "automatic" else mode)
+    if mode == "automatic":
+        rec = summary.get("reconciled")
+        print("mode automatic — the schedule/prioritizer govern again"
+              + (f" (reconciling to {rec} now)" if rec else "") + ".")
+    elif mode == "endpoint":
         note = (f" (restoring {summary.get('swap') or 'the default LM'} first — "
-                "minimal mode was on; weights load over minutes)"
-                if summary["restored_llm"] else "")
-        print(f"endpoint mode ON{note} — the LM endpoints keep answering outside "
-              "apps; this box runs none of its own jobs until "
-              "'./vinur.sh endpoint off'.")
+                "weights load over minutes)" if summary["restored_llm"] else "")
+        print(f"mode PINNED: endpoint{note} — the LM endpoints keep answering "
+              "outside apps; this box runs none of its own jobs until "
+              "'./vinur.sh mode automatic'.")
     else:
-        print("endpoint mode OFF — autopilot, panel jobs and the weekly schedule "
-              "resume on their own timers.")
+        print(f"mode PINNED: {mode} — no schedule boundary will change the "
+              "posture until './vinur.sh mode automatic'.")
     return 0
+
+
+def cmd_endpoint(action: str | None) -> int:
+    """Backwards-friendly shorthand: endpoint on = mode endpoint; endpoint
+    off = mode automatic."""
+    action = (action or "status").lower()
+    if action == "status":
+        return cmd_mode("status")
+    if action not in ("on", "off"):
+        print("usage: ./vinur.sh endpoint on|off|status")
+        return 2
+    return cmd_mode("endpoint" if action == "on" else "automatic")
 
 
 def cmd_logs(target: str | None) -> int:
@@ -1000,6 +1051,8 @@ def main(argv: list[str] | None = None) -> int:
         return cmd_swap(args[1] if len(args) > 1 else None)
     if cmd == "minimal":
         return cmd_minimal(args[1] if len(args) > 1 else "status")
+    if cmd == "mode":
+        return cmd_mode(args[1] if len(args) > 1 else "status")
     if cmd == "endpoint":
         return cmd_endpoint(args[1] if len(args) > 1 else "status")
     if cmd == "logs":

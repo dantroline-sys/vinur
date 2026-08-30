@@ -279,6 +279,28 @@ class Handler(BaseHTTPRequestHandler):
             out["progress"] = ops.progress()
         return out
 
+    def _mode_brief(self) -> dict:
+        """The box's posture, for the header's mode selector: the pinned
+        override (or none = Automatic), the mechanism states, and what the
+        prioritizer is doing — so the Automatic label can say what automation
+        is up to right now.  Rides the unauthed /stats like _job_brief: names
+        only, no paths or argv."""
+        from . import serving as sv
+        try:
+            d = {"override": (sv.override_state() or {}).get("mode"),
+                 "minimal": bool(sv.minimal_state().get("on")),
+                 "endpoint": bool(sv.endpoint_state().get("on"))}
+        except Exception:                          # pragma: no cover - defensive
+            return {}
+        ap = getattr(self.server, "autopilot", None)
+        try:
+            st = ap.status() if ap else {}
+            d["prioritizer"] = {"enabled": bool(st.get("enabled")),
+                                "running_step": st.get("running_step")}
+        except Exception:                          # pragma: no cover - defensive
+            d["prioritizer"] = {}
+        return d
+
     # A handler exception must NEVER drop the socket without a response —
     # the browser then reports only "NetworkError when attempting to fetch
     # resource", which names nothing.  Answer 500 with the real error and
@@ -336,7 +358,8 @@ class Handler(BaseHTTPRequestHandler):
                 "ok": True, "backend": store.backend, "chunks": store.count(),
                 "dense": store.has_vectors(),
                 "version": store.manifest.meta_get("version", "1"),
-                "by_source": by_source, "job": self._job_brief()})
+                "by_source": by_source, "job": self._job_brief(),
+                "mode": self._mode_brief()})
         if path == "/yield_audit":                 # Sources: documents that distilled to ~nothing
             kb = getattr(self.server, "kb", None)
             if kb is None:
@@ -520,7 +543,7 @@ class Handler(BaseHTTPRequestHandler):
             return self._send_json(
                 {"ok": True, "schedule": sched,
                  "minimal": sv.minimal_state(),          # current live posture
-                 "endpoint": sv.endpoint_state(),        # schedule is held while on
+                 "override": sv.override_state(),        # schedule is held while pinned
                  # server-local clock so the editor can show "now" against the grid —
                  # tz included so a UTC-vs-wall-clock mismatch (a classic "timer fires at
                  # the wrong hour" cause) is visible at a glance
@@ -728,7 +751,7 @@ class Handler(BaseHTTPRequestHandler):
         if path not in ("/call", "/ops/run", "/ops/stop", "/ops/reload", "/config",
                         "/ops/autopilot", "/library/config", "/library/root",
                         "/source", "/scenario", "/brain", "/drop", "/serving/swap",
-                        "/serving/control", "/serving/minimal", "/serving/endpoint",
+                        "/serving/control", "/serving/minimal", "/serving/mode",
                         "/serving/schedule",
                         "/serving/model", "/serving/add",
                         "/serving/pull", "/serving/download", "/serving/tune", "/net",
@@ -960,24 +983,28 @@ class Handler(BaseHTTPRequestHandler):
             return self._send_json({"ok": True, **summary,
                                     "note": "the supervisor acts within a few seconds — "
                                             "re-poll /serving/status"})
-        if path == "/serving/endpoint":                # LM-endpoint-only (permanent yield-all)
-            # The Serving tab's switch: host the model(s) purely for outside
-            # applications; the autopilot / panel jobs / weekly schedule stand
-            # down until it's turned off.  Flag flips live, survives restarts.
+        if path == "/serving/mode":                    # header selector: pin a posture / unset
+            # 'automatic' hands control back to the schedule/prioritizer (and
+            # reconciles immediately); full|minimal|endpoint PIN that posture —
+            # no automated scheduler changes it until unset.  Endpoint is the
+            # permanent yield-all (LM served to outside apps only, own jobs
+            # held).  Flag flips live, survives restarts.
             from . import supervisor as sup
             st = sup.read_state()
             if not sup.alive(st.get("supervisor", 0)):
                 return self._send_json(
                     {"ok": False, "error": "the supervisor is not running "
                                            "(./vinur.sh start)"}, 409)
-            action = str(req.get("action") or "")
-            if action not in ("on", "off"):
+            mode = str(req.get("mode") or "")
+            if mode not in ("automatic", "full", "minimal", "endpoint"):
                 return self._send_json(
-                    {"ok": False, "error": "action must be on|off"}, 400)
-            summary = sup.apply_endpoint(self.cfg, action)
+                    {"ok": False, "error": "mode must be "
+                                           "automatic|full|minimal|endpoint"}, 400)
+            summary = sup.apply_override(self.cfg,
+                                         None if mode == "automatic" else mode)
             return self._send_json({"ok": True, **summary,
                                     "note": "takes effect immediately — "
-                                            "re-poll /serving/status"})
+                                            "re-poll /stats"})
         if path == "/serving/schedule":                # save the weekly minimal-mode plan
             # Validated + normalised, then written to var/run/schedule.json; the
             # supervisor re-reads it live and flips minimal at window boundaries.
