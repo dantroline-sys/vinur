@@ -259,6 +259,14 @@ TUNING_SCHEMA = [
              "flashinfer-python installed or startup fails. A wrong name "
              "fails at startup with the valid list in the log.",
      "applies": "service", "scope": "model"},
+    {"key": "enforce_eager", "label": "Eager mode", "type": "bool",
+     "engines": ["vllm", "container"], "recommended": None,
+     "help": "Disable CUDA graphs and run pure eager PyTorch. A "
+             "troubleshooting/VRAM knob, NOT a speedup — graphs are faster "
+             "for decode; eager saves the graphs' VRAM, starts quicker, and "
+             "dodges graph-capture crashes on brand-new models. Leave off "
+             "unless a model dies during capture or VRAM is critically "
+             "tight.", "applies": "service", "scope": "model"},
     {"key": "enable_auto_tool_choice", "label": "Tool calling", "type": "bool",
      "engines": ["vllm", "container"], "recommended": None,
      "help": "Let OpenAI-style clients send a tools list and have the model "

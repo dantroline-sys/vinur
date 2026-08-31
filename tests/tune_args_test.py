@@ -195,6 +195,18 @@ def main():
                                            "enable_chunked_prefill": False})
           == {"attention_backend": "flashinfer", "enable_chunked_prefill": False})
 
+    # ── eager mode (now a Tune row; the flag mapping predates it) ────────────
+    check("enforce_eager emits only when true (plain flag)",
+          SV._mapped_flags({"enforce_eager": True}, SV._VLLM_KEYS)
+          == ["--enforce-eager"]
+          and SV._mapped_flags({"enforce_eager": False}, SV._VLLM_KEYS) == [])
+    check("validate_tuning: a false Eager mode removes the key (default = "
+          "hybrid CUDA graphs)",
+          SV.validate_tuning("container", {"enforce_eager": False})
+          == {"enforce_eager": None}
+          and SV.validate_tuning("container", {"enforce_eager": True})
+          == {"enforce_eager": True})
+
     # ── the Thinking default (tri-state chat-template kwarg) ─────────────────
     check("Thinking on emits the server-default kwarg as compact JSON",
           SV._mapped_flags({"enable_thinking": True}, SV._VLLM_KEYS)
