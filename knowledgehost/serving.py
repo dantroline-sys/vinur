@@ -88,6 +88,8 @@ _VLLM_KEYS = [
     ("max_num_seqs",           "--max-num-seqs",           "value"),
     ("max_num_batched_tokens", "--max-num-batched-tokens", "value"),
     ("enable_prefix_caching",  "--enable-prefix-caching",  "onoff"),
+    ("enable_chunked_prefill", "--enable-chunked-prefill", "onoff"),
+    ("attention_backend",      "--attention-backend",      "value"),
     ("tensor_parallel",        "--tensor-parallel-size",   "value"),
     ("cpu_offload_gb",         "--cpu-offload-gb",         "value"),
     ("swap_space",             "--swap-space",             "value"),
@@ -240,6 +242,22 @@ TUNING_SCHEMA = [
      "help": "Reuse computed KV for prompts that share a prefix. The distiller "
              "sends thousands of prompts with the same header, so this saves real "
              "prefill time. Turn it off only when VRAM is critically tight.",
+     "applies": "service", "scope": "model"},
+    {"key": "enable_chunked_prefill", "label": "Chunked prefill", "type": "bool3",
+     "engines": ["vllm", "container"], "recommended": None,
+     "help": "Split long prompts into chunks sized by the Prefill budget so "
+             "decode requests keep flowing between chunks. Unset = the engine "
+             "decides — the V1 engine turns this ON for most models already, "
+             "so it usually needs no setting; on/off forces it either way.",
+     "applies": "service", "scope": "model"},
+    {"key": "attention_backend", "label": "Attention backend", "type": "str",
+     "engines": ["vllm", "container"],
+     "help": "Which attention kernel vLLM uses: flashinfer, flash_attn, "
+             "triton_attn, … Empty = automatic selection (usually right; it "
+             "may pick something other than flashinfer). The official "
+             "container image ships FlashInfer; a bare-metal venv needs "
+             "flashinfer-python installed or startup fails. A wrong name "
+             "fails at startup with the valid list in the log.",
      "applies": "service", "scope": "model"},
     {"key": "enable_auto_tool_choice", "label": "Tool calling", "type": "bool",
      "engines": ["vllm", "container"], "recommended": None,

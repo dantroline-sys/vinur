@@ -175,6 +175,26 @@ def main():
     except ValueError:
         check("the knobs are vLLM/container-only", True)
 
+    # ── attention backend + chunked prefill ──────────────────────────────────
+    check("attention backend emits as a plain value flag",
+          SV._mapped_flags({"attention_backend": "flashinfer"}, SV._VLLM_KEYS)
+          == ["--attention-backend", "flashinfer"])
+    check("chunked prefill is tri-state (off emits the --no- spelling)",
+          SV._mapped_flags({"enable_chunked_prefill": False}, SV._VLLM_KEYS)
+          == ["--no-enable-chunked-prefill"]
+          and SV._mapped_flags({"enable_chunked_prefill": True}, SV._VLLM_KEYS)
+          == ["--enable-chunked-prefill"])
+    fl = SV._conflict_flags({"attention_backend": "flashinfer",
+                             "enable_chunked_prefill": True}, "container")
+    check("both join the conflict set (incl. the --no- spelling)",
+          {"--attention-backend", "--enable-chunked-prefill",
+           "--no-enable-chunked-prefill"} <= fl)
+    check("validate_tuning takes them (backend = single token, bool3 false "
+          "kept)",
+          SV.validate_tuning("container", {"attention_backend": "flashinfer",
+                                           "enable_chunked_prefill": False})
+          == {"attention_backend": "flashinfer", "enable_chunked_prefill": False})
+
     # ── the Thinking default (tri-state chat-template kwarg) ─────────────────
     check("Thinking on emits the server-default kwarg as compact JSON",
           SV._mapped_flags({"enable_thinking": True}, SV._VLLM_KEYS)
